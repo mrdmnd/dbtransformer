@@ -76,7 +76,7 @@ select = [
     "PERF",
     "RUF",
 ]
-ignore = ["TD003", "F722", "PLR0914", "TRY003"]
+ignore = ["TD003", "F722", "PLR0914", "TRY003", "SIM108"]
 # "bugbear" checks are not fixable by default
 unfixable = ["B"]
 
