@@ -93,3 +93,8 @@ dmypy.json
 .ruff_cache/
 
 logs/
+
+# Ignore local data
+data/
+
+.DS_Store
