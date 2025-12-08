@@ -19,7 +19,7 @@ pre-commit install-hooks
 uv sync
 ```
 
-## Run Locally (CPU)
+## Run Locally
 
 ```bash
 uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py
