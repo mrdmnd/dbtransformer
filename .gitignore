@@ -97,5 +97,6 @@ logs/
 # Ignore local data
 data/
 wandb/
+snapshot.pt
 
 .DS_Store
