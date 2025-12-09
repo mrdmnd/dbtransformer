@@ -15,15 +15,13 @@ import time
 
 import torch
 import torch.nn.functional as F  # noqa: N812
-from beartype import beartype
-from jaxtyping import Float, Int, jaxtyped
+from jaxtyping import Float, Int
 from loguru import logger
 from torch import Tensor
 from transformers import AutoModel, AutoTokenizer
 from transformers.utils import is_flash_attn_2_available
 
 
-@jaxtyped(typechecker=beartype)
 def last_token_pooling(
     hidden_states: Float[Tensor, "b s d"],
     attention_mask: Int[Tensor, "b s"],
@@ -79,7 +77,15 @@ class FrozenEmbedder:
                 dtype=torch.float16,
             ).cpu()
 
-    @torch.no_grad()
+        # Disable gradients and set eval mode
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+        # Compile model for faster inference (PyTorch 2.0+)
+        logger.info("Compiling model with torch.compile()...")
+        self.model = torch.compile(self.model, mode="reduce-overhead")
+
+    @torch.inference_mode()
     def embed(self, texts: list[str]) -> Float[Tensor, "b d"]:
         batch = self.tokenizer(
             texts,
@@ -87,6 +93,7 @@ class FrozenEmbedder:
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
+            return_token_type_ids=False,
         ).to(self.model.device)
         outputs = self.model(**batch)
         embeddings = last_token_pooling(
