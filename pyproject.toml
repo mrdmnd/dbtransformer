@@ -3,7 +3,7 @@ name = "dbtransformer"
 version = "0.1.0"
 description = "Training a relational database transformer model!"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13.1"
 dependencies = [
     "beartype>=0.22.8",
     "einops>=0.8.1",
