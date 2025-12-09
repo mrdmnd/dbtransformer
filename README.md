@@ -1,14 +1,12 @@
 # dbtransformer
 
-Train a relational transformer on any database!
+This is a HACKATHON project - expect rough edges and incomplete things.
 
-This is intended to be run both locally (for testing) and on Prime Intellect GPU servers.
+Goal: train a relational transformer on any database!
 
 ## Datasets
 
 - [RelBench](https://huggingface.co/datasets/relbench/relbench)
-- [CTU Prague]
-- ???
 
 ## Setup
 
@@ -24,6 +22,8 @@ uv sync
 ```bash
 uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py
 ```
+
+Maintenance bits for me to remember:
 
 ## Remote
 

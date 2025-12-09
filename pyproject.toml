@@ -6,11 +6,10 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "beartype>=0.22.8",
-    "duckdb>=1.3.0",
+    "einops>=0.8.1",
     "jaxtyping>=0.3.3",
     "loguru>=0.7.3",
-    "numpy>=2.3.5",
-    "polars>=1.35.2",
+    "pooch>=1.8.2",
     "relbench>=1.0.0",
     "torch>=2.9.0",
     "tqdm>=4.67.1",
@@ -84,7 +83,7 @@ ignore = ["TD003", "F722", "PLR0914", "TRY003", "SIM108"]
 unfixable = ["B"]
 
 [tool.mypy]
-exclude = ["scripts"]
+files = ["dbtransformer", "tests"]
 
 [tool.pytest.ini_options]
 log_cli = true

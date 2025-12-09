@@ -2,6 +2,8 @@
 Download all RelBench datasets and tasks.
 """
 
+# mypy: ignore-errors
+
 import pooch
 from loguru import logger
 from relbench.datasets import get_dataset, get_dataset_names
