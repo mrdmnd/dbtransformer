@@ -7,9 +7,10 @@ The paper uses MiniLM-L12-V2 w/ 384 dims; I want to try a more modern model.
 
 https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
 
-Embedding dimension is 1024 here.
+Embedding dimension for the model defaults to 1024 but I'm going to use 512 for now.
 """
 
+import os
 import random
 import time
 
@@ -18,6 +19,10 @@ import torch.nn.functional as F  # noqa: N812
 from jaxtyping import Float, Int
 from loguru import logger
 from torch import Tensor
+
+# This is to avoid a warning about tokenizers being parallelized.
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
 from transformers import AutoModel, AutoTokenizer
 from transformers.utils import is_flash_attn_2_available
 
@@ -38,7 +43,7 @@ def last_token_pooling(
 
 
 class FrozenEmbedder:
-    def __init__(self, mrl_dimension: int = 1024) -> None:
+    def __init__(self, mrl_dimension: int = 512) -> None:
         logger.info("Initializing FrozenEmbedder...")
         self.mrl_dimension = min(mrl_dimension, 1024)
         if self.mrl_dimension != mrl_dimension:
@@ -197,7 +202,7 @@ def _run_benchmark(
     all_strings = _generate_synthetic_strings(total_strings)
 
     logger.info("Initializing embedder...")
-    embedder = FrozenEmbedder(mrl_dimension=1024)
+    embedder = FrozenEmbedder(mrl_dimension=512)
 
     # Count tokens per string for throughput calculation
     logger.info("Tokenizing all strings...")
