@@ -21,7 +21,14 @@ uv sync
 
 ```bash
 uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py
+
+
 ```
+
+In another process you can wandb login and then
+`wandb beta leet` if you want a sick TUI, or go to the website version at:
+
+<https://wandb.ai/mttrdmnd-massachusetts-institute-of-technology/dbtransformer?nw=nwusermttrdmnd>
 
 Maintenance bits for me to remember:
 

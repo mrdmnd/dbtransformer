@@ -96,5 +96,6 @@ logs/
 
 # Ignore local data
 data/
+wandb/
 
 .DS_Store

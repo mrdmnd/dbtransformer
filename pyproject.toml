@@ -9,11 +9,13 @@ dependencies = [
     "einops>=0.8.1",
     "jaxtyping>=0.3.3",
     "loguru>=0.7.3",
+    "numpy>=2.3.5",
     "pooch>=1.8.2",
     "relbench>=1.0.0",
     "torch>=2.9.0",
     "tqdm>=4.67.1",
     "transformers>=4.57.3",
+    "wandb>=0.23.1",
 ]
 
 [tool.uv.sources]
