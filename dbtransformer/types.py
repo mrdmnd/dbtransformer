@@ -11,7 +11,7 @@ class Cell:
     value: any
     column: str
     table: str
-    row_id: int
+    row_id: str
     is_masked: bool = False
 
 @dataclass
