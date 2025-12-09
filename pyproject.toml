@@ -13,6 +13,7 @@ dependencies = [
     "relbench>=1.0.0",
     "torch>=2.9.0",
     "tqdm>=4.67.1",
+    "transformers>=4.57.3",
 ]
 
 [tool.uv.sources]
