@@ -15,7 +15,6 @@ from typing import TypedDict
 
 import torch
 import torch.nn.functional as F  # noqa: N812
-from beartype import beartype
 from einops import rearrange
 from einops._torch_specific import allow_ops_in_compiled_graph  # noqa: PLC2701
 from jaxtyping import Bool, Float, Int, jaxtyped
@@ -64,7 +63,7 @@ MAX_F2P_NEIGHBORS = 5
 
 # This is a generic masked attention block that can be used for any attention type.
 # We save the attention type as a class variable for debugging.
-@jaxtyped(typechecker=beartype)
+@jaxtyped()
 class GenericMaskedAttentionBlock(nn.Module):
     def __init__(
         self,
@@ -111,7 +110,7 @@ class GenericMaskedAttentionBlock(nn.Module):
 
 
 # Bog-standard FFN with no biases. Uses SwiGLU activation.
-@jaxtyped(typechecker=beartype)
+@jaxtyped()
 class FFN(nn.Module):
     def __init__(self, d_model: int, d_ff: int) -> None:
         super().__init__()
@@ -124,7 +123,7 @@ class FFN(nn.Module):
 
 
 # Implements the "Relational Transformer Block" from the paper.
-@jaxtyped(typechecker=beartype)
+@jaxtyped()
 class RelationalBlock(nn.Module):
     def __init__(
         self,
@@ -165,7 +164,8 @@ class RelationalBlock(nn.Module):
 # https://github.com/pytorch/pytorch/blob/v2.9.1/torch/nn/attention/flex_attention.py
 # The mask_mod signature is Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]
 # but the input tensors are 1d scalars, basically.
-@jaxtyped(typechecker=beartype)
+# NOTE: No typechecker - runtime type checking is incompatible with torch.compile
+@jaxtyped()
 def _generate_block_mask(
     mask: Bool[Tensor, "b s s"],
     batch_size: int,
@@ -201,7 +201,7 @@ def _generate_block_mask(
 # A "batch" of data for the training loops.
 # The sequence is a flattened list of cells from multiple rows (nodes) sampled
 # via BFS traversal of the relational graph starting from a seed row in a task table.
-@jaxtyped(typechecker=beartype)
+@jaxtyped()
 class Batch(TypedDict):
     # Row index for each cell. Multiple cells share the same node_index when
     # they belong to the same row. Used to compute attention masks:
@@ -292,7 +292,7 @@ class Batch(TypedDict):
     true_batch_size: int
 
 
-@jaxtyped(typechecker=beartype)
+@jaxtyped()
 class ModelOutput(TypedDict):
     # The loss averaged over the full batch
     loss: Float[Tensor, ""]
@@ -302,7 +302,7 @@ class ModelOutput(TypedDict):
     yhat_text: Float[Tensor, "b s d_text"] | None
 
 
-@jaxtyped(typechecker=beartype)
+@jaxtyped()
 class RelationalTransformer(nn.Module):
     def __init__(
         self,
