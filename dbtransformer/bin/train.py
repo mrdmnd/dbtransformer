@@ -52,7 +52,7 @@ class TrainConfig:
     seed: int = 42
     lr: float = 0.01
     weight_decay: float = 1e-4
-    epochs: int = 20
+    epochs: int = 1
     batch_size: int = 8
     use_compile: bool = True
     save_every: int = 5
@@ -168,9 +168,7 @@ def create_dummy_batch(
     num_tables = 5
     num_cols_per_table = 20
     table_indices = torch.randint(0, num_tables, (batch_size, seq_len), device=device, dtype=torch.int32)
-    column_indices = torch.randint(
-        0, num_tables * num_cols_per_table, (batch_size, seq_len), device=device, dtype=torch.int32
-    )
+    column_indices = torch.randint(0, num_tables * num_cols_per_table, (batch_size, seq_len), device=device, dtype=torch.int32)
 
     # Foreign-to-primary neighbor indices
     # Each cell has up to MAX_F2P_NEIGHBORS parent row references
@@ -642,9 +640,7 @@ class Trainer:
         for i, batch in enumerate(self.train_loader):
             if i == 0 and self.global_rank == 0:
                 b_sz = batch["node_indices"].shape[0]
-                logger.info(
-                    f"Epoch {epoch + 1} | Batchsize: {b_sz} samples | Batches per epoch: {len(self.train_loader)}"
-                )
+                logger.info(f"Epoch {epoch + 1} | Batchsize: {b_sz} samples | Batches per epoch: {len(self.train_loader)}")
 
             batch_loss = self._run_batch(batch)
             total_loss += batch_loss
@@ -934,9 +930,7 @@ if __name__ == "__main__":
 
     # Training arguments
     parser.add_argument("--save-every", type=int, default=5, help="Save snapshot every N epochs (default: 5)")
-    parser.add_argument(
-        "--snapshot-path", type=str, default="snapshot.pt", help="Path to save/load snapshots (default: snapshot.pt)"
-    )
+    parser.add_argument("--snapshot-path", type=str, default="snapshot.pt", help="Path to save/load snapshots (default: snapshot.pt)")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
     parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (0=sync, 1+=async, default: 0)")
