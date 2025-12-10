@@ -1,13 +1,11 @@
 """
 A module for embedding strings into a fixed-size vector space.
-
-Uses a fixed embedding model to place strings into a vector space.
-
-The paper uses MiniLM-L12-V2 w/ 384 dims; I want to try a more modern model.
+The paper uses MiniLM-L12-V2 w/ 384 dims, but I want to try a more modern model.
 
 https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
 
-Embedding dimension for the model defaults to 1024 but I'm going to use 512 for now.
+Embedding dimension for the model defaults to 1024 but was trained with Matryoshka Representation Learning,
+so we can truncate the dimension by taking any prefix of the vectors.
 """
 
 import os
@@ -20,11 +18,12 @@ from jaxtyping import Float, Int
 from loguru import logger
 from torch import Tensor
 
+from dbtransformer.hardware_abstraction_layer import HardwareConfig
+
 # This is to avoid a warning about tokenizers being parallelized.
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 from transformers import AutoModel, AutoTokenizer
-from transformers.utils import is_flash_attn_2_available
 
 
 def last_token_pooling(
@@ -43,13 +42,20 @@ def last_token_pooling(
 
 
 class FrozenEmbedder:
-    def __init__(self, mrl_dimension: int = 512) -> None:
-        logger.info("Initializing FrozenEmbedder...")
+    def __init__(
+        self,
+        mrl_dimension: int = 512,
+        hardware_config: HardwareConfig | None = None,
+    ) -> None:
+        logger.info("Initializing FrozenEmbedder")
         self.mrl_dimension = min(mrl_dimension, 1024)
         if self.mrl_dimension != mrl_dimension:
-            logger.warning(f"Truncating MRL dimension from {mrl_dimension} to {self.mrl_dimension} because it's too large")
+            logger.warning(f"Truncating MRL dimension from {mrl_dimension} to {self.mrl_dimension} (max supported)")
+
+        # Auto-detect config if not provided
+        self.hardware_config = hardware_config or HardwareConfig.auto_detect()
+
         self.model_name = "Qwen/Qwen3-Embedding-0.6B"
-        # This might be too long when the texts are like "<col_name> of <table_name>" etc
         self.max_length = 1024
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
@@ -57,37 +63,19 @@ class FrozenEmbedder:
             truncation_side="left",
         )
 
-        logger.info("Loading model...")
-
-        # Determine best available device and attention implementation
-        if is_flash_attn_2_available():
-            logger.info("Flash Attention 2 is available. Using CUDA.")
-            self.model = AutoModel.from_pretrained(
-                self.model_name,
-                attn_implementation="flash_attention_2",
-                dtype=torch.bfloat16,
-            ).cuda()
-        elif torch.backends.mps.is_available():
-            logger.info("Using MPS (Apple Silicon GPU).")
-            self.model = AutoModel.from_pretrained(
-                self.model_name,
-                attn_implementation="sdpa",
-                dtype=torch.float16,
-            ).to("mps")
-        else:
-            logger.warning("No GPU available. Using CPU.")
-            self.model = AutoModel.from_pretrained(
-                self.model_name,
-                attn_implementation="sdpa",
-                dtype=torch.float16,
-            ).cpu()
+        logger.info(f"Loading embedding model on {self.hardware_config.device}. FlashAttention2 enabled: {self.hardware_config.use_flash_attention}")
+        self.model = AutoModel.from_pretrained(
+            self.model_name,
+            attn_implementation="flash_attention_2" if self.hardware_config.use_flash_attention else "sdpa",
+            dtype=self.hardware_config.embedder_dtype,
+        ).to(self.hardware_config.device)
 
         # Disable gradients and set eval mode
         self.model.eval()
         self.model.requires_grad_(False)
 
-        # Compile model for faster inference (PyTorch 2.0+)
-        logger.info("Compiling model with torch.compile()...")
+        # Optionally compile model for faster inference
+        logger.info("Compiling embedder model with torch.compile()")
         self.model = torch.compile(self.model, mode="reduce-overhead")
 
     @torch.inference_mode()
@@ -99,21 +87,18 @@ class FrozenEmbedder:
             max_length=self.max_length,
             return_tensors="pt",
             return_token_type_ids=False,
-        ).to(self.model.device)
+        ).to(self.hardware_config.device)
         outputs = self.model(**batch)
         embeddings = last_token_pooling(
             outputs.last_hidden_state,
             batch["attention_mask"],
         )
-        # Matryoshka: truncate and renormalize
+        # Matryoshka: truncate dimension, then renormalize
         embeddings = embeddings[:, : self.mrl_dimension]
         return F.normalize(embeddings, p=2, dim=1)
 
 
-# Microbenchmarks
-# These are not part of the public API.
-
-
+# Benchmarks are not part of the public API for this.
 def _generate_synthetic_strings(n: int, seed: int = 42) -> list[str]:
     """Generate n synthetic strings for benchmarking."""
     random.seed(seed)
@@ -198,14 +183,14 @@ def _run_benchmark(
 ) -> None:
     """Benchmark embedding throughput with synthetic strings."""
     total_strings = (warmup_batches + num_batches) * batch_size
-    logger.info(f"Generating {total_strings} synthetic strings...")
+    logger.info(f"Generating {total_strings} synthetic strings")
     all_strings = _generate_synthetic_strings(total_strings)
 
-    logger.info("Initializing embedder...")
+    logger.info("Initializing embedder")
     embedder = FrozenEmbedder(mrl_dimension=512)
 
     # Count tokens per string for throughput calculation
-    logger.info("Tokenizing all strings...")
+    logger.info("Tokenizing all strings")
     token_counts = [len(embedder.tokenizer.encode(s)) for s in all_strings]
     total_tokens = sum(token_counts)
     logger.info(f"Total tokens: {total_tokens}")
@@ -239,7 +224,7 @@ def _run_benchmark(
 
         batch_times.append(elapsed)
         batch_tokens.append(tokens_in_batch)
-        logger.info(f"  Batch {i + 1}/{num_batches}: {elapsed:.3f}s ({tokens_in_batch / elapsed:.1f} tokens/s)")
+        logger.success(f"  Batch {i + 1}/{num_batches}: {elapsed:.3f}s ({tokens_in_batch / elapsed:.1f} tokens/s)")
 
     # Report summary
     total_time = sum(batch_times)
