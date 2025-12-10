@@ -621,10 +621,10 @@ class Trainer:
         # Explicit sync to ensure GPU work completes before next batch.
         # This prevents sync time from "leaking" into data loading.
         # Without this, async GPU ops cause misleading profiler attribution.
-        self._sync_device()
 
         # Notify profiler of step boundary (for torch.profiler schedule)
         if self.profiler is not None:
+            self._sync_device()
             self.profiler.step()
 
         # Return detached loss tensor to avoid holding computation graph.
@@ -781,6 +781,8 @@ class Trainer:
         batches_since_log = 0
 
         batch_iter = self._batch_iterator()
+
+        start_time = time.time()
         pbar = tqdm(
             range(self.batches_run, self.config.max_batches),
             initial=self.batches_run,
@@ -822,8 +824,12 @@ class Trainer:
             # Save snapshot every save_every_batches
             if current_batch % self.config.save_every_batches == 0 and self.global_rank == 0:
                 self._save_snapshot(current_batch)
-
-        # Save final snapshot
+        elapsed = time.time() - start_time
+        batches_trained = self.config.max_batches - self.batches_run
+        samples_per_sec = (batches_trained * self.config.batch_size * self.world_size) / elapsed
+        if self.global_rank == 0:
+            logger.info(f"Global throughput: {samples_per_sec:.1f} samples/sec")
+       # Save final snapshot
         if self.global_rank == 0:
             self._save_snapshot(self.config.max_batches)
 

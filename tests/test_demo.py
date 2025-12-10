@@ -6,7 +6,7 @@ from torch import Tensor
 
 
 @pytest.fixture(scope="session")
-@jaxtyped()
+@jaxtyped(typechecker=None)
 def setup() -> Float[Tensor, "m n"]:
     # Some demo fixture for reusable data or whatever
     result = torch.randn(10, 12)
