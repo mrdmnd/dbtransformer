@@ -12,6 +12,7 @@ Always run with uv run torchrun:
 
 import os
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,26 +24,45 @@ from loguru import logger
 from torch import nn, optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.nn.utils import clip_grads_with_norm_, get_total_norm
-from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 
 import wandb
+from dbtransformer.hardware_abstraction_layer import HardwareConfig
+from dbtransformer.model import (
+    MAX_F2P_NEIGHBORS,
+    Batch,
+    ModelOutput,
+    RelationalTransformer,
+)
 
 
 @dataclass
 class TrainConfig:
     """Configuration for training."""
 
+    # Training hyperparameters
     max_grad_norm: float = 1.0
     seed: int = 42
     lr: float = 0.01
     weight_decay: float = 1e-4
     epochs: int = 20
-    batch_size: int = 256
-    hidden_dim: int = 2048
+    batch_size: int = 8
     use_compile: bool = True
     save_every: int = 5
     snapshot_path: str = "snapshot.pt"
+
+    # Model architecture.
+    # Intentionally set small during testing and development.
+    num_blocks: int = 2
+    d_model: int = 128
+    d_text: int = 384
+    num_heads: int = 4
+    d_ff: int = 4 * d_model
+    seq_len: int = 256
+
+    # Dataset size for dummy data
+    num_samples: int = 1000
 
     # Weights & Biases config
     use_wandb: bool = True
@@ -60,50 +80,218 @@ def seed_everything(seed: int = 42) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def ddp_setup() -> tuple[int, int, int, torch.device]:
+def ddp_setup() -> tuple[int, int, int, HardwareConfig]:
     """
     Initialize distributed training.
 
     Returns:
-        (local_rank, global_rank, world_size, device)
+        (local_rank, global_rank, world_size, device_config)
     """
     local_rank = int(os.environ["LOCAL_RANK"])
     global_rank = int(os.environ.get("RANK", "0"))
 
-    has_cuda = torch.cuda.is_available()
-    backend = "nccl" if has_cuda else "gloo"
-    dist.init_process_group(backend=backend)
+    # Auto-detect device configuration
+    hardware_config = HardwareConfig.auto_detect(local_rank=local_rank)
 
+    # Initialize process group with the appropriate backend
+    dist.init_process_group(backend=hardware_config.ddp_backend)
     world_size = dist.get_world_size()
 
-    # Device selection: CUDA > MPS (single-process only) > CPU
-    if has_cuda:
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-    elif torch.backends.mps.is_available() and world_size == 1:
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    # MPS doesn't support multi-process, fall back to CPU
+    if hardware_config.is_mps and world_size > 1:
+        logger.warning("MPS doesn't support multi-GPU; falling back to CPU")
+        hardware_config = HardwareConfig.for_cpu()
 
-    logger.info(f"[Local Rank {local_rank} | Global Rank {global_rank}/{world_size}] backend={backend}, device={device}")
-    return local_rank, global_rank, world_size, device
+    logger.info(
+        f"[Local Rank {local_rank} | Global Rank {global_rank} | World Size {world_size}] "
+        f"backend={hardware_config.ddp_backend}, device={hardware_config.device}"
+    )
+    hardware_config.log_config()
+
+    return local_rank, global_rank, world_size, hardware_config
 
 
-def build_model(hidden_dim: int, device: torch.device) -> nn.Module:
-    """Build a ~20M parameter MLP model."""
-    return nn.Sequential(
-        nn.Linear(10, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, 1),
-    ).to(device)
+def build_model(
+    config: TrainConfig,
+    hardware_config: HardwareConfig,
+) -> nn.Module:
+    """Build the RelationalTransformer model."""
+    return RelationalTransformer(
+        num_blocks=config.num_blocks,
+        d_model=config.d_model,
+        d_text=config.d_text,
+        num_heads=config.num_heads,
+        d_ff=config.d_ff,
+        hardware_config=hardware_config,
+    ).to(hardware_config.device)
+
+
+def create_dummy_batch(
+    batch_size: int,
+    seq_len: int,
+    d_text: int,
+    device: torch.device,
+) -> Batch:
+    """
+    Create a dummy Batch with random data for testing.
+
+    This generates synthetic data matching the Batch TypedDict structure
+    expected by the RelationalTransformer model.
+    """
+    # Create node indices: groups of cells belong to the same row
+    # We'll simulate ~10 cells per row on average
+    cells_per_row = 10
+    num_rows = (seq_len + cells_per_row - 1) // cells_per_row  # Round up
+    # Create enough node indices to cover seq_len
+    node_indices = torch.arange(num_rows, device=device)
+    node_indices = node_indices.repeat_interleave(cells_per_row)[:seq_len]
+    node_indices = node_indices.expand(batch_size, -1).contiguous()
+
+    # Table and column indices: simulate ~5 tables, ~20 columns per table
+    num_tables = 5
+    num_cols_per_table = 20
+    table_indices = torch.randint(0, num_tables, (batch_size, seq_len), device=device, dtype=torch.int32)
+    column_indices = torch.randint(0, num_tables * num_cols_per_table, (batch_size, seq_len), device=device, dtype=torch.int32)
+
+    # Foreign-to-primary neighbor indices
+    # Each cell has up to MAX_F2P_NEIGHBORS parent row references
+    # Use -1 for padding (no neighbor)
+    f2p = torch.randint(-1, num_rows, (batch_size, seq_len, MAX_F2P_NEIGHBORS), device=device, dtype=torch.int32)
+
+    # Numeric values (z-score normalized)
+    # Use float32 here; will be converted to bfloat16 on CUDA in _move_batch
+    number_vals = torch.randn(batch_size, seq_len, 1, device=device, dtype=torch.float32)
+    datetime_vals = torch.randn(batch_size, seq_len, 1, device=device, dtype=torch.float32)
+    boolean_vals = torch.randn(batch_size, seq_len, 1, device=device, dtype=torch.float32)
+
+    # Text embeddings (pre-computed sentence transformer output)
+    text_vals = torch.randn(batch_size, seq_len, d_text, device=device, dtype=torch.float32)
+    column_name_vals = torch.randn(batch_size, seq_len, d_text, device=device, dtype=torch.float32)
+
+    # Semantic types: 0=number, 1=text, 2=datetime, 3=boolean
+    # Exclude text (1) from masked positions for now (model doesn't support)
+    semantic_types = torch.randint(0, 4, (batch_size, seq_len), device=device, dtype=torch.long)
+
+    # Masks: positions to hide and predict
+    # Mask ~15% of non-text positions
+    masks = torch.rand(batch_size, seq_len, device=device) < 0.15  # noqa: PLR2004
+    # Don't mask text positions (model doesn't support text prediction yet)
+    masks &= semantic_types != 1
+
+    # Ensure at least one masked position per batch for loss computation
+    for i in range(batch_size):
+        if not masks[i].any():
+            # Find a non-text position to mask
+            non_text = (semantic_types[i] != 1).nonzero(as_tuple=True)[0]
+            if len(non_text) > 0:
+                masks[i, non_text[0]] = True
+
+    # is_targets: same as masks for now
+    is_targets = masks.clone()
+
+    # is_task_nodes: first ~10% of rows are task table rows
+    task_row_threshold = num_rows // 10
+    is_task_nodes = node_indices < task_row_threshold
+
+    # No padding in dummy data
+    is_padding = torch.zeros(batch_size, seq_len, device=device, dtype=torch.bool)
+
+    # Class value indices (unused, set to -1)
+    class_indices = torch.full((batch_size, seq_len), -1, device=device, dtype=torch.int32)
+
+    return Batch(
+        node_indices=node_indices.to(torch.int32),
+        table_name_indices=table_indices,
+        column_name_indices=column_indices,
+        f2p_neighbor_indices=f2p,
+        number_values=number_vals,
+        datetime_values=datetime_vals,
+        boolean_values=boolean_vals,
+        text_values=text_vals,
+        column_name_values=column_name_vals,
+        semantic_types=semantic_types,
+        masks=masks,
+        is_targets=is_targets,
+        is_task_nodes=is_task_nodes,
+        is_padding=is_padding,
+        class_value_indices=class_indices,
+        true_batch_size=batch_size,
+    )
+
+
+class DummyBatchDataset(Dataset):
+    """
+    Dataset that pre-generates dummy Batch data for fast iteration.
+
+    Pre-generates all batches at initialization to avoid slow on-the-fly
+    random tensor generation during training.
+    """
+
+    def __init__(
+        self,
+        num_samples: int,
+        batch_size: int,
+        seq_len: int,
+        d_text: int,
+    ) -> None:
+        self.num_samples = num_samples
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.d_text = d_text
+
+        # Pre-generate a pool of batches to reuse (much faster than on-the-fly)
+        # Use a smaller pool and cycle through it
+        self._pool_size = min(64, num_samples)
+        logger.info(f"Pre-generating {self._pool_size} dummy batches...")
+        self._batch_pool = [
+            create_dummy_batch(
+                batch_size=1,
+                seq_len=seq_len,
+                d_text=d_text,
+                device=torch.device("cpu"),
+            )
+            for _ in range(self._pool_size)
+        ]
+        logger.info("Done pre-generating batches.")
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> Batch:
+        # Return from pre-generated pool (cycling through)
+        return self._batch_pool[idx % self._pool_size]
+
+
+def collate_batches(batches: list[Batch]) -> Batch:
+    """
+    Collate multiple single-sample Batches into one batched Batch.
+
+    Each input batch has shape (1, seq_len, ...), we concatenate along dim 0.
+    """
+    batch_size = len(batches)
+
+    def cat_field(key: str) -> torch.Tensor:
+        tensors = [b[key] for b in batches]  # type: ignore[literal-required]
+        return torch.cat(tensors, dim=0)
+
+    return Batch(
+        node_indices=cat_field("node_indices"),
+        table_name_indices=cat_field("table_name_indices"),
+        column_name_indices=cat_field("column_name_indices"),
+        f2p_neighbor_indices=cat_field("f2p_neighbor_indices"),
+        number_values=cat_field("number_values"),
+        datetime_values=cat_field("datetime_values"),
+        boolean_values=cat_field("boolean_values"),
+        text_values=cat_field("text_values"),
+        column_name_values=cat_field("column_name_values"),
+        semantic_types=cat_field("semantic_types"),
+        masks=cat_field("masks"),
+        is_targets=cat_field("is_targets"),
+        is_task_nodes=cat_field("is_task_nodes"),
+        is_padding=cat_field("is_padding"),
+        class_value_indices=cat_field("class_value_indices"),
+        true_batch_size=batch_size,
+    )
 
 
 def configure_dynamo(use_compile: bool, world_size: int) -> None:
@@ -116,20 +304,21 @@ def configure_dynamo(use_compile: bool, world_size: int) -> None:
 
 
 def prepare_dataloader(
-    dataset: TensorDataset,
+    dataset: Dataset,
     batch_size: int,
     world_size: int,
     rank: int,
-    device: torch.device,
+    hardware_config: HardwareConfig,
 ) -> tuple[DataLoader, DistributedSampler]:
     """Create distributed dataloader for the given dataset."""
     sampler: DistributedSampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
-    loader = DataLoader(
+    loader: DataLoader = DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=sampler,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=hardware_config.pin_memory,
         shuffle=False,
+        collate_fn=collate_batches,
     )
     return loader, sampler
 
@@ -137,7 +326,6 @@ def prepare_dataloader(
 class Trainer:
     """Handles distributed training with checkpointing support."""
 
-    # ruff: noqa: PLR0913, PLR0917
     def __init__(
         self,
         model: nn.Module,
@@ -145,9 +333,8 @@ class Trainer:
         sampler: DistributedSampler,
         optimizer: optim.Optimizer,
         scheduler: optim.lr_scheduler.LRScheduler,
-        loss_fn: nn.Module,
         config: TrainConfig,
-        device: torch.device,
+        hardware_config: HardwareConfig,
         local_rank: int,
         global_rank: int,
         world_size: int,
@@ -155,14 +342,13 @@ class Trainer:
         self.local_rank = local_rank
         self.global_rank = global_rank
         self.world_size = world_size
-        self.device = device
+        self.hardware_config = hardware_config
         self.config = config
 
         self.train_loader = train_loader
         self.sampler = sampler
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.loss_fn = loss_fn
 
         self.epochs_run = 0
         self.wandb_run: wandb.sdk.wandb_run.Run | None = None
@@ -170,8 +356,8 @@ class Trainer:
         # Wrap model with DDP
         self.model = self._wrap_model(model)
 
-        # Optionally compile model
-        if config.use_compile and device.type in {"cuda", "mps"}:
+        # Optionally compile model (CUDA or MPS only)
+        if config.use_compile and not hardware_config.is_cpu:
             logger.info("Compiling model with torch.compile(dynamic=False)")
             self.model = torch.compile(  # type: ignore[assignment]
                 self.model, dynamic=False
@@ -186,14 +372,17 @@ class Trainer:
         if self.world_size <= 1:
             return model
 
-        if self.device.type == "cuda":
+        if self.hardware_config.is_cuda:
             return DistributedDataParallel(model, device_ids=[self.local_rank])
         return DistributedDataParallel(model)
 
     def _load_snapshot(self, snapshot_path: str) -> None:
         """Load training state from a snapshot."""
         logger.info(f"Loading snapshot from {snapshot_path}")
-        loc = f"cuda:{self.local_rank}" if self.device.type == "cuda" else "cpu"
+        if self.hardware_config.is_cuda:
+            loc = f"cuda:{self.local_rank}"
+        else:
+            loc = "cpu"
         snapshot = torch.load(snapshot_path, map_location=loc)
 
         self.model.load_state_dict(snapshot["MODEL_STATE"])
@@ -232,26 +421,54 @@ class Trainer:
         torch.save(snapshot, self.config.snapshot_path)
         logger.info(f"Epoch {epoch + 1} | Snapshot saved at {self.config.snapshot_path}")
 
-    def _run_batch(self, source: torch.Tensor, targets: torch.Tensor) -> float:
-        """Run a single training batch and return the loss."""
-        x = source.to(self.device, non_blocking=True)
-        y = targets.to(self.device, non_blocking=True)
+    def _move_batch_to_device(self, batch: Batch) -> Batch:
+        """Move all tensors in a Batch to the target device."""
+        device = self.hardware_config.device
+        float_dtype = self.hardware_config.model_dtype
 
-        if self.device.type == "cuda":
-            x = x.to(torch.bfloat16)
-            y = y.to(torch.bfloat16)
+        def move(t: torch.Tensor) -> torch.Tensor:
+            return t.to(device, non_blocking=True)
+
+        def move_float(t: torch.Tensor) -> torch.Tensor:
+            return t.to(device, dtype=float_dtype, non_blocking=True)
+
+        return Batch(
+            node_indices=move(batch["node_indices"]),
+            table_name_indices=move(batch["table_name_indices"]),
+            column_name_indices=move(batch["column_name_indices"]),
+            f2p_neighbor_indices=move(batch["f2p_neighbor_indices"]),
+            number_values=move_float(batch["number_values"]),
+            datetime_values=move_float(batch["datetime_values"]),
+            boolean_values=move_float(batch["boolean_values"]),
+            text_values=move_float(batch["text_values"]),
+            column_name_values=move_float(batch["column_name_values"]),
+            semantic_types=move(batch["semantic_types"]),
+            masks=move(batch["masks"]),
+            is_targets=move(batch["is_targets"]),
+            is_task_nodes=move(batch["is_task_nodes"]),
+            is_padding=move(batch["is_padding"]),
+            class_value_indices=move(batch["class_value_indices"]),
+            true_batch_size=batch["true_batch_size"],
+        )
+
+    def _run_batch(self, batch: Batch) -> float:
+        """Run a single training batch and return the loss."""
+        batch = self._move_batch_to_device(batch)
 
         self.optimizer.zero_grad(set_to_none=True)
-        loss = self.loss_fn(self.model(x), y)
+
+        # Model returns ModelOutput with loss already computed
+        output: ModelOutput = self.model(batch)
+        loss = output["loss"]
         loss.backward()
 
         # Gradient clipping
-        # This has to happen *after* loss.backward(), which automatically handles DDP
-        # gradient averaging, but *before* optimizer.step(), which needs the clipped
-        # gradients to update parameters.
+        # This has to happen *after* loss.backward(), which automatically
+        # handles DDP gradient averaging, but *before* optimizer.step(),
+        # which needs the clipped gradients to update parameters.
         model: Any = self.model
         if self.world_size > 1:
-            # Need to unwrap the module from the DDP wrapper here to get parameters.
+            # Unwrap the module from the DDP wrapper to get parameters.
             params = list(model.module.parameters())
         else:
             params = list(model.parameters())
@@ -269,12 +486,13 @@ class Trainer:
         self.sampler.set_epoch(epoch)
         total_loss = 0.0
 
-        b_sz = len(next(iter(self.train_loader))[0])
+        first_batch: Batch = next(iter(self.train_loader))
+        b_sz = first_batch["node_indices"].shape[0]
         if self.global_rank == 0:
-            logger.info(f"Epoch {epoch + 1} | Batchsize: {b_sz} | Batches per epoch: {len(self.train_loader)}")
+            logger.info(f"Epoch {epoch + 1} | Batchsize: {b_sz} | Steps per epoch: {len(self.train_loader)}")
 
-        for source, targets in self.train_loader:
-            batch_loss = self._run_batch(source, targets)
+        for batch in self.train_loader:
+            batch_loss = self._run_batch(batch)
             total_loss += batch_loss
 
         return total_loss
@@ -284,7 +502,7 @@ class Trainer:
         if self.world_size <= 1:
             return total_loss
 
-        loss_tensor = torch.tensor([total_loss], device=self.device)
+        loss_tensor = torch.tensor([total_loss], device=self.hardware_config.device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
         return loss_tensor.item()
 
@@ -294,14 +512,21 @@ class Trainer:
             return
 
         config_dict = {
+            # Training hyperparameters
             "max_grad_norm": self.config.max_grad_norm,
             "seed": self.config.seed,
             "lr": self.config.lr,
             "weight_decay": self.config.weight_decay,
             "epochs": self.config.epochs,
             "batch_size": self.config.batch_size,
-            "hidden_dim": self.config.hidden_dim,
             "use_compile": self.config.use_compile,
+            # Model architecture
+            "num_blocks": self.config.num_blocks,
+            "d_model": self.config.d_model,
+            "d_text": self.config.d_text,
+            "num_heads": self.config.num_heads,
+            "d_ff": self.config.d_ff,
+            "seq_len": self.config.seq_len,
         }
         self.wandb_run = wandb.init(
             entity=self.config.wandb_entity,
@@ -320,13 +545,35 @@ class Trainer:
                 step=epoch + 1,
             )
 
-    def train(self) -> None:  # noqa: C901
+    def _warmup_compile(self) -> None:
+        """
+        Run a warmup forward pass to trigger torch.compile.
+
+        This moves the compilation cost out of the first epoch so tqdm
+        timing stats are accurate.
+        """
+        if not self.config.use_compile or self.hardware_config.is_cpu:
+            return
+
+        logger.info("Running warmup forward pass to trigger compilation...")
+        start = time.time()
+        warmup_batch: Batch = next(iter(self.train_loader))
+        warmup_batch = self._move_batch_to_device(warmup_batch)
+        with torch.no_grad():
+            _ = self.model(warmup_batch)
+        if self.hardware_config.is_cuda:
+            torch.cuda.synchronize()
+        elif self.hardware_config.is_mps:
+            torch.mps.synchronize()
+        end = time.time()
+        logger.success(f"Warmup complete, compilation finished in {end - start:.2f} seconds")
+
+    def train(self) -> None:
         """Run the full training loop."""
         self._init_wandb()
 
         model: Any = self.model
         if self.global_rank == 0:
-            # Log model info
             if self.world_size > 1:
                 params = model.module.parameters()
             else:
@@ -334,14 +581,10 @@ class Trainer:
             num_params = sum(p.numel() for p in params)
             logger.info(f"Model: {num_params:,} params (~{num_params / 1e6:.1f}M)")
 
-        # Always use bfloat16 on CUDA for efficiency
-        if self.device.type == "cuda":
-            if self.world_size > 1:
-                model.module.to(torch.bfloat16)
-            else:
-                model.to(torch.bfloat16)
+        model.to(self.hardware_config.model_dtype)
 
-        # Check if training is already complete
+        self._warmup_compile()
+
         if self.epochs_run >= self.config.epochs:
             logger.warning(
                 f"Training already complete ({self.epochs_run}/{self.config.epochs}"
@@ -377,16 +620,19 @@ class Trainer:
 
 def load_train_objs(
     config: TrainConfig,
-    device: torch.device,
-) -> tuple[TensorDataset, nn.Module]:
+    hardware_config: HardwareConfig,
+) -> tuple[Dataset, nn.Module]:
     """Load dataset and model."""
-    # Create synthetic dataset
-    x = torch.randn(10000, 10)
-    y = torch.randn(10000, 1)
-    dataset = TensorDataset(x, y)
+    # Create dummy batch dataset
+    dataset: Dataset = DummyBatchDataset(
+        num_samples=config.num_samples,
+        batch_size=config.batch_size,
+        seq_len=config.seq_len,
+        d_text=config.d_text,
+    )
 
     # Build model
-    model = build_model(config.hidden_dim, device)
+    model = build_model(config, hardware_config)
 
     return dataset, model
 
@@ -394,7 +640,7 @@ def load_train_objs(
 def create_optimizer(
     model: nn.Module,
     config: TrainConfig,
-    device: torch.device,
+    hardware_config: HardwareConfig,
     total_steps: int,
 ) -> tuple[optim.Optimizer, optim.lr_scheduler.LRScheduler]:
     """Create AdamW optimizer with OneCycleLR scheduler."""
@@ -402,7 +648,7 @@ def create_optimizer(
         model.parameters(),
         lr=config.lr,
         weight_decay=config.weight_decay,
-        fused=(device.type == "cuda"),
+        fused=hardware_config.use_fused_optimizer,
     )
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
@@ -417,21 +663,20 @@ def create_optimizer(
 def main(config: TrainConfig) -> None:
     """Main entry point for training."""
     seed_everything(config.seed)
-    local_rank, global_rank, world_size, device = ddp_setup()
+    local_rank, global_rank, world_size, hardware_config = ddp_setup()
 
     # Configure dynamo before model creation
     configure_dynamo(config.use_compile, world_size)
 
     # Load dataset and model
-    dataset, model = load_train_objs(config, device)
+    dataset, model = load_train_objs(config, hardware_config)
 
     # Prepare dataloader
-    train_loader, sampler = prepare_dataloader(dataset, config.batch_size, world_size, global_rank, device)
+    train_loader, sampler = prepare_dataloader(dataset, config.batch_size, world_size, global_rank, hardware_config)
 
     # Create optimizer and scheduler
     total_steps = config.epochs * len(train_loader)
-    optimizer, scheduler = create_optimizer(model, config, device, total_steps)
-    loss_fn = nn.MSELoss()
+    optimizer, scheduler = create_optimizer(model, config, hardware_config, total_steps)
 
     # Create trainer and run
     trainer = Trainer(
@@ -440,9 +685,8 @@ def main(config: TrainConfig) -> None:
         sampler=sampler,
         optimizer=optimizer,
         scheduler=scheduler,
-        loss_fn=loss_fn,
         config=config,
-        device=device,
+        hardware_config=hardware_config,
         local_rank=local_rank,
         global_rank=global_rank,
         world_size=world_size,
@@ -460,7 +704,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Distributed training with torchrun")
     parser.add_argument("--epochs", type=int, default=20, help="Total epochs to train (default: 20)")
-    parser.add_argument("--batch-size", type=int, default=256, help="Input batch size per device (default: 256)")
+    parser.add_argument("--batch-size", type=int, default=8, help="Input batch size per device (default: 8)")
     parser.add_argument("--save-every", type=int, default=5, help="Save snapshot every N epochs (default: 5)")
     parser.add_argument("--snapshot-path", type=str, default="snapshot.pt", help="Path to save/load snapshots (default: snapshot.pt)")
     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate (default: 0.01)")

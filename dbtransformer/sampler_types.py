@@ -2,26 +2,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import Any
 
 
 @dataclass
 class Cell:
     """Represents a single database cell"""
-    value: any
+
+    value: Any
     column: str
     table: str
     row_id: int
     is_masked: bool = False
 
+
 @dataclass
 class Row:
     """Represents a database row with relationships"""
+
     row_id: str
     table: str
-    cells: List[Cell]
-    timestamp: Optional[datetime]
-    
+    cells: list[Cell]
+    timestamp: datetime | None
+
     # Foreign key relationships
-    f2p_neighbors: List[Row]  # Foreign → Primary (parents; outbound)
-    p2f_neighbors: List[Row]  # Primary → Foreign (children; inbound)
+    f2p_neighbors: list[Row]  # Foreign → Primary (parents; outbound)
+    p2f_neighbors: list[Row]  # Primary → Foreign (children; inbound)

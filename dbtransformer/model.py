@@ -1,24 +1,5 @@
 # An implementation of the relational transformer model.
-from enum import Enum
-from typing import TypedDict
-
-import torch
-import torch.nn.functional as F  # noqa: N812
-from beartype import beartype
-from einops import rearrange
-from einops._torch_specific import allow_ops_in_compiled_graph  # noqa: PLC2701
-from jaxtyping import BFloat16, Bool, Float, Int, Int32, jaxtyped
-from loguru import logger
-from torch import Tensor, nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
-
-logger.info("Initializing model.py...")
-logger.info("Allowing ops in compiled graph")
-allow_ops_in_compiled_graph()
-logger.info("Compiling flex attention")
-flex_attention = torch.compile(flex_attention)
-
+# https://arxiv.org/abs/2510.06377
 # Model sizing from the paper:
 # L = 12
 # d_text = 384
@@ -27,6 +8,33 @@ flex_attention = torch.compile(flex_attention)
 # num_heads = 8
 # batch_size = 128
 # seq_len = 1024
+
+
+from enum import Enum
+from typing import TypedDict
+
+import torch
+import torch.nn.functional as F  # noqa: N812
+from beartype import beartype
+from einops import rearrange
+from einops._torch_specific import allow_ops_in_compiled_graph  # noqa: PLC2701
+from jaxtyping import Bool, Float, Int, jaxtyped
+from loguru import logger
+from torch import Tensor, nn
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    create_block_mask,
+    flex_attention,
+)
+
+from dbtransformer.hardware_abstraction_layer import HardwareConfig
+
+logger.info("Initializing model.py...")
+allow_ops_in_compiled_graph()
+
+# TODO(mrdmnd): only do this if we're using flex attention; this will break on MPS
+logger.info("Compiling flex_attention...")
+flex_attention = torch.compile(flex_attention)
 
 
 # We have four kinds of masked attention blocks:
@@ -55,11 +63,15 @@ MAX_F2P_NEIGHBORS = 5
 # We save the attention type as a class variable for debugging.
 @jaxtyped(typechecker=beartype)
 class GenericMaskedAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, attention_type: AttentionType) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        attention_type: AttentionType,
+    ) -> None:
         super().__init__()
         self.attention_type = attention_type
         self.num_heads = num_heads
-        # We're not going to use a different size for wk for now, just reuse wq / wv dims
         self.wq = nn.Linear(d_model, d_model, bias=False)
         self.wk = nn.Linear(d_model, d_model, bias=False)
         self.wv = nn.Linear(d_model, d_model, bias=False)
@@ -68,7 +80,7 @@ class GenericMaskedAttentionBlock(nn.Module):
     def forward(
         self,
         x: Float[Tensor, "b s d"],
-        block_mask: BlockMask | None,
+        mask: BlockMask | Bool[Tensor, "b s s"] | None,
     ) -> Float[Tensor, "b s d"]:
         q: Float[Tensor, "b s d"] = self.wq(x)
         k: Float[Tensor, "b s d"] = self.wk(x)
@@ -78,17 +90,21 @@ class GenericMaskedAttentionBlock(nn.Module):
         k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
         v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
 
-        if block_mask is not None:
-            attn_out = flex_attention(q, k, v, block_mask=block_mask)
-            if not isinstance(attn_out, Tensor):
-                raise TypeError(f"Expected Tensor, got {type(attn_out)}")
-            x = attn_out
+        if isinstance(mask, BlockMask):
+            # flex_attention returns Tensor when return_lse=False (default)
+            # we know this, but mypy doesn't - no cast, but just ignoring the warning.
+            attn_out: Float[Tensor, "b h s d"] = flex_attention(q, k, v, block_mask=mask)  # type: ignore[assignment]
+        elif isinstance(mask, Tensor):
+            # MPS/CPU fallback: use SDPA with dense bool mask
+            # Expand (b, s, s) -> (b, num_heads, s, s)
+            attn_mask = mask[:, None, :, :].expand(-1, self.num_heads, -1, -1)
+            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         else:
-            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                x = F.scaled_dot_product_attention(q, k, v)
+            # No mask: full attention
+            attn_out = F.scaled_dot_product_attention(q, k, v)
 
-        x = rearrange(x, "b h s d -> b s (h d)")
-        return self.wo(x)
+        out: Float[Tensor, "b s d"] = rearrange(attn_out, "b h s d -> b s (h d)")
+        return self.wo(out)
 
 
 # Bog-standard FFN with no biases. Uses SwiGLU activation.
@@ -107,7 +123,12 @@ class FFN(nn.Module):
 # Implements the "Relational Transformer Block" from the paper.
 @jaxtyped(typechecker=beartype)
 class RelationalBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+    ) -> None:
         super().__init__()
         self.column_norm = nn.RMSNorm(d_model)
         self.feature_norm = nn.RMSNorm(d_model)
@@ -122,22 +143,32 @@ class RelationalBlock(nn.Module):
 
         self.ffn = FFN(d_model, d_ff)
 
-    def forward(self, x: Float[Tensor, "b s d"], block_masks: dict[AttentionType, BlockMask | None]) -> Float[Tensor, "b s d"]:
-        x += self.column_attn(self.column_norm(x), block_masks[AttentionType.COLUMN])
-        x += self.feature_attn(self.feature_norm(x), block_masks[AttentionType.FEATURE])
-        x += self.neighbor_attn(self.neighbor_norm(x), block_masks[AttentionType.NEIGHBOR])
-        x += self.full_attn(self.full_norm(x), block_masks[AttentionType.FULL])
-        x += self.ffn(self.ffn_norm(x))
-        return x
+    def forward(
+        self,
+        x: Float[Tensor, "b s d"],
+        masks: dict[AttentionType, BlockMask | Bool[Tensor, "b s s"] | None],
+    ) -> Float[Tensor, "b s d"]:
+        # Don't use += operations to avoid autograd issues
+        x = x + self.column_attn(self.column_norm(x), masks[AttentionType.COLUMN])  # noqa: PLR6104
+        x = x + self.feature_attn(self.feature_norm(x), masks[AttentionType.FEATURE])  # noqa: PLR6104
+        x = x + self.neighbor_attn(self.neighbor_norm(x), masks[AttentionType.NEIGHBOR])  # noqa: PLR6104
+        x = x + self.full_attn(self.full_norm(x), masks[AttentionType.FULL])  # noqa: PLR6104
+        x = x + self.ffn(self.ffn_norm(x))  # noqa: PLR6104
+        return x  # noqa: RET504
 
 
 # This is torch.flex_attention's BlockMask.
-# https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html#torch.nn.attention.flex_attention.create_block_mask
-# https://github.com/pytorch/pytorch/blob/v2.9.1/torch/nn/attention/flex_attention.py#L1027
-# in particular, the signature for "mask_mod" is:
-# _mask_mod_signature = Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]
+# https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html
+# https://github.com/pytorch/pytorch/blob/v2.9.1/torch/nn/attention/flex_attention.py
+# The mask_mod signature is Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]
 # but the input tensors are 1d scalars, basically.
-def _generate_block_mask(mask: Bool[Tensor, "b s s"], batch_size: int, seq_len: int, device: torch.device) -> BlockMask:
+@jaxtyped(typechecker=beartype)
+def _generate_block_mask(
+    mask: Bool[Tensor, "b s s"],
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+) -> BlockMask:
     # This is a "mask modifier" function that flex attention uses to determine
     # if a query position can attend to a key-value position. The parameters are
     # - b: batch index
@@ -147,7 +178,7 @@ def _generate_block_mask(mask: Bool[Tensor, "b s s"], batch_size: int, seq_len: 
 
     def mask_mod(
         b: Int[Tensor, " b"],  # Batch size
-        _h: Int[Tensor, " h"],  # Number of heads; unused in this case. All heads share the same mask pattern.
+        _h: Int[Tensor, " h"],  # Num heads; unused. All heads share same mask.
         q_idx: Int[Tensor, " q_idx"],  # Query index
         kv_idx: Int[Tensor, " kv_idx"],  # Key-value index
     ) -> Bool[Tensor, "b h q_idx kv_idx"]:
@@ -173,18 +204,18 @@ class Batch(TypedDict):
     # they belong to the same row. Used to compute attention masks:
     # - "same_node" for feature attention (cells in the same row attend)
     # - "kv_in_f2p" / "q_in_p2f" for neighbor attention (parent/child rows)
-    node_indices: Int32[Tensor, "b s"]
+    node_indices: Int[Tensor, "b s"]
 
     # Unique integer ID for this cell's table. Used with column_name_indices
     # for equality comparison to compute the "same column AND same table"
     # attention mask for column attention. Not used for embedding lookup.
-    table_name_indices: Int32[Tensor, "b s"]
+    table_name_indices: Int[Tensor, "b s"]
 
     # Unique integer ID for this cell's column (globally unique across all
     # tables). Used with table_name_indices for equality comparison to
     # compute column attention mask. Not used for embedding lookup -
     # the actual column name embeddings come via column_name_values.
-    column_name_indices: Int32[Tensor, "b s"]
+    column_name_indices: Int[Tensor, "b s"]
 
     # Foreign-to-primary (parent) neighbor indices for each cell's row.
     # If a row has a foreign key referencing another row, that parent row's
@@ -194,32 +225,32 @@ class Batch(TypedDict):
 
     # The real shape is (b, s, MAX_F2P_NEIGHBORS), but jaxtyping is going to want a
     # constant, so here's the magic number five.
-    f2p_neighbor_indices: Int32[Tensor, "b s 5"]
+    f2p_neighbor_indices: Int[Tensor, "b s 5"]
 
     # Numeric cell values, z-score normalized per column: (val - mean) / std.
     # NaN values are skipped during preprocessing. Val/test splits use
     # statistics computed from the training set for consistency.
-    number_values: BFloat16[Tensor, "b s 1"]
+    number_values: Float[Tensor, "b s 1"]
 
     # Datetime cell values (converted to nanoseconds), z-score normalized using
     # *global* statistics computed across ALL datetime columns in the entire
     # database, not per-column. This allows cross-table temporal reasoning.
-    datetime_values: BFloat16[Tensor, "b s 1"]
+    datetime_values: Float[Tensor, "b s 1"]
 
     # Boolean cell values, converted to 0.0/1.0 then z-score normalized
     # per column (same as number_values). Not raw 0/1!
-    boolean_values: BFloat16[Tensor, "b s 1"]
+    boolean_values: Float[Tensor, "b s 1"]
 
     # Pre-computed text embeddings from some SentenceTransformer (e.g. MiniLM).
     # During preprocessing, all unique strings are embedded and stored;
     # at runtime these could looked up by index from a memory-mapped file.
-    text_values: BFloat16[Tensor, "b s d_text"]
+    text_values: Float[Tensor, "b s d_text"]
 
     # Pre-computed embeddings for column names, formatted as
     # "<column_name> of <table_name>" (e.g., "price of products").
     # TODO(mrdmnd): expand to include column descriptions!
     # Added to every cell's representation as positional context.
-    column_name_values: BFloat16[Tensor, "b s d_text"]
+    column_name_values: Float[Tensor, "b s d_text"]
 
     # Semantic type determining which encoder/decoder head to use:
     # 0=number, 1=text, 2=datetime, 3=boolean (see SemanticsType enum).
@@ -250,7 +281,7 @@ class Batch(TypedDict):
     # Set to -1 for non-categorical types. Currently unused in the model
     # but could enable a categorical prediction head in the future
     # (predict which category from a vocabulary).
-    class_value_indices: Int32[Tensor, "b s"]
+    class_value_indices: Int[Tensor, "b s"]
 
     # Actual number of valid samples in this batch (not padded duplicates).
     # The last batch may have fewer samples; positions >= true_batch_size
@@ -270,12 +301,20 @@ class ModelOutput(TypedDict):
 
 @jaxtyped(typechecker=beartype)
 class RelationalTransformer(nn.Module):
-    def __init__(self, num_blocks: int, d_model: int, d_text: int, num_heads: int, d_ff: int) -> None:
+    def __init__(
+        self,
+        num_blocks: int,
+        d_model: int,
+        d_text: int,
+        num_heads: int,
+        d_ff: int,
+        hardware_config: HardwareConfig,
+    ) -> None:
         super().__init__()
+        self.hardware_config = hardware_config
         self.d_model = d_model
 
         # Set up initial embedding layers
-        # TODO(mrdmnd): this could be expanded to include column descriptions, not just "<col_name> of <table_name>"
         self.column_name_encoder = nn.Linear(d_text, d_model, bias=True)
         self.number_encoder = nn.Linear(1, d_model, bias=True)
         self.text_encoder = nn.Linear(d_text, d_model, bias=True)
@@ -325,10 +364,11 @@ class RelationalTransformer(nn.Module):
         # Semantics types: [0, 1, 2, 3] -> [number, text, datetime, boolean]
         semantic_type: Int[Tensor, "b s"] = batch["semantic_types"]
 
-        # Disallow masked text positions for now - we aren't predicting text yet.
-        masked_text: Bool[Tensor, "b s"] = masks & (semantic_type == SemanticsType.TEXT.value)
-        if masked_text.any():
-            raise ValueError("Masked text positions are not supported yet.")
+        # Disallow masked text positions for now - we don't predict text yet.
+        # NOTE: This check is expensive (forces GPU sync) so only uncomment / run in debug mode.
+        # masked_text = masks & (semantic_type == SemanticsType.TEXT.value)
+        # if masked_text.any():
+        #   raise ValueError("Masked text positions not supported yet.")
 
         b: int = node_indices.shape[0]  # Batch Size
         s: int = node_indices.shape[1]  # Sequence Length
@@ -351,24 +391,49 @@ class RelationalTransformer(nn.Module):
             table_name_indices[:, :, None] == table_name_indices[:, None, :]
         )
 
-        # Final attention masks, per-type
+        # Final attention masks, per-type (dense bool tensors)
         column_mask: Bool[Tensor, "b s s"] = same_column_and_table & pad
         feature_mask: Bool[Tensor, "b s s"] = (same_node | kv_in_f2p) & pad
         neighbor_mask: Bool[Tensor, "b s s"] = q_in_p2f & pad
         full_mask: Bool[Tensor, "b s s"] = pad
 
-        # Make masks contiguous for kernel performance and compile for flex attention
-        block_column_mask = _generate_block_mask(column_mask.contiguous(), b, s, device)
-        block_feature_mask = _generate_block_mask(feature_mask.contiguous(), b, s, device)
-        block_neighbor_mask = _generate_block_mask(neighbor_mask.contiguous(), b, s, device)
-        block_full_mask = _generate_block_mask(full_mask.contiguous(), b, s, device)
-
-        block_masks: dict[AttentionType, BlockMask] = {
-            AttentionType.COLUMN: block_column_mask,
-            AttentionType.FEATURE: block_feature_mask,
-            AttentionType.NEIGHBOR: block_neighbor_mask,
-            AttentionType.FULL: block_full_mask,
-        }
+        # Build attention masks - use BlockMask on CUDA, dense bool on MPS/CPU
+        if self.hardware_config.use_flex_attention:
+            # CUDA: convert to BlockMask for flex_attention
+            attn_masks: dict[AttentionType, BlockMask | Bool[Tensor, "b s s"] | None] = {
+                AttentionType.COLUMN: _generate_block_mask(
+                    column_mask.contiguous(),
+                    b,
+                    s,
+                    device,
+                ),
+                AttentionType.FEATURE: _generate_block_mask(
+                    feature_mask.contiguous(),
+                    b,
+                    s,
+                    device,
+                ),
+                AttentionType.NEIGHBOR: _generate_block_mask(
+                    neighbor_mask.contiguous(),
+                    b,
+                    s,
+                    device,
+                ),
+                AttentionType.FULL: _generate_block_mask(
+                    full_mask.contiguous(),
+                    b,
+                    s,
+                    device,
+                ),
+            }
+        else:
+            # MPS/CPU: pass dense bool masks directly for SDPA
+            attn_masks = {
+                AttentionType.COLUMN: column_mask.contiguous(),
+                AttentionType.FEATURE: feature_mask.contiguous(),
+                AttentionType.NEIGHBOR: neighbor_mask.contiguous(),
+                AttentionType.FULL: full_mask.contiguous(),
+            }
 
         # The forward pass!
 
@@ -416,7 +481,7 @@ class RelationalTransformer(nn.Module):
         #  RUN THE BLOCKS
         # =======================================================
         for block in self.blocks:
-            x = block(x, block_masks)
+            x = block(x, attn_masks)
 
         x = self.out_norm(x)
 
