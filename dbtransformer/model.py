@@ -32,9 +32,12 @@ from dbtransformer.hardware_abstraction_layer import HardwareConfig
 logger.info("Initializing model.py...")
 allow_ops_in_compiled_graph()
 
-# TODO(mrdmnd): only do this if we're using flex attention; this will break on MPS
-logger.info("Compiling flex_attention...")
-flex_attention = torch.compile(flex_attention)
+# Only compile flex_attention on CUDA where it's actually used
+if torch.cuda.is_available():
+    logger.info("Compiling flex_attention for CUDA...")
+    flex_attention = torch.compile(flex_attention)
+else:
+    logger.warning("Skipping flex_attention compilation (no CUDA available)")
 
 
 # We have four kinds of masked attention blocks:
@@ -365,7 +368,7 @@ class RelationalTransformer(nn.Module):
         semantic_type: Int[Tensor, "b s"] = batch["semantic_types"]
 
         # Disallow masked text positions for now - we don't predict text yet.
-        # NOTE: This check is expensive (forces GPU sync) so only uncomment / run in debug mode.
+        # NOTE: This check is expensive (forces GPU sync) so comment out.
         # masked_text = masks & (semantic_type == SemanticsType.TEXT.value)
         # if masked_text.any():
         #   raise ValueError("Masked text positions not supported yet.")
@@ -380,7 +383,8 @@ class RelationalTransformer(nn.Module):
         # Cells in the same node can attend to each other
         same_node: Bool[Tensor, "b s s"] = node_indices[:, :, None] == node_indices[:, None, :]
 
-        # If the KV index is in A's foreign-to-primary (parent) neighbohood set
+        # If the KV index is in Q's foreign-to-primary (parent) neighborhood set
+        # Shape: (b, s, s, 5) -> (b, s, s) via any()
         kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
 
         # If the Q index is in KV's primary-to-foreign (child) neighborhood set
@@ -434,8 +438,6 @@ class RelationalTransformer(nn.Module):
                 AttentionType.NEIGHBOR: neighbor_mask.contiguous(),
                 AttentionType.FULL: full_mask.contiguous(),
             }
-
-        # The forward pass!
 
         # =======================================================
         #  INPUT EMBEDDING STEP
@@ -513,6 +515,7 @@ class RelationalTransformer(nn.Module):
 
         # Single masked sum and division
         loss_out: Float[Tensor, ""] = (combined_loss * masks).sum() / masks.sum() + dummy
+
         return ModelOutput(
             loss=loss_out,
             yhat_number=yhat_number,

@@ -21,9 +21,17 @@ uv sync
 
 ```bash
 uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py
-
-
 ```
+
+## Profiling
+
+You can profile with
+
+```bash
+uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py --profile torch --no-wandb --epochs 1
+```
+
+Then open `http://ui.perfetto.dev` in your browser and load the content from the `profiler_logs` directory.
 
 In another process you can wandb login and then
 `wandb beta leet` if you want a sick TUI, or go to the website version at:

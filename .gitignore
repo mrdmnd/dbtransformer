@@ -98,5 +98,6 @@ logs/
 data/
 wandb/
 snapshot.pt
+profiler_logs/
 
 .DS_Store

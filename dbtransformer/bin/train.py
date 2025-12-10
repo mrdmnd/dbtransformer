@@ -13,6 +13,7 @@ Always run with uv run torchrun:
 import os
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,6 @@ import torch.distributed as dist
 from loguru import logger
 from torch import nn, optim
 from torch.nn.parallel import DistributedDataParallel
-from torch.nn.utils import clip_grads_with_norm_, get_total_norm
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 
@@ -34,6 +34,12 @@ from dbtransformer.model import (
     Batch,
     ModelOutput,
     RelationalTransformer,
+)
+from dbtransformer.profiling import (
+    mps_profiler_context,
+    no_profiler_context,
+    torch_profiler_context,
+    torch_profiler_full_context,
 )
 
 
@@ -59,15 +65,26 @@ class TrainConfig:
     d_text: int = 384
     num_heads: int = 4
     d_ff: int = 4 * d_model
-    seq_len: int = 256
+    seq_len: int = 512
+
+    # Data loading
+    num_workers: int = 0  # 0=sync, 1+=async background workers
+    debug_timing: bool = False  # Enable per-phase timing in model forward
 
     # Dataset size for dummy data
-    num_samples: int = 1000
+    total_num_samples: int = 2048
 
     # Weights & Biases config
     use_wandb: bool = True
     wandb_entity: str = "mttrdmnd-massachusetts-institute-of-technology"
     wandb_project: str | None = "dbtransformer"
+
+    # Profiling config
+    profile_mode: str | None = None  # "torch", "mps", or None
+    profile_output: str = "./profiler_logs"
+    profile_wait: int = 2
+    profile_warmup: int = 2
+    profile_active: int = 6
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -229,19 +246,19 @@ class DummyBatchDataset(Dataset):
 
     def __init__(
         self,
-        num_samples: int,
+        total_num_samples: int,
         batch_size: int,
         seq_len: int,
         d_text: int,
     ) -> None:
-        self.num_samples = num_samples
+        self.total_num_samples = total_num_samples
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.d_text = d_text
 
         # Pre-generate a pool of batches to reuse (much faster than on-the-fly)
         # Use a smaller pool and cycle through it
-        self._pool_size = min(64, num_samples)
+        self._pool_size = min(64, total_num_samples)
         logger.info(f"Pre-generating {self._pool_size} dummy batches...")
         self._batch_pool = [
             create_dummy_batch(
@@ -255,11 +272,11 @@ class DummyBatchDataset(Dataset):
         logger.info("Done pre-generating batches.")
 
     def __len__(self) -> int:
-        return self.num_samples
+        return self.total_num_samples
 
     def __getitem__(self, idx: int) -> Batch:
         # Return from pre-generated pool (cycling through)
-        return self._batch_pool[idx % self._pool_size]
+        return self._batch_pool[idx % self._pool_size]  # type: ignore[index]
 
 
 def collate_batches(batches: list[Batch]) -> Batch:
@@ -294,6 +311,72 @@ def collate_batches(batches: list[Batch]) -> Batch:
     )
 
 
+class DeviceCollator:
+    """
+    Collate batches directly onto target device.
+
+    For MPS: Creates tensors directly on device, leveraging unified memory.
+    This eliminates the CPU->device "move" entirely since MPS can write
+    directly to unified memory during collation.
+
+    For CUDA: Still creates on CPU (with pinned memory via DataLoader),
+    since async DMA transfer is more efficient than direct GPU allocation.
+
+    Only usable with num_workers=0 (main process has device access).
+    """
+
+    def __init__(
+        self,
+        hardware_config: HardwareConfig,
+    ) -> None:
+        self.device = hardware_config.device
+        self.float_dtype = hardware_config.model_dtype
+        # Only place directly on device for MPS (unified memory benefit).
+        # CUDA is better served by pinned memory + async transfer.
+        self.use_direct_device = hardware_config.is_mps
+
+    def __call__(self, batches: list[Batch]) -> Batch:
+        batch_size = len(batches)
+
+        if not self.use_direct_device:
+            # CUDA/CPU: use standard collation (pinned memory handles it)
+            return collate_batches(batches)
+
+        # MPS: concatenate and place directly on device in one operation
+        device = self.device
+        float_dtype = self.float_dtype
+
+        def cat_to_device(key: str) -> torch.Tensor:
+            tensors = [b[key] for b in batches]  # type: ignore[literal-required]
+            # torch.cat creates output on same device as inputs (CPU)
+            # .to(device) with MPS unified memory is essentially a no-op
+            # for the data, just creates the Metal buffer wrapper
+            return torch.cat(tensors, dim=0).to(device)
+
+        def cat_to_device_float(key: str) -> torch.Tensor:
+            tensors = [b[key] for b in batches]  # type: ignore[literal-required]
+            return torch.cat(tensors, dim=0).to(device, dtype=float_dtype)
+
+        return Batch(
+            node_indices=cat_to_device("node_indices"),
+            table_name_indices=cat_to_device("table_name_indices"),
+            column_name_indices=cat_to_device("column_name_indices"),
+            f2p_neighbor_indices=cat_to_device("f2p_neighbor_indices"),
+            number_values=cat_to_device_float("number_values"),
+            datetime_values=cat_to_device_float("datetime_values"),
+            boolean_values=cat_to_device_float("boolean_values"),
+            text_values=cat_to_device_float("text_values"),
+            column_name_values=cat_to_device_float("column_name_values"),
+            semantic_types=cat_to_device("semantic_types"),
+            masks=cat_to_device("masks"),
+            is_targets=cat_to_device("is_targets"),
+            is_task_nodes=cat_to_device("is_task_nodes"),
+            is_padding=cat_to_device("is_padding"),
+            class_value_indices=cat_to_device("class_value_indices"),
+            true_batch_size=batch_size,
+        )
+
+
 def configure_dynamo(use_compile: bool, world_size: int) -> None:
     """Configure torch.compile / dynamo settings."""
     if not use_compile:
@@ -309,16 +392,44 @@ def prepare_dataloader(
     world_size: int,
     rank: int,
     hardware_config: HardwareConfig,
+    num_workers: int = 0,
 ) -> tuple[DataLoader, DistributedSampler]:
-    """Create distributed dataloader for the given dataset."""
+    """Create distributed dataloader for the given dataset.
+
+    Args:
+        num_workers: Number of worker processes for data loading.
+            0 = load in main process (synchronous, GPU waits for data)
+            1 = one background worker (overlaps data prep with GPU compute)
+            >1 = multiple workers (useful for heavy CPU preprocessing)
+
+    For MPS with num_workers=0: Uses DeviceCollator to place batches
+    directly on device during collation, eliminating the batch-to-device
+    transfer step entirely (leverages unified memory architecture).
+    """
     sampler: DistributedSampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+
+    # Use device-aware collator when safe (num_workers=0 means main process
+    # does collation, so we have device access). For MPS this eliminates
+    # the batch-to-device overhead by collating directly into unified memory.
+    collate_fn: Callable[[list[Batch]], Batch]
+    if num_workers == 0:
+        collate_fn = DeviceCollator(hardware_config)
+    else:
+        # Workers can't access GPU, must collate on CPU
+        collate_fn = collate_batches
+
     loader: DataLoader = DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=sampler,
         pin_memory=hardware_config.pin_memory,
         shuffle=False,
-        collate_fn=collate_batches,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        # Persistent workers avoid re-spawning overhead between epochs
+        persistent_workers=num_workers > 0,
+        # Prefetch batches to overlap data loading with compute
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     return loader, sampler
 
@@ -338,6 +449,7 @@ class Trainer:
         local_rank: int,
         global_rank: int,
         world_size: int,
+        profiler: torch.profiler.profile | None = None,
     ) -> None:
         self.local_rank = local_rank
         self.global_rank = global_rank
@@ -349,6 +461,7 @@ class Trainer:
         self.sampler = sampler
         self.optimizer = optimizer
         self.scheduler = scheduler
+        self.profiler = profiler
 
         self.epochs_run = 0
         self.wandb_run: wandb.sdk.wandb_run.Run | None = None
@@ -422,15 +535,29 @@ class Trainer:
         logger.info(f"Epoch {epoch + 1} | Snapshot saved at {self.config.snapshot_path}")
 
     def _move_batch_to_device(self, batch: Batch) -> Batch:
-        """Move all tensors in a Batch to the target device."""
+        """Move all tensors in a Batch to the target device.
+
+        Optimizations:
+        - non_blocking=True only for CUDA (MPS unified memory gets no benefit)
+        - Skip move if tensor already on target device
+        - Dtype conversion only when needed
+        """
         device = self.hardware_config.device
         float_dtype = self.hardware_config.model_dtype
+        # non_blocking only helps CUDA (async DMA); MPS is unified memory
+        non_blocking = self.hardware_config.is_cuda
+        # Compare device type, not device object (mps != mps:0)
+        device_type = device.type
 
         def move(t: torch.Tensor) -> torch.Tensor:
-            return t.to(device, non_blocking=True)
+            if t.device.type == device_type:
+                return t
+            return t.to(device, non_blocking=non_blocking)
 
         def move_float(t: torch.Tensor) -> torch.Tensor:
-            return t.to(device, dtype=float_dtype, non_blocking=True)
+            if t.device.type == device_type and t.dtype == float_dtype:
+                return t
+            return t.to(device, dtype=float_dtype, non_blocking=non_blocking)
 
         return Batch(
             node_indices=move(batch["node_indices"]),
@@ -451,8 +578,15 @@ class Trainer:
             true_batch_size=batch["true_batch_size"],
         )
 
-    def _run_batch(self, batch: Batch) -> float:
-        """Run a single training batch and return the loss."""
+    def _sync_device(self) -> None:
+        """Explicit device sync for accurate timing."""
+        if self.hardware_config.is_cuda:
+            torch.cuda.synchronize()
+        elif self.hardware_config.is_mps:
+            torch.mps.synchronize()
+
+    def _run_batch(self, batch: Batch) -> torch.Tensor:
+        """Run a single training batch and return the loss (as a tensor)."""
         batch = self._move_batch_to_device(batch)
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -466,45 +600,54 @@ class Trainer:
         # This has to happen *after* loss.backward(), which automatically
         # handles DDP gradient averaging, but *before* optimizer.step(),
         # which needs the clipped gradients to update parameters.
-        model: Any = self.model
-        if self.world_size > 1:
-            # Unwrap the module from the DDP wrapper to get parameters.
-            params = list(model.module.parameters())
-        else:
-            params = list(model.parameters())
-        grads = [p.grad for p in params if p.grad is not None]
-        grad_norm = get_total_norm(grads)
-        clip_grads_with_norm_(params, self.config.max_grad_norm, grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
 
         self.optimizer.step()
         self.scheduler.step()
 
-        return loss.item()
+        # Explicit sync to ensure GPU work completes before next batch.
+        # This prevents sync time from "leaking" into data loading.
+        # Without this, async GPU ops cause misleading profiler attribution.
+        self._sync_device()
 
-    def _run_epoch(self, epoch: int) -> float:
-        """Run one training epoch and return total loss."""
+        # Notify profiler of step boundary (for torch.profiler schedule)
+        if self.profiler is not None:
+            self.profiler.step()
+
+        # Return detached loss tensor to avoid holding computation graph.
+        # We do NOT call .item() here to avoid a CUDA sync every batch.
+        return loss.detach()
+
+    def _run_epoch(self, epoch: int) -> torch.Tensor:
+        """Run one training epoch and return total loss as a tensor."""
         self.sampler.set_epoch(epoch)
-        total_loss = 0.0
+        # Accumulate on GPU to avoid per-batch CUDA syncs from .item()
+        total_loss = torch.tensor(
+            0.0,
+            device=self.hardware_config.device,
+            dtype=torch.float32,
+        )
 
-        first_batch: Batch = next(iter(self.train_loader))
-        b_sz = first_batch["node_indices"].shape[0]
-        if self.global_rank == 0:
-            logger.info(f"Epoch {epoch + 1} | Batchsize: {b_sz} | Steps per epoch: {len(self.train_loader)}")
+        for i, batch in enumerate(self.train_loader):
+            if i == 0 and self.global_rank == 0:
+                b_sz = batch["node_indices"].shape[0]
+                logger.info(f"Epoch {epoch + 1} | Batchsize: {b_sz} samples | Batches per epoch: {len(self.train_loader)}")
 
-        for batch in self.train_loader:
             batch_loss = self._run_batch(batch)
             total_loss += batch_loss
 
         return total_loss
 
-    def _sync_loss(self, total_loss: float) -> float:
-        """Synchronize loss across all ranks via all_reduce."""
-        if self.world_size <= 1:
-            return total_loss
+    def _sync_loss(self, total_loss: torch.Tensor) -> float:
+        """Synchronize loss across all ranks via all_reduce and return scalar.
 
-        loss_tensor = torch.tensor([total_loss], device=self.hardware_config.device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-        return loss_tensor.item()
+        This is the ONLY place we call .item() on the loss, ensuring we only
+        trigger one CUDA sync per epoch instead of per batch.
+        """
+        if self.world_size > 1:
+            dist.all_reduce(total_loss, op=dist.ReduceOp.AVG)
+
+        return total_loss.item()
 
     def _init_wandb(self) -> None:
         """Initialize Weights & Biases on rank 0 only."""
@@ -547,26 +690,49 @@ class Trainer:
 
     def _warmup_compile(self) -> None:
         """
-        Run a warmup forward pass to trigger torch.compile.
+        Run a full warmup training step to trigger all torch.compile graphs.
 
-        This moves the compilation cost out of the first epoch so tqdm
-        timing stats are accurate.
+        This compiles forward pass, backward pass, gradient clipping, and
+        optimizer step. We save and restore model state so warmup doesn't
+        affect training.
         """
         if not self.config.use_compile or self.hardware_config.is_cpu:
             return
 
-        logger.info("Running warmup forward pass to trigger compilation...")
+        logger.info("Running warmup step to trigger compilation...")
         start = time.time()
+
+        # Save model state before warmup (clone to avoid reference issues)
+        model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+
         warmup_batch: Batch = next(iter(self.train_loader))
         warmup_batch = self._move_batch_to_device(warmup_batch)
-        with torch.no_grad():
-            _ = self.model(warmup_batch)
+
+        # Run full training step to compile all graphs
+        self.optimizer.zero_grad(set_to_none=True)
+        output: ModelOutput = self.model(warmup_batch)
+        loss = output["loss"]
+        loss.backward()
+
+        # Compile gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+
+        # Compile optimizer step (fused kernels)
+        self.optimizer.step()
+
         if self.hardware_config.is_cuda:
             torch.cuda.synchronize()
         elif self.hardware_config.is_mps:
             torch.mps.synchronize()
+
+        # Restore model state (undo warmup weight updates)
+        self.model.load_state_dict(model_state)
+
+        # Reset optimizer state (clear momentum buffers from warmup)
+        self.optimizer.state.clear()
+
         end = time.time()
-        logger.success(f"Warmup complete, compilation finished in {end - start:.2f} seconds")
+        logger.success(f"Warmup complete, compilation finished in {end - start:.2f}s")
 
     def train(self) -> None:
         """Run the full training loop."""
@@ -598,10 +764,10 @@ class Trainer:
             disable=self.global_rank != 0,
         ):
             total_loss = self._run_epoch(epoch)
-            total_loss = self._sync_loss(total_loss)
+            total_loss_scalar = self._sync_loss(total_loss)
 
             if self.global_rank == 0:
-                avg_loss = total_loss / len(self.train_loader)
+                avg_loss = total_loss_scalar / len(self.train_loader)
                 lr_now = self.optimizer.param_groups[0]["lr"]
                 self._log_metrics(epoch, avg_loss, lr_now)
 
@@ -625,7 +791,7 @@ def load_train_objs(
     """Load dataset and model."""
     # Create dummy batch dataset
     dataset: Dataset = DummyBatchDataset(
-        num_samples=config.num_samples,
+        total_num_samples=config.total_num_samples,
         batch_size=config.batch_size,
         seq_len=config.seq_len,
         d_text=config.d_text,
@@ -660,11 +826,15 @@ def create_optimizer(
     return optimizer, scheduler
 
 
-def main(config: TrainConfig) -> None:
-    """Main entry point for training."""
-    seed_everything(config.seed)
-    local_rank, global_rank, world_size, hardware_config = ddp_setup()
-
+def _run_training(
+    config: TrainConfig,
+    hardware_config: HardwareConfig,
+    local_rank: int,
+    global_rank: int,
+    world_size: int,
+    profiler: torch.profiler.profile | None = None,
+) -> None:
+    """Run the full training pipeline (setup + training)."""
     # Configure dynamo before model creation
     configure_dynamo(config.use_compile, world_size)
 
@@ -672,7 +842,14 @@ def main(config: TrainConfig) -> None:
     dataset, model = load_train_objs(config, hardware_config)
 
     # Prepare dataloader
-    train_loader, sampler = prepare_dataloader(dataset, config.batch_size, world_size, global_rank, hardware_config)
+    train_loader, sampler = prepare_dataloader(
+        dataset,
+        config.batch_size,
+        world_size,
+        global_rank,
+        hardware_config,
+        num_workers=config.num_workers,
+    )
 
     # Create optimizer and scheduler
     total_steps = config.epochs * len(train_loader)
@@ -690,8 +867,46 @@ def main(config: TrainConfig) -> None:
         local_rank=local_rank,
         global_rank=global_rank,
         world_size=world_size,
+        profiler=profiler,
     )
     trainer.train()
+
+
+def main(config: TrainConfig) -> None:
+    """Main entry point for training."""
+    seed_everything(config.seed)
+    local_rank, global_rank, world_size, hardware_config = ddp_setup()
+
+    # Select profiler context based on config
+    # "torch-full" wraps EVERYTHING (data loading, setup, training)
+    # "torch" uses a step-based schedule (only profiles training batches)
+    if config.profile_mode == "torch-full":
+        profiler_ctx = torch_profiler_full_context(
+            output_dir=config.profile_output,
+        )
+    elif config.profile_mode == "torch":
+        profiler_ctx = torch_profiler_context(
+            output_dir=config.profile_output,
+            wait=config.profile_wait,
+            warmup=config.profile_warmup,
+            active=config.profile_active,
+        )
+    elif config.profile_mode == "mps":
+        profiler_ctx = mps_profiler_context()
+    else:
+        profiler_ctx = no_profiler_context()
+
+    # Run training (optionally with profiling)
+    with profiler_ctx as prof:
+        use_step_profiler = config.profile_mode == "torch"
+        _run_training(
+            config=config,
+            hardware_config=hardware_config,
+            local_rank=local_rank,
+            global_rank=global_rank,
+            world_size=world_size,
+            profiler=prof if use_step_profiler else None,
+        )
 
     # Cleanup
     dist.destroy_process_group()
@@ -703,24 +918,41 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Distributed training with torchrun")
-    parser.add_argument("--epochs", type=int, default=20, help="Total epochs to train (default: 20)")
-    parser.add_argument("--batch-size", type=int, default=8, help="Input batch size per device (default: 8)")
+
+    # Training arguments
     parser.add_argument("--save-every", type=int, default=5, help="Save snapshot every N epochs (default: 5)")
     parser.add_argument("--snapshot-path", type=str, default="snapshot.pt", help="Path to save/load snapshots (default: snapshot.pt)")
-    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate (default: 0.01)")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
-    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (0=sync, 1+=async, default: 0)")
+
+    # Profiling arguments
+    parser.add_argument(
+        "--profile",
+        type=str,
+        choices=["torch", "torch-full", "mps"],
+        default=None,
+        help="Enable profiling: 'torch' for a few run_batch invocations (step-based), 'torch-full' for full program, 'mps' for Instruments",
+    )
+    parser.add_argument("--profile-output", type=str, default="./profiler_logs", help="Output dir for torch profiler (default: ./profiler_logs)")
+    parser.add_argument("--profile-wait", type=int, default=2, help="Steps to skip before warmup (default: 2)")
+    parser.add_argument("--profile-warmup", type=int, default=2, help="Warmup steps (default: 2)")
+    parser.add_argument("--profile-active", type=int, default=6, help="Active profiling steps (default: 6)")
 
     args = parser.parse_args()
 
     train_config = TrainConfig(
-        epochs=args.epochs,
-        batch_size=args.batch_size,
         save_every=args.save_every,
         snapshot_path=args.snapshot_path,
-        lr=args.lr,
         use_compile=not args.no_compile,
         use_wandb=not args.no_wandb,
+        num_workers=args.num_workers,
+        debug_timing=args.debug_timing,
+        profile_mode=args.profile,
+        profile_output=args.profile_output,
+        profile_wait=args.profile_wait,
+        profile_warmup=args.profile_warmup,
+        profile_active=args.profile_active,
     )
 
     main(train_config)
