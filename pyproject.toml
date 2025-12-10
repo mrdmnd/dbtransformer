@@ -17,6 +17,19 @@ dependencies = [
     "wandb>=0.23.1",
 ]
 
+[project.optional-dependencies]
+flash = [
+    "flash-attn>=2.8.3"
+]
+
+[tool.uv.extra-build-dependencies]
+# Specifies that 'torch' is required when building 'flash-attn'
+flash-attn = [{ requirement = "torch", match-runtime = true }]
+
+[tool.uv.extra-build-variables]
+# Tells flash-attn to skip building the CUDA extension if a wheel is found
+flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
+
 [tool.uv.sources]
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
@@ -91,6 +104,10 @@ files = ["dbtransformer", "tests"]
 log_cli = true
 log_cli_level = "INFO"
 addopts = "--capture=no"
+
+[tool.deptry.per_rule_ignores]
+# This is used at runtime by torch but not in the codebase:
+DEP002 = ["flash-attn"]
 
 [build-system]
 requires = ["hatchling", "torch"]

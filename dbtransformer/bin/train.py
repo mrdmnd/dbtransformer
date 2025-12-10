@@ -36,7 +36,6 @@ from dbtransformer.model import (
     RelationalTransformer,
 )
 from dbtransformer.profiling import (
-    mps_profiler_context,
     no_profiler_context,
     torch_profiler_context,
     torch_profiler_full_context,
@@ -52,7 +51,7 @@ class TrainConfig:
     seed: int = 42
     lr: float = 1e-3
     weight_decay: float = 0.1
-    max_batches: int = 1000  # Total batches to train
+    max_batches: int = 300  # Total batches to train
     batch_size: int = 32  # Reduced from 256 to fit in GPU memory
     use_compile: bool = True
     save_every_batches: int = 100  # Save snapshot every N batches
@@ -938,8 +937,6 @@ def main(config: TrainConfig) -> None:
             warmup=config.profile_warmup,
             active=config.profile_active,
         )
-    elif config.profile_mode == "mps":
-        profiler_ctx = mps_profiler_context()
     else:
         profiler_ctx = no_profiler_context()
 
@@ -994,9 +991,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profile",
         type=str,
-        choices=["torch", "torch-full", "mps"],
+        choices=["torch", "torch-full"],
         default=None,
-        help="Enable profiling: 'torch' for a few run_batch invocations (step-based), 'torch-full' for full program, 'mps' for Instruments",
+        help="Enable profiling: 'torch' for a few run_batch invocations (step-based), 'torch-full' for full program",
     )
     parser.add_argument(
         "--profile-output",

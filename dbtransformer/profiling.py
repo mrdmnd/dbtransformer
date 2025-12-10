@@ -2,27 +2,17 @@
 Profiling utilities for PyTorch training.
 
 Usage with train.py:
-    # Profile training batches with torch.profiler (step-based schedule)
+    # Profile ONLY the training batches with torch.profiler (step-based schedule)
     uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py \
         --profile torch --no-wandb --epochs 1
 
-    # Profile EVERYTHING (data loading, setup, training, etc.)
+    # Profile EVERYTHING (data loading, setup, compilation, training, etc.)
     uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py \
         --profile torch-full --no-wandb --epochs 1
 
-    # Profile with MPS profiler (for Metal-level GPU analysis)
-    uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py \
-        --profile mps --no-wandb --epochs 1
+    # The torch-full profile will be VERY VERY large (O(10 GB) for a single run) because it is capturing EVERYTHING.
 
-    # Profile with cProfile (Python-level only)
-    uv run python -m cProfile -o profile.prof -s cumtime \
-        dbtransformer/bin/train.py --no-wandb --epochs 1
-
-After running with --profile torch or --profile torch-full:
-    tensorboard --logdir=./profiler_logs
-
-After running with --profile mps:
-    Open Instruments.app -> Logging template to view signpost traces
+    # To see what's happening, you can look at profiles with perfetto (ui.perfetto.dev)
 """
 
 from collections.abc import Generator
@@ -83,36 +73,6 @@ def torch_profiler_context(
 
 
 @contextmanager
-def mps_profiler_context(
-    mode: str = "interval",
-    wait_until_completed: bool = False,
-) -> Generator[None]:
-    """
-    Context manager for MPS profiler (Apple Metal).
-
-    Args:
-        mode: "interval", "event", or "interval,event"
-        wait_until_completed: Whether to wait for GPU ops to complete
-    """
-    if not torch.backends.mps.is_available():
-        logger.warning("MPS not available, skipping MPS profiler")
-        yield
-        return
-
-    import torch.mps.profiler as mps_profiler  # noqa: PLC0415
-
-    logger.info(f"Starting MPS profiler (mode={mode})")
-    logger.info("After training, open Instruments.app -> Logging template")
-
-    mps_profiler.start(mode=mode, wait_until_completed=wait_until_completed)
-    try:
-        yield
-    finally:
-        mps_profiler.stop()
-        logger.success("MPS profiling complete. Open Instruments.app -> Logging template")
-
-
-@contextmanager
 def torch_profiler_full_context(
     output_dir: str = "./profiler_logs",
 ) -> Generator[torch.profiler.profile | None]:
@@ -122,6 +82,9 @@ def torch_profiler_full_context(
     This profiles EVERYTHING within the context - no waiting, no warmup,
     just continuous profiling. Use this to capture data loading, model
     setup, compilation, and training all in one trace.
+
+    Records shapes, memory, and stack traces - very verbose and large.
+    Probably only want to do this for one or two batches to get a sense for things.
 
     Args:
         output_dir: Directory to save profiler traces

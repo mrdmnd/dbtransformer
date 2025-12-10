@@ -6,7 +6,7 @@
 # d_model = 256
 # d_ff = 1024
 # num_heads = 8
-# batch_size = 128
+# batch_size = 256 (we train on 32 to fit on non-datacenter hardware during compilation)
 # seq_len = 1024
 
 
