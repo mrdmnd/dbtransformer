@@ -4,7 +4,6 @@
 from typing import TypedDict
 
 import torch
-from loguru import logger
 from torch import Tensor
 from torch.utils.data import Dataset
 
@@ -136,9 +135,7 @@ class DummySampleDataset(Dataset[DummySample]):
 
         # Pre-generate a pool of samples to cycle through (faster than on-fly)
         self._pool_size = min(1000, self.num_samples)
-        logger.info(f"Pre-generating {self._pool_size} dummy samples on CPU...")
         self._sample_pool: list[DummySample] = [create_dummy_sample(self.seq_len, self.d_text) for _ in range(self._pool_size)]
-        logger.info("Done pre-generating samples.")
 
     def __len__(self) -> int:
         return self.num_samples

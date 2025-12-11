@@ -299,7 +299,8 @@ class Trainer:
         # Reset optimizer state (clear momentum buffers from warmup)
         self.optimizer.state.clear()
         end = time.time()
-        logger.success(f"Warmup complete, compilation finished in {end - start:.2f}s")
+        if self.is_leader:
+            logger.success(f"Warmup complete, compilation finished in {end - start:.2f}s")
 
     def train(self) -> None:
         """Run the full training loop."""
