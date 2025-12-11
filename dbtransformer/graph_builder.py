@@ -3,7 +3,7 @@ from typing import Dict, List, Literal, Optional
 from loguru import logger
 from relbench.base import Dataset, Database
 from relbench.tasks import BaseTask
-from dbtransformer.types import Cell, Row
+from dbtransformer.sampler_types import Cell, Row
 
 Split = Literal["train", "val", "test"]
 
