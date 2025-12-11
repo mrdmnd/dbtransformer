@@ -4,6 +4,14 @@ This is a HACKATHON project - expect rough edges and incomplete things.
 
 Goal: train a relational transformer on any database!
 
+Note: this is ONLY designed to run on CUDA-enabled machines.
+For simplification I've dropped the support for OSX MPS libraries.
+
+Further assumptions: flex-attention (used for sparse attention mask compilation) and flash-attention (for dense layer)
+are installable in the environment.
+
+Currently presupposes a pytorch 2.9 environment with cuda 13.0, to better support Blackwell cards.
+
 ## Datasets
 
 - [RelBench](https://huggingface.co/datasets/relbench/relbench)
@@ -14,8 +22,10 @@ Goal: train a relational transformer on any database!
 pre-commit clean
 pre-commit install
 pre-commit install-hooks
-uv sync
+uv sync --extra flash
 ```
+
+(do the --extra flash on cuda machines, just --sync otherwise, to get flash-attention appropriately)
 
 ## Run Locally
 
@@ -28,7 +38,7 @@ uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py
 You can profile with
 
 ```bash
-uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py --profile torch --no-wandb --epochs 1
+uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py --profile torch --no-wandb
 ```
 
 Then open `http://ui.perfetto.dev` in your browser and load the content from the `profiler_logs` directory.

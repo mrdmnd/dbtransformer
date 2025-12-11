@@ -13,7 +13,7 @@ Always run with uv run torchrun:
 import os
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,7 +36,6 @@ from dbtransformer.model import (
     RelationalTransformer,
 )
 from dbtransformer.profiling import (
-    mps_profiler_context,
     no_profiler_context,
     torch_profiler_context,
     torch_profiler_full_context,
@@ -50,29 +49,29 @@ class TrainConfig:
     # Training hyperparameters
     max_grad_norm: float = 1.0
     seed: int = 42
-    lr: float = 0.01
-    weight_decay: float = 1e-4
-    epochs: int = 20
-    batch_size: int = 8
+    lr: float = 1e-3
+    weight_decay: float = 0.1
+    max_batches: int = 300  # Total batches to train
+    batch_size: int = 32  # Reduced from 256 to fit in GPU memory
     use_compile: bool = True
-    save_every: int = 5
+    save_every_batches: int = 100  # Save snapshot every N batches
+    log_every_batches: int = 100  # Log metrics every N batches
     snapshot_path: str = "snapshot.pt"
 
     # Model architecture.
-    # Intentionally set small during testing and development.
-    num_blocks: int = 2
-    d_model: int = 128
+    num_blocks: int = 12
+    d_model: int = 256
     d_text: int = 384
-    num_heads: int = 4
+    num_heads: int = 8
     d_ff: int = 4 * d_model
-    seq_len: int = 512
+    seq_len: int = 1024
 
     # Data loading
     num_workers: int = 0  # 0=sync, 1+=async background workers
     debug_timing: bool = False  # Enable per-phase timing in model forward
 
     # Dataset size for dummy data
-    total_num_samples: int = 2048
+    total_num_samples: int = 8192
 
     # Weights & Biases config
     use_wandb: bool = True
@@ -463,7 +462,8 @@ class Trainer:
         self.scheduler = scheduler
         self.profiler = profiler
 
-        self.epochs_run = 0
+        self.batches_run = 0
+        self.current_epoch = 0  # For sampler shuffling
         self.wandb_run: wandb.sdk.wandb_run.Run | None = None
 
         # Wrap model with DDP
@@ -500,13 +500,23 @@ class Trainer:
 
         self.model.load_state_dict(snapshot["MODEL_STATE"])
         self.optimizer.load_state_dict(snapshot["OPTIMIZER_STATE"])
-        self.epochs_run = snapshot["EPOCHS_RUN"]
 
-        # Check if epochs were extended beyond original training
-        saved_epochs = snapshot.get("TOTAL_EPOCHS", self.epochs_run)
-        if self.config.epochs > saved_epochs:
+        # Cast optimizer state to match model dtype for fused optimizer
+        # compatibility when resuming with different precision settings.
+        model_dtype = self.hardware_config.model_dtype
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor) and v.is_floating_point():
+                    state[k] = v.to(dtype=model_dtype)
+
+        self.batches_run = snapshot["BATCHES_RUN"]
+        self.current_epoch = snapshot.get("CURRENT_EPOCH", 0)
+
+        # Check if max_batches was extended beyond original training
+        saved_max_batches = snapshot.get("MAX_BATCHES", self.batches_run)
+        if self.config.max_batches > saved_max_batches:
             # Create fresh scheduler for remaining steps
-            remaining_steps = (self.config.epochs - self.epochs_run) * len(self.train_loader)
+            remaining_steps = self.config.max_batches - self.batches_run
             self.scheduler = optim.lr_scheduler.OneCycleLR(
                 self.optimizer,
                 max_lr=self.config.lr,
@@ -515,24 +525,27 @@ class Trainer:
                 anneal_strategy="linear",
             )
             logger.warning(
-                f"Epochs extended ({saved_epochs} -> {self.config.epochs}). Created new LR scheduler for {remaining_steps} remaining steps."
+                f"Max batches extended ({saved_max_batches} -> "
+                f"{self.config.max_batches}). Created new LR scheduler "
+                f"for {remaining_steps} remaining steps."
             )
         else:
             self.scheduler.load_state_dict(snapshot["SCHEDULER_STATE"])
 
-        logger.info(f"Resuming training from epoch {self.epochs_run}")
+        logger.info(f"Resuming training from batch {self.batches_run}")
 
-    def _save_snapshot(self, epoch: int) -> None:
+    def _save_snapshot(self, batch_num: int) -> None:
         """Save training state to a snapshot."""
         snapshot = {
             "MODEL_STATE": self.model.state_dict(),
             "OPTIMIZER_STATE": self.optimizer.state_dict(),
             "SCHEDULER_STATE": self.scheduler.state_dict(),
-            "EPOCHS_RUN": epoch + 1,
-            "TOTAL_EPOCHS": self.config.epochs,
+            "BATCHES_RUN": batch_num,
+            "CURRENT_EPOCH": self.current_epoch,
+            "MAX_BATCHES": self.config.max_batches,
         }
         torch.save(snapshot, self.config.snapshot_path)
-        logger.info(f"Epoch {epoch + 1} | Snapshot saved at {self.config.snapshot_path}")
+        logger.info(f"Batch {batch_num} | Snapshot saved at {self.config.snapshot_path}")
 
     def _move_batch_to_device(self, batch: Batch) -> Batch:
         """Move all tensors in a Batch to the target device.
@@ -608,35 +621,27 @@ class Trainer:
         # Explicit sync to ensure GPU work completes before next batch.
         # This prevents sync time from "leaking" into data loading.
         # Without this, async GPU ops cause misleading profiler attribution.
-        self._sync_device()
 
         # Notify profiler of step boundary (for torch.profiler schedule)
         if self.profiler is not None:
+            self._sync_device()
             self.profiler.step()
 
         # Return detached loss tensor to avoid holding computation graph.
         # We do NOT call .item() here to avoid a CUDA sync every batch.
         return loss.detach()
 
-    def _run_epoch(self, epoch: int) -> torch.Tensor:
-        """Run one training epoch and return total loss as a tensor."""
-        self.sampler.set_epoch(epoch)
-        # Accumulate on GPU to avoid per-batch CUDA syncs from .item()
-        total_loss = torch.tensor(
-            0.0,
-            device=self.hardware_config.device,
-            dtype=torch.float32,
-        )
+    def _batch_iterator(self) -> Iterator[Batch]:
+        """
+        Yield batches infinitely, cycling through epochs.
 
-        for i, batch in enumerate(self.train_loader):
-            if i == 0 and self.global_rank == 0:
-                b_sz = batch["node_indices"].shape[0]
-                logger.info(f"Epoch {epoch + 1} | Batchsize: {b_sz} samples | Batches per epoch: {len(self.train_loader)}")
-
-            batch_loss = self._run_batch(batch)
-            total_loss += batch_loss
-
-        return total_loss
+        Updates sampler.set_epoch() on each new epoch for proper shuffling
+        in distributed training.
+        """
+        while True:
+            self.sampler.set_epoch(self.current_epoch)
+            yield from self.train_loader
+            self.current_epoch += 1
 
     def _sync_loss(self, total_loss: torch.Tensor) -> float:
         """Synchronize loss across all ranks via all_reduce and return scalar.
@@ -660,9 +665,11 @@ class Trainer:
             "seed": self.config.seed,
             "lr": self.config.lr,
             "weight_decay": self.config.weight_decay,
-            "epochs": self.config.epochs,
+            "max_batches": self.config.max_batches,
             "batch_size": self.config.batch_size,
             "use_compile": self.config.use_compile,
+            "save_every_batches": self.config.save_every_batches,
+            "log_every_batches": self.config.log_every_batches,
             # Model architecture
             "num_blocks": self.config.num_blocks,
             "d_model": self.config.d_model,
@@ -678,14 +685,19 @@ class Trainer:
         )
         logger.info(f"W&B run: {self.wandb_run.name}")
 
-    def _log_metrics(self, epoch: int, avg_loss: float, lr: float) -> None:
+    def _log_metrics(
+        self,
+        batch_num: int,
+        avg_loss: float,
+        lr: float,
+    ) -> None:
         """Log metrics to console and wandb."""
-        print(f"Epoch {epoch + 1}, Loss: {avg_loss:.4f}, LR: {lr:.6f}")
+        print(f"Batch {batch_num}/{self.config.max_batches}, Loss: {avg_loss:.4f}, LR: {lr:.6f}")
 
         if self.wandb_run is not None:
             wandb.log(
-                {"loss": avg_loss, "lr": lr, "epoch": epoch + 1},
-                step=epoch + 1,
+                {"loss": avg_loss, "lr": lr, "batch": batch_num},
+                step=batch_num,
             )
 
     def _warmup_compile(self) -> None:
@@ -751,33 +763,75 @@ class Trainer:
 
         self._warmup_compile()
 
-        if self.epochs_run >= self.config.epochs:
+        if self.batches_run >= self.config.max_batches:
             logger.warning(
-                f"Training already complete ({self.epochs_run}/{self.config.epochs}"
-                f" epochs). Use --epochs > {self.epochs_run} to continue training,"
-                f" or delete {self.config.snapshot_path} to start fresh."
+                f"Training already complete ({self.batches_run}/"
+                f"{self.config.max_batches} batches). "
+                f"Use --max-batches > {self.batches_run} to continue training, "
+                f"or delete {self.config.snapshot_path} to start fresh."
             )
             return
 
-        for epoch in tqdm(
-            range(self.epochs_run, self.config.epochs),
+        # Accumulate loss over log_every_batches for averaging
+        accumulated_loss = torch.tensor(
+            0.0,
+            device=self.hardware_config.device,
+            dtype=torch.float32,
+        )
+        batches_since_log = 0
+
+        batch_iter = self._batch_iterator()
+
+        start_time = time.time()
+        pbar = tqdm(
+            range(self.batches_run, self.config.max_batches),
+            initial=self.batches_run,
+            total=self.config.max_batches,
             disable=self.global_rank != 0,
-        ):
-            total_loss = self._run_epoch(epoch)
-            total_loss_scalar = self._sync_loss(total_loss)
+            desc="Training",
+            unit="batch",
+        )
 
-            if self.global_rank == 0:
-                avg_loss = total_loss_scalar / len(self.train_loader)
-                lr_now = self.optimizer.param_groups[0]["lr"]
-                self._log_metrics(epoch, avg_loss, lr_now)
+        for batch_num in pbar:
+            batch = next(batch_iter)
 
-                # Save snapshot periodically
-                if (epoch + 1) % self.config.save_every == 0:
-                    self._save_snapshot(epoch)
+            # Log batch info on first batch
+            if batch_num == self.batches_run and self.global_rank == 0:
+                b_sz = batch["node_indices"].shape[0]
+                logger.info(f"Starting training | Batch size: {b_sz} samples | Batches per epoch: {len(self.train_loader)}")
 
-        # Save final snapshot
+            batch_loss = self._run_batch(batch)
+            accumulated_loss += batch_loss
+            batches_since_log += 1
+            current_batch = batch_num + 1
+
+            # Log metrics every log_every_batches
+            if current_batch % self.config.log_every_batches == 0:
+                total_loss_scalar = self._sync_loss(accumulated_loss)
+                if self.global_rank == 0:
+                    avg_loss = total_loss_scalar / batches_since_log
+                    lr_now = self.optimizer.param_groups[0]["lr"]
+                    self._log_metrics(current_batch, avg_loss, lr_now)
+                    pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr_now:.2e}")
+                # Reset accumulator
+                accumulated_loss = torch.tensor(
+                    0.0,
+                    device=self.hardware_config.device,
+                    dtype=torch.float32,
+                )
+                batches_since_log = 0
+
+            # Save snapshot every save_every_batches
+            if current_batch % self.config.save_every_batches == 0 and self.global_rank == 0:
+                self._save_snapshot(current_batch)
+        elapsed = time.time() - start_time
+        batches_trained = self.config.max_batches - self.batches_run
+        samples_per_sec = (batches_trained * self.config.batch_size * self.world_size) / elapsed
         if self.global_rank == 0:
-            self._save_snapshot(self.config.epochs - 1)
+            logger.info(f"Global throughput: {samples_per_sec:.1f} samples/sec")
+       # Save final snapshot
+        if self.global_rank == 0:
+            self._save_snapshot(self.config.max_batches)
 
         # Finish wandb run
         if self.wandb_run is not None:
@@ -807,7 +861,6 @@ def create_optimizer(
     model: nn.Module,
     config: TrainConfig,
     hardware_config: HardwareConfig,
-    total_steps: int,
 ) -> tuple[optim.Optimizer, optim.lr_scheduler.LRScheduler]:
     """Create AdamW optimizer with OneCycleLR scheduler."""
     optimizer = optim.AdamW(
@@ -819,7 +872,7 @@ def create_optimizer(
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=config.lr,
-        total_steps=total_steps,
+        total_steps=config.max_batches,
         pct_start=0.2,
         anneal_strategy="linear",
     )
@@ -852,8 +905,7 @@ def _run_training(
     )
 
     # Create optimizer and scheduler
-    total_steps = config.epochs * len(train_loader)
-    optimizer, scheduler = create_optimizer(model, config, hardware_config, total_steps)
+    optimizer, scheduler = create_optimizer(model, config, hardware_config)
 
     # Create trainer and run
     trainer = Trainer(
@@ -891,8 +943,6 @@ def main(config: TrainConfig) -> None:
             warmup=config.profile_warmup,
             active=config.profile_active,
         )
-    elif config.profile_mode == "mps":
-        profiler_ctx = mps_profiler_context()
     else:
         profiler_ctx = no_profiler_context()
 
@@ -920,34 +970,69 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Distributed training with torchrun")
 
     # Training arguments
-    parser.add_argument("--save-every", type=int, default=5, help="Save snapshot every N epochs (default: 5)")
-    parser.add_argument("--snapshot-path", type=str, default="snapshot.pt", help="Path to save/load snapshots (default: snapshot.pt)")
-    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
-    parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (0=sync, 1+=async, default: 0)")
+    parser.add_argument(
+        "--snapshot-path",
+        type=str,
+        default="snapshot.pt",
+        help="Path to save/load snapshots (default: snapshot.pt)",
+    )
+    parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Disable torch.compile",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable W&B logging",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader workers (0=sync, 1+=async, default: 0)",
+    )
 
     # Profiling arguments
     parser.add_argument(
         "--profile",
         type=str,
-        choices=["torch", "torch-full", "mps"],
+        choices=["torch", "torch-full"],
         default=None,
-        help="Enable profiling: 'torch' for a few run_batch invocations (step-based), 'torch-full' for full program, 'mps' for Instruments",
+        help="Enable profiling: 'torch' for a few run_batch invocations (step-based), 'torch-full' for full program",
     )
-    parser.add_argument("--profile-output", type=str, default="./profiler_logs", help="Output dir for torch profiler (default: ./profiler_logs)")
-    parser.add_argument("--profile-wait", type=int, default=2, help="Steps to skip before warmup (default: 2)")
-    parser.add_argument("--profile-warmup", type=int, default=2, help="Warmup steps (default: 2)")
-    parser.add_argument("--profile-active", type=int, default=6, help="Active profiling steps (default: 6)")
+    parser.add_argument(
+        "--profile-output",
+        type=str,
+        default="./profiler_logs",
+        help="Output dir for torch profiler (default: ./profiler_logs)",
+    )
+    parser.add_argument(
+        "--profile-wait",
+        type=int,
+        default=2,
+        help="Steps to skip before warmup (default: 2)",
+    )
+    parser.add_argument(
+        "--profile-warmup",
+        type=int,
+        default=2,
+        help="Warmup steps (default: 2)",
+    )
+    parser.add_argument(
+        "--profile-active",
+        type=int,
+        default=6,
+        help="Active profiling steps (default: 6)",
+    )
 
     args = parser.parse_args()
 
     train_config = TrainConfig(
-        save_every=args.save_every,
         snapshot_path=args.snapshot_path,
         use_compile=not args.no_compile,
         use_wandb=not args.no_wandb,
         num_workers=args.num_workers,
-        debug_timing=args.debug_timing,
         profile_mode=args.profile,
         profile_output=args.profile_output,
         profile_wait=args.profile_wait,

@@ -1,13 +1,12 @@
 import pytest
 import torch
-from beartype import beartype
 from jaxtyping import Float, jaxtyped
 from loguru import logger
 from torch import Tensor
 
 
 @pytest.fixture(scope="session")
-@jaxtyped(typechecker=beartype)
+@jaxtyped(typechecker=None)
 def setup() -> Float[Tensor, "m n"]:
     # Some demo fixture for reusable data or whatever
     result = torch.randn(10, 12)

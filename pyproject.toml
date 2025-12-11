@@ -5,7 +5,6 @@ description = "Training a relational database transformer model!"
 readme = "README.md"
 requires-python = ">=3.13.1"
 dependencies = [
-    "beartype>=0.22.8",
     "einops>=0.8.1",
     "jaxtyping>=0.3.3",
     "loguru>=0.7.3",
@@ -17,6 +16,19 @@ dependencies = [
     "transformers>=4.57.3",
     "wandb>=0.23.1",
 ]
+
+[project.optional-dependencies]
+flash = [
+    "flash-attn>=2.8.3"
+]
+
+[tool.uv.extra-build-dependencies]
+# Specifies that 'torch' is required when building 'flash-attn'
+flash-attn = [{ requirement = "torch", match-runtime = true }]
+
+[tool.uv.extra-build-variables]
+# Tells flash-attn to skip building the CUDA extension if a wheel is found
+flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
 
 [tool.uv.sources]
 torch = [
@@ -92,6 +104,10 @@ files = ["dbtransformer", "tests"]
 log_cli = true
 log_cli_level = "INFO"
 addopts = "--capture=no"
+
+[tool.deptry.per_rule_ignores]
+# This is used at runtime by torch but not in the codebase:
+DEP002 = ["flash-attn"]
 
 [build-system]
 requires = ["hatchling", "torch"]
