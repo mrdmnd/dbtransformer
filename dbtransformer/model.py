@@ -20,7 +20,6 @@ import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
 from einops._torch_specific import allow_ops_in_compiled_graph  # noqa: PLC2701
 from jaxtyping import Bool, Float, Int, jaxtyped
-from loguru import logger
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import (
     BlockMask,
@@ -34,10 +33,7 @@ from dbtransformer.sampler_types import SemanticType
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available. This model effectively requires CUDA.")
 
-logger.info("Initializing model.py...")
 allow_ops_in_compiled_graph()
-
-logger.info("Compiling flex_attention for CUDA...")
 flex_attention = torch.compile(flex_attention)
 
 

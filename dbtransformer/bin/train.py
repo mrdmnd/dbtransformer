@@ -102,7 +102,10 @@ class Trainer:
         self.wandb_run: wandb.sdk.wandb_run.Run | None = None
 
         self.model: nn.Module = RelationalTransformer(config.model)
-        self.model.to(self.config.model.model_dtype)
+        self.model.to(
+            device=self.ddp_parameters.device,
+            dtype=self.config.model.model_dtype,
+        )
         params = self.model.parameters()
         num_params = sum(p.numel() for p in params)
         if self.is_leader:
@@ -403,6 +406,8 @@ def main(config: OverallConfig) -> None:
     """Main entry point for training."""
     seed_everything(config.random_seed)
     ddp_parameters: DDPParameters = ddp_setup(config.training.ddp_backend)
+    if ddp_parameters.global_rank == 0:
+        logger.success(f"Starting training with config:\n{overall_config!r}")
     profiler_ctx = get_profiler_context(config.profiling)
 
     with profiler_ctx as prof:
@@ -475,5 +480,4 @@ if __name__ == "__main__":
         wandb=wandb_config,
     )
 
-    logger.success(f"Starting training with config:\n{overall_config!r}")
     main(overall_config)

@@ -101,9 +101,10 @@ unfixable = ["B"]
 
 [tool.mypy]
 files = ["dbtransformer", "tests"]
+disable_error_code = ["import-untyped"]
 
 [[tool.mypy.overrides]]
-module = "relbench.*"
+module = ["relbench", "relbench.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
