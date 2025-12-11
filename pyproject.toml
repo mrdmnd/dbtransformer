@@ -9,6 +9,7 @@ dependencies = [
     "jaxtyping>=0.3.3",
     "loguru>=0.7.3",
     "numpy>=2.3.5",
+    "pandas>=2.3.3",
     "pooch>=1.8.2",
     "relbench>=1.0.0",
     "torch>=2.9.0",
@@ -52,6 +53,7 @@ dev = [
     "line-profiler>=5.0.0",
     "memray>=1.19.1",
     "mypy>=1.19.0",
+    "pandas-stubs>=2.3.3.251201",
     "pytest>=9.0.1",
     "pytest-loguru>=0.4.0",
     "ruff>=0.14.8",
@@ -99,6 +101,10 @@ unfixable = ["B"]
 
 [tool.mypy]
 files = ["dbtransformer", "tests"]
+
+[[tool.mypy.overrides]]
+module = "relbench.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 log_cli = true

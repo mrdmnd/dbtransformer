@@ -29,6 +29,7 @@ from torch.nn.attention.flex_attention import (
 )
 
 from dbtransformer.configurations import ModelConfig
+from dbtransformer.sampler_types import SemanticType
 
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available. This model effectively requires CUDA.")
@@ -48,17 +49,8 @@ class AttentionType(Enum):
     FULL = 3
 
 
-# Different cells are treated differently by the architecture.
-class SemanticsType(Enum):
-    NUMBER = 0
-    TEXT = 1
-    DATETIME = 2
-    BOOLEAN = 3
-    # TODO(mrdmnd): categorical / enum? If you know it has to be one of a few things?
-    # TODO(mrdmnd): learn this heuristically?
-
-
 # Maximum number of foreign-to-primary neighbors per cell.
+# Only used for DummyBatchDataset in train.py.
 MAX_F2P_NEIGHBORS = 5
 
 
@@ -190,22 +182,20 @@ class Batch:
 
     # Foreign-to-primary (parent) neighbor indices for each cell's row.
     # If a row has a foreign key referencing another row, that parent row's
-    # index appears here. Padded with -1 if fewer than MAX_F2P_NEIGHBORS.
+    # index appears here. Padded with -1 for unused slots.
     # Used for feature attention (attend to parent rows) and neighbor
     # attention (attend to child rows via the reverse relationship).
-    # The real shape is (b, s, MAX_F2P_NEIGHBORS), but jaxtyping wants a
-    # constant, so here's the magic number five.
-    f2p_neighbor_indices: Int[Tensor, "b s 5"]
+    # Shape: (b, s, max_f2p) where max_f2p is dynamic per batch.
+    f2p_neighbor_indices: Int[Tensor, "b s max_f2p"]
 
     # Numeric cell values, z-score normalized per column: (val - mean) / std.
     # NaN values are skipped during preprocessing. Val/test splits use
     # statistics computed from the training set for consistency.
     number_values: Float[Tensor, "b s 1"]
 
-    # Datetime cell values (converted to nanoseconds), z-score normalized
-    # using *global* statistics computed across ALL datetime columns in the
-    # entire database, not per-column. This allows cross-table temporal
-    # reasoning.
+    # Datetime cell values (converted to seconds since epoch), z-score normalized
+    # using *global* statistics computed across ALL datetime columns in the entire
+    # database, not per-column. This allows cross-table temporal reasoning.
     datetime_values: Float[Tensor, "b s 1"]
 
     # Boolean cell values, converted to 0.0/1.0 then z-score normalized
@@ -224,7 +214,7 @@ class Batch:
     column_name_values: Float[Tensor, "b s d_text"]
 
     # Semantic type determining which encoder/decoder head to use:
-    # 0=number, 1=text, 2=datetime, 3=boolean (see SemanticsType enum).
+    # 0=number, 1=text, 2=datetime, 3=boolean (see SemanticType enum).
     semantic_types: Int[Tensor, "b s"]
 
     # Positions to HIDE from the model (replaced with learned mask embedding)
@@ -351,10 +341,10 @@ class RelationalTransformer(nn.Module):
 
         # Semantics types: [0, 1, 2, 3] -> [number, text, datetime, boolean]
         semantic_type: Int[Tensor, "b s"] = batch.semantic_types
-        is_number: Bool[Tensor, "b s"] = semantic_type == SemanticsType.NUMBER.value
-        is_text: Bool[Tensor, "b s"] = semantic_type == SemanticsType.TEXT.value
-        is_datetime: Bool[Tensor, "b s"] = semantic_type == SemanticsType.DATETIME.value
-        is_boolean: Bool[Tensor, "b s"] = semantic_type == SemanticsType.BOOLEAN.value
+        is_number: Bool[Tensor, "b s"] = semantic_type == SemanticType.NUMBER.value
+        is_text: Bool[Tensor, "b s"] = semantic_type == SemanticType.TEXT.value
+        is_datetime: Bool[Tensor, "b s"] = semantic_type == SemanticType.DATETIME.value
+        is_boolean: Bool[Tensor, "b s"] = semantic_type == SemanticType.BOOLEAN.value
 
         # Don't do python control flow in the forward pass unless we're debugging.
         # if (masks & is_text).any():
@@ -396,7 +386,7 @@ class RelationalTransformer(nn.Module):
         same_node: Bool[Tensor, "b s s"] = node_indices[:, :, None] == node_indices[:, None, :]
 
         # If the KV index is in Q's foreign-to-primary (parent) neighborhood set
-        # Shape: (b, s, s, 5) -> (b, s, s) via any()
+        # Shape: (b, s, s, max_f2p) -> (b, s, s) via any()
         kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
 
         # If the Q index is in KV's primary-to-foreign (child) neighborhood set

@@ -9,7 +9,8 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from dbtransformer.configurations import DummyDataConfig, ModelConfig
-from dbtransformer.model import MAX_F2P_NEIGHBORS, Batch, SemanticsType
+from dbtransformer.model import MAX_F2P_NEIGHBORS, Batch
+from dbtransformer.sampler_types import SemanticType
 
 
 class DummySample(TypedDict):
@@ -74,11 +75,11 @@ def create_dummy_sample(seq_len: int, d_text: int) -> DummySample:
     # Masks: positions to hide and predict
     # Mask ~15% of non-text positions (model doesn't support text masking)
     masks = torch.rand(seq_len) < 0.15  # noqa: PLR2004
-    masks &= semantic_types != SemanticsType.TEXT.value
+    masks &= semantic_types != SemanticType.TEXT.value
 
     # Ensure at least one masked position for loss computation
     if not masks.any():
-        non_text = (semantic_types != SemanticsType.TEXT.value).nonzero(as_tuple=True)[0]
+        non_text = (semantic_types != SemanticType.TEXT.value).nonzero(as_tuple=True)[0]
         if len(non_text) > 0:
             masks[non_text[0]] = True
 
