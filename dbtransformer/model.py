@@ -320,7 +320,7 @@ class RelationalTransformer(nn.Module):
         self.boolean_decoder = nn.Linear(config.d_model, 1, bias=True)
         self.text_decoder = nn.Linear(config.d_model, config.d_text, bias=True)
 
-    def forward(self, batch: Batch) -> ModelOutput:  # noqa: PLR0915
+    def forward(self, batch: Batch) -> ModelOutput:
         node_indices: Int[Tensor, "b s"] = batch.node_indices
         f2p_neighbor_indices: Int[Tensor, "b s 5"] = batch.f2p_neighbor_indices
 
@@ -415,20 +415,14 @@ class RelationalTransformer(nn.Module):
         # =======================================================
         # OUTPUT DECODING & LOSS
         # =======================================================
-        yhat_number: Float[Tensor, "b s 1"] = torch.zeros_like(number_values)
-        yhat_datetime: Float[Tensor, "b s 1"] = torch.zeros_like(datetime_values)
-        yhat_boolean: Float[Tensor, "b s 1"] = torch.zeros_like(boolean_values)
-        yhat_text: Float[Tensor, "b s d_text"] = torch.zeros_like(text_values)
-
-        # Run all decoders unconditionally to avoid graph breaks from .any()
-        # checks. The indexed assignment is a no-op when the mask is all False.
-        # This is an intentional tradeoff (do extra compute to avoid syncs) which I am
-        # making because the models are small, not really compute bound, and moving data
-        # back and forth will be worse.
-        yhat_number[is_number] = self.number_decoder(x[is_number])
-        yhat_datetime[is_datetime] = self.datetime_decoder(x[is_datetime])
-        yhat_boolean[is_boolean] = self.boolean_decoder(x[is_boolean])
-        yhat_text[is_text] = self.text_decoder(x[is_text])
+        # Run all decoders unconditionally on full tensor to avoid graph breaks.
+        # Boolean indexing uses nonzero internally, which torch.compile can't
+        # handle. Instead, we run decoders on all positions and mask the output.
+        # This is an intentional tradeoff (extra compute to avoid graph breaks).
+        yhat_number: Float[Tensor, "b s 1"] = self.number_decoder(x) * is_number[..., None]
+        yhat_datetime: Float[Tensor, "b s 1"] = self.datetime_decoder(x) * is_datetime[..., None]
+        yhat_boolean: Float[Tensor, "b s 1"] = self.boolean_decoder(x) * is_boolean[..., None]
+        yhat_text: Float[Tensor, "b s d_text"] = self.text_decoder(x) * is_text[..., None]
 
         # Compute per-position losses (before masking)
         loss_number: Float[Tensor, "b s"] = F.huber_loss(yhat_number, number_values, reduction="none").mean(-1)

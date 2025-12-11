@@ -270,7 +270,8 @@ class Trainer:
         optimizer step. We save and restore model state so warmup doesn't
         affect training.
         """
-        logger.info("Running warmup step to trigger compilation...")
+        if self.is_leader:
+            logger.info("Running warmup step to trigger compilation...")
         start = time.time()
 
         # Save model state before warmup (clone to avoid reference issues)
