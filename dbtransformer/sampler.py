@@ -105,18 +105,19 @@ class RelationalSampler:
             return row
         
         def get_closest_rows(rows: list[Row]) -> list[Row]:
-          if not rows:
-            return []
+            if not rows:
+                return []
 
-          closest_rows = []
-          min_distance = float("inf")
-          for row in rows:
-            dist = hop_distance.get(row.row_id, float("inf"))
-            if dist < min_distance:
-                min_distance = dist
-                closest_rows = [row]
-            elif dist == min_distance:
-                closest_rows.append(row)
+            closest_rows = []
+            min_distance = float("inf")
+            for row in rows:
+                dist = hop_distance.get(row.row_id, float("inf"))
+                if dist < min_distance:
+                    min_distance = dist
+                    closest_rows = [row]
+                elif dist == min_distance:
+                    closest_rows.append(row)
+            return closest_rows
 
         # Prioritize rows added via F→P links over P→F links
         f2p_rows = [row for row in frontier if link_type.get(row.row_id) == "f2p"]

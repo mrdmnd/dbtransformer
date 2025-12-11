@@ -283,6 +283,7 @@ def collate_batches(batches: list[Batch]) -> Batch:
     Collate multiple single-sample Batches into one batched Batch.
 
     Each input batch has shape (1, seq_len, ...), we concatenate along dim 0.
+    f2p_neighbor_indices may have variable last dimension - pad to max in batch.
     """
     batch_size = len(batches)
 
@@ -290,11 +291,23 @@ def collate_batches(batches: list[Batch]) -> Batch:
         tensors = [b[key] for b in batches]  # type: ignore[literal-required]
         return torch.cat(tensors, dim=0)
 
+    def cat_f2p_field() -> torch.Tensor:
+        """Pad f2p_neighbor_indices to max dimension across batch, then concatenate."""
+        tensors = [b["f2p_neighbor_indices"] for b in batches]
+        max_f2p = max(t.shape[-1] for t in tensors)
+        padded = []
+        for t in tensors:
+            if t.shape[-1] < max_f2p:
+                pad_size = max_f2p - t.shape[-1]
+                t = torch.nn.functional.pad(t, (0, pad_size), value=-1)
+            padded.append(t)
+        return torch.cat(padded, dim=0)
+
     return Batch(
         node_indices=cat_field("node_indices"),
         table_name_indices=cat_field("table_name_indices"),
         column_name_indices=cat_field("column_name_indices"),
-        f2p_neighbor_indices=cat_field("f2p_neighbor_indices"),
+        f2p_neighbor_indices=cat_f2p_field(),
         number_values=cat_field("number_values"),
         datetime_values=cat_field("datetime_values"),
         boolean_values=cat_field("boolean_values"),
@@ -356,11 +369,23 @@ class DeviceCollator:
             tensors = [b[key] for b in batches]  # type: ignore[literal-required]
             return torch.cat(tensors, dim=0).to(device, dtype=float_dtype)
 
+        def cat_f2p_to_device() -> torch.Tensor:
+            """Pad f2p_neighbor_indices to max dimension across batch, then concatenate."""
+            tensors = [b["f2p_neighbor_indices"] for b in batches]
+            max_f2p = max(t.shape[-1] for t in tensors)
+            padded = []
+            for t in tensors:
+                if t.shape[-1] < max_f2p:
+                    pad_size = max_f2p - t.shape[-1]
+                    t = torch.nn.functional.pad(t, (0, pad_size), value=-1)
+                padded.append(t)
+            return torch.cat(padded, dim=0).to(device)
+
         return Batch(
             node_indices=cat_to_device("node_indices"),
             table_name_indices=cat_to_device("table_name_indices"),
             column_name_indices=cat_to_device("column_name_indices"),
-            f2p_neighbor_indices=cat_to_device("f2p_neighbor_indices"),
+            f2p_neighbor_indices=cat_f2p_to_device(),
             number_values=cat_to_device_float("number_values"),
             datetime_values=cat_to_device_float("datetime_values"),
             boolean_values=cat_to_device_float("boolean_values"),

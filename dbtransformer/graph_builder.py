@@ -1,11 +1,40 @@
+import numpy as np
 import pandas as pd
 from typing import Dict, List, Literal, Optional
 from loguru import logger
 from relbench.base import Dataset, Database
 from relbench.tasks import BaseTask
-from dbtransformer.sampler_types import Cell, Row
+from dbtransformer.sampler_types import Cell, Row, SemanticType
 
 Split = Literal["train", "val", "test"]
+
+
+def infer_semantic_type(dtype: np.dtype) -> SemanticType:
+    """Infer semantic type from pandas dtype and value."""
+    dtype_str = str(dtype)
+    
+    # Boolean types
+    if dtype_str == "bool" or dtype_str == "boolean":
+        return SemanticType.BOOLEAN
+    
+    # Datetime types
+    if "datetime" in dtype_str or "timestamp" in dtype_str:
+        return SemanticType.DATETIME
+    
+    # Numeric types
+    if np.issubdtype(dtype, np.number):
+        return SemanticType.NUMBER
+    
+    # Object/string types - treat as text
+    if dtype_str == "object" or dtype_str == "string" or "str" in dtype_str:
+        return SemanticType.TEXT
+    
+    # Category - treat as text (will use class_value_indices for prediction)
+    if dtype_str == "category":
+        return SemanticType.TEXT
+    
+    # Default to TEXT for unknown types
+    return SemanticType.TEXT
 
 
 class RelBenchGraphBuilder:
@@ -28,8 +57,20 @@ class RelBenchGraphBuilder:
         # Rows keyed by global row_id
         self.rows: Dict[str, Row] = {}
         
+        # Sequential node index counter
+        self._next_node_index: int = 0
+        
         # Task rows keyed by split -> list of Row
         self._task_rows: Dict[Split, List[Row]] = {}
+        
+        # Column metadata: (table, column) -> {"dtype": dtype, "semantic_type": SemanticType}
+        self.column_metadata: Dict[tuple[str, str], dict] = {}
+        
+        # Unique table name -> index mapping (for attention masks)
+        self._table_name_to_idx: Dict[str, int] = {}
+        
+        # Unique (table, column) -> index mapping (for attention masks)
+        self._column_to_idx: Dict[tuple[str, str], int] = {}
         
         self._build_rows()
         self._build_relationships()
@@ -37,6 +78,10 @@ class RelBenchGraphBuilder:
     def _build_rows(self) -> None:
         """Create Row objects for each database row."""
         for table_name, table in self.db.table_dict.items():
+            # Assign table index
+            if table_name not in self._table_name_to_idx:
+                self._table_name_to_idx[table_name] = len(self._table_name_to_idx)
+            
             pkey_col = table.pkey_col
             time_col = table.time_col
             
@@ -53,23 +98,44 @@ class RelBenchGraphBuilder:
                 if col not in key_cols and col != time_col
             ]
             
+            # Build column metadata for feature columns
+            for col in feature_cols:
+                col_key = (table_name, col)
+                if col_key not in self._column_to_idx:
+                    self._column_to_idx[col_key] = len(self._column_to_idx)
+                
+                dtype = table.df[col].dtype
+                semantic_type = infer_semantic_type(dtype)
+                self.column_metadata[col_key] = {
+                    "dtype": dtype,
+                    "semantic_type": semantic_type,
+                }
+            
             for idx, row in table.df.iterrows():
                 # Generate unique global row ID
                 global_row_id = self._make_row_id(table_name, pkey_col, row, idx)
                 
                 # Build Cell objects for feature columns
-                cells = [
-                    Cell(
-                        value=row[col],
-                        column=col,
-                        table=table_name,
-                        row_id=global_row_id,
+                cells = []
+                for col in feature_cols:
+                    col_key = (table_name, col)
+                    semantic_type = self.column_metadata[col_key]["semantic_type"]
+                    cells.append(
+                        Cell(
+                            value=row[col],
+                            column=col,
+                            table=table_name,
+                            row_id=global_row_id,
+                            semantic_type=semantic_type,
+                        )
                     )
-                    for col in feature_cols
-                ]
                 
                 # Extract timestamp from time_col
                 timestamp = row[time_col] if time_col is not None else None
+                
+                # Assign sequential node index
+                node_index = self._next_node_index
+                self._next_node_index += 1
                 
                 row_obj = Row(
                     row_id=global_row_id,
@@ -78,6 +144,7 @@ class RelBenchGraphBuilder:
                     timestamp=timestamp,
                     f2p_neighbors=[],
                     p2f_neighbors=[],
+                    node_index=node_index,
                 )
                 
                 self.rows[global_row_id] = row_obj
@@ -181,19 +248,41 @@ class RelBenchGraphBuilder:
         task_table_name = f"__task_{split}__"
         task_rows = []
         
+        # Register task table in indices
+        if task_table_name not in self._table_name_to_idx:
+            self._table_name_to_idx[task_table_name] = len(self._table_name_to_idx)
+        
+        # Infer semantic type for target column
+        target_dtype = task_df[target_col].dtype
+        target_semantic_type = infer_semantic_type(target_dtype)
+        
+        # Register column metadata for task target
+        col_key = (task_table_name, target_col)
+        if col_key not in self._column_to_idx:
+            self._column_to_idx[col_key] = len(self._column_to_idx)
+        self.column_metadata[col_key] = {
+            "dtype": target_dtype,
+            "semantic_type": target_semantic_type,
+        }
+        
         for idx, row in task_df.iterrows():
             global_row_id = f"{task_table_name}:{idx}"
             
             timestamp = row[time_col]
-            # Create masked label cell
+            
+            # Create masked label cell with semantic type
             label_cell = Cell(
                 value=row[target_col],
                 column=target_col,
                 table=task_table_name,
                 row_id=global_row_id,
+                semantic_type=target_semantic_type,
                 is_masked=True,  # Label is masked during inference
             )
             
+            # Assign sequential node index for task row
+            node_index = self._next_node_index
+            self._next_node_index += 1
             # Create task row
             task_row = Row(
                 row_id=global_row_id,
@@ -202,6 +291,7 @@ class RelBenchGraphBuilder:
                 timestamp=timestamp,
                 f2p_neighbors=[],
                 p2f_neighbors=[],
+                node_index=node_index,
             )
             
             # Link task row to entity row (F→P)
@@ -221,3 +311,21 @@ class RelBenchGraphBuilder:
         
         self._task_rows[split] = task_rows
         logger.info(f"Built {len(task_rows)} task rows for split '{split}'")
+    
+    def get_table_index(self, table_name: str) -> int:
+        """Get the unique integer index for a table name."""
+        return self._table_name_to_idx.get(table_name, -1)
+    
+    def get_column_index(self, table_name: str, column_name: str) -> int:
+        """Get the unique integer index for a (table, column) pair."""
+        return self._column_to_idx.get((table_name, column_name), -1)
+    
+    @property
+    def num_tables(self) -> int:
+        """Total number of unique tables."""
+        return len(self._table_name_to_idx)
+    
+    @property
+    def num_columns(self) -> int:
+        """Total number of unique (table, column) pairs."""
+        return len(self._column_to_idx)
