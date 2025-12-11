@@ -8,6 +8,12 @@ Always run with uv run torchrun:
 """
 
 import os
+
+# Set OpenMP threads before importing numpy/torch to avoid CPU over-subscription
+# in distributed training. Adjust based on: total_cores / num_gpu_processes.
+# This silences the torchrun warning about OMP_NUM_THREADS.
+if "OMP_NUM_THREADS" not in os.environ:
+    os.environ["OMP_NUM_THREADS"] = "8"
 import random
 import time
 from collections.abc import Iterator
@@ -409,10 +415,10 @@ def main(config: OverallConfig) -> None:
 
     with profiler_ctx as prof:
         # Configure torch before model creation
-        torch.set_float32_matmul_precision("high")
+        # torch.set_float32_matmul_precision("high")
         torch._dynamo.config.cache_size_limit = 64
         torch._dynamo.config.optimize_ddp = True
-        torch.set_num_threads(1)
+        # torch.set_num_threads(1)
 
         trainer = Trainer(config=config, ddp_parameters=ddp_parameters, profiler=prof)
         trainer.train()
