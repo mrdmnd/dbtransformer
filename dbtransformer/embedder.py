@@ -18,7 +18,7 @@ from jaxtyping import Float, Int
 from loguru import logger
 from torch import Tensor
 
-from dbtransformer.hardware_abstraction_layer import HardwareConfig
+from dbtransformer.configurations import EmbedderConfig
 
 # This is to avoid a warning about tokenizers being parallelized.
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -44,31 +44,28 @@ def last_token_pooling(
 class FrozenEmbedder:
     def __init__(
         self,
-        mrl_dimension: int = 512,
-        hardware_config: HardwareConfig | None = None,
+        embedder_config: EmbedderConfig,
     ) -> None:
+        self.embedder_config = embedder_config
         logger.info("Initializing FrozenEmbedder")
-        self.mrl_dimension = min(mrl_dimension, 1024)
-        if self.mrl_dimension != mrl_dimension:
-            logger.warning(f"Truncating MRL dimension from {mrl_dimension} to {self.mrl_dimension} (max supported)")
+        self.mrl_dimension = min(self.embedder_config.mrl_dimension, 1024)
+        if self.mrl_dimension != self.embedder_config.mrl_dimension:
+            logger.warning(f"Truncating MRL dimension from {self.embedder_config.mrl_dimension} to {self.mrl_dimension} (max supported)")
 
-        # Auto-detect config if not provided
-        self.hardware_config = hardware_config or HardwareConfig.auto_detect()
-
-        self.model_name = "Qwen/Qwen3-Embedding-0.6B"
-        self.max_length = 1024
+        self.model_name = self.embedder_config.embedder_model_name
+        self.max_length = self.embedder_config.max_length
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             padding_side="left",
             truncation_side="left",
         )
 
-        logger.info(f"Loading embedding model on {self.hardware_config.device}. FlashAttention2 enabled: {self.hardware_config.use_flash_attention}")
+        logger.info("Loading embedding model.")
         self.model = AutoModel.from_pretrained(
             self.model_name,
-            attn_implementation="flash_attention_2" if self.hardware_config.use_flash_attention else "sdpa",
-            dtype=self.hardware_config.embedder_dtype,
-        ).to(self.hardware_config.device)
+            attn_implementation="flash_attention_2",
+            dtype=self.embedder_config.embedder_model_dtype,
+        ).to("cuda")
 
         # Disable gradients and set eval mode
         self.model.eval()
@@ -87,7 +84,7 @@ class FrozenEmbedder:
             max_length=self.max_length,
             return_tensors="pt",
             return_token_type_ids=False,
-        ).to(self.hardware_config.device)
+        ).to("cuda")
         outputs = self.model(**batch)
         embeddings = last_token_pooling(
             outputs.last_hidden_state,
@@ -187,7 +184,8 @@ def _run_benchmark(
     all_strings = _generate_synthetic_strings(total_strings)
 
     logger.info("Initializing embedder")
-    embedder = FrozenEmbedder(mrl_dimension=512)
+    embedder_config = EmbedderConfig()
+    embedder = FrozenEmbedder(embedder_config)
 
     # Count tokens per string for throughput calculation
     logger.info("Tokenizing all strings")

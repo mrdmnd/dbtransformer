@@ -2,117 +2,117 @@
 Profiling utilities for PyTorch training.
 
 Usage with train.py:
-    # Profile ONLY the training batches with torch.profiler (step-based schedule)
+    # Profile ONLY the training batches with torch.profiler (step-based)
     uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py \
-        --profile torch --no-wandb --epochs 1
+        --profile batch --no-wandb
 
-    # Profile EVERYTHING (data loading, setup, compilation, training, etc.)
+    # Profile EVERYTHING (data loading, setup, compilation, training)
     uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py \
-        --profile torch-full --no-wandb --epochs 1
+        --profile full --no-wandb
 
-    # The torch-full profile will be VERY VERY large (O(10 GB) for a single run) because it is capturing EVERYTHING.
+    # The full profile will be VERY large (O(10 GB)) because it captures
+    # EVERYTHING: shapes, memory, stack traces, etc.
 
-    # To see what's happening, you can look at profiles with perfetto (ui.perfetto.dev)
+    # View profiles with perfetto (ui.perfetto.dev) or TensorBoard.
 """
 
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 
 import torch
 from loguru import logger
 
+from dbtransformer.configurations import ProfilingConfig
+
 
 @contextmanager
-def torch_profiler_context(
-    output_dir: str = "./profiler_logs",
-    wait: int = 2,
-    warmup: int = 2,
-    active: int = 6,
-    repeat: int = 1,
-) -> Generator[torch.profiler.profile | None]:
+def _batch_context(
+    config: ProfilingConfig,
+) -> Iterator[torch.profiler.profile]:
     """
-    Context manager for torch.profiler with TensorBoard output.
+    Context manager for torch.profiler with step-based schedule.
 
-    Args:
-        output_dir: Directory to save profiler traces
-        wait: Steps to skip before warmup
-        warmup: Steps for warmup (not recorded)
-        active: Steps to actively record
-        repeat: Number of cycles to repeat
+    Uses a schedule to wait, warmup, then record for a configurable
+    number of batches. Call profiler.step() after each batch.
     """
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    Path(config.profile_output).mkdir(parents=True, exist_ok=True)
 
     schedule = torch.profiler.schedule(
-        wait=wait,
-        warmup=warmup,
-        active=active,
-        repeat=repeat,
+        wait=config.batch_profile_wait_batches,
+        warmup=config.batch_profile_warmup_batches,
+        active=config.batch_profile_active_batches,
+        repeat=config.batch_profile_repeat_batches,
     )
 
-    # Determine activities based on available hardware
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if torch.cuda.is_available():
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-    logger.info(f"Starting torch.profiler with activities: {activities}")
-    logger.info(f"Schedule: wait={wait}, warmup={warmup}, active={active}, repeat={repeat}")
-    logger.info(f"Output: {output_dir}")
+    activities = [
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ]
+    logger.info(f"Starting BATCH profiler with activities: {activities}")
+    logger.info(f"Output: {config.profile_output}")
 
     with torch.profiler.profile(
         activities=activities,
         schedule=schedule,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(config.profile_output),
         record_shapes=True,
         profile_memory=True,
         with_stack=True,
     ) as prof:
         yield prof
 
-    logger.success(f"Profiling complete. View with: tensorboard --logdir={output_dir}")
-
 
 @contextmanager
-def torch_profiler_full_context(
-    output_dir: str = "./profiler_logs",
-) -> Generator[torch.profiler.profile | None]:
+def _full_context(
+    config: ProfilingConfig,
+) -> Iterator[torch.profiler.profile]:
     """
     Context manager for torch.profiler WITHOUT a schedule.
 
-    This profiles EVERYTHING within the context - no waiting, no warmup,
+    Profiles EVERYTHING within the context - no waiting, no warmup,
     just continuous profiling. Use this to capture data loading, model
     setup, compilation, and training all in one trace.
 
-    Records shapes, memory, and stack traces - very verbose and large.
-    Probably only want to do this for one or two batches to get a sense for things.
-
-    Args:
-        output_dir: Directory to save profiler traces
+    Warning: Generates very large traces. Only use for short runs.
     """
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    Path(config.profile_output).mkdir(parents=True, exist_ok=True)
 
-    # Determine activities based on available hardware
-    activities = [torch.profiler.ProfilerActivity.CPU]
-    if torch.cuda.is_available():
-        activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-    logger.info(f"Starting FULL torch.profiler with activities: {activities}")
-    logger.info("Profiling everything (no schedule - always active)")
-    logger.info(f"Output: {output_dir}")
+    activities = [
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ]
+    logger.info(f"Starting FULL profiler with activities: {activities}")
+    logger.info(f"Output: {config.profile_output}")
 
     with torch.profiler.profile(
         activities=activities,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(output_dir),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(config.profile_output),
         record_shapes=True,
         profile_memory=True,
         with_stack=True,
     ) as prof:
         yield prof
 
-    logger.success(f"Profiling complete. View with: tensorboard --logdir={output_dir}")
-
 
 @contextmanager
-def no_profiler_context() -> Generator[None]:
-    """Dummy context manager for no profiling."""
+def _disabled_context() -> Iterator[None]:
+    """Context manager that yields None (no profiling)."""
     yield None
+
+
+def get_profiler_context(
+    config: ProfilingConfig,
+) -> AbstractContextManager[torch.profiler.profile | None]:
+    """
+    Get the appropriate profiler context based on the configuration.
+
+    Returns a context manager that yields:
+        - torch.profiler.profile for "full" or "batch" modes
+        - None for "disabled" mode
+    """
+    if config.profile_mode == "full":
+        return _full_context(config)
+    if config.profile_mode == "batch":
+        return _batch_context(config)
+    return _disabled_context()

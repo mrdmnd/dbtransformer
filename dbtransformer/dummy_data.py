@@ -1,0 +1,183 @@
+# This file contains code for generating "dummy data" for the model, just for
+# initial testing and development.
+
+from typing import TypedDict
+
+import torch
+from loguru import logger
+from torch import Tensor
+from torch.utils.data import Dataset
+
+from dbtransformer.configurations import DummyDataConfig, ModelConfig
+from dbtransformer.model import MAX_F2P_NEIGHBORS, Batch, SemanticsType
+
+
+class DummySample(TypedDict):
+    """A single sample (no batch dimension) for dummy data generation."""
+
+    node_indices: Tensor  # (seq_len,)
+    table_name_indices: Tensor  # (seq_len,)
+    column_name_indices: Tensor  # (seq_len,)
+    f2p_neighbor_indices: Tensor  # (seq_len, MAX_F2P_NEIGHBORS)
+    number_values: Tensor  # (seq_len, 1)
+    datetime_values: Tensor  # (seq_len, 1)
+    boolean_values: Tensor  # (seq_len, 1)
+    text_values: Tensor  # (seq_len, d_text)
+    column_name_values: Tensor  # (seq_len, d_text)
+    semantic_types: Tensor  # (seq_len,)
+    masks: Tensor  # (seq_len,)
+    is_targets: Tensor  # (seq_len,)
+    is_task_nodes: Tensor  # (seq_len,)
+    is_padding: Tensor  # (seq_len,)
+    class_value_indices: Tensor  # (seq_len,)
+
+
+def create_dummy_sample(seq_len: int, d_text: int) -> DummySample:
+    """
+    Create a single dummy sample with random data for testing.
+
+    All tensors have shape (seq_len, ...) with NO batch dimension.
+    The DataLoader will handle batching via the collate function.
+    """
+    # Create node indices: groups of cells belong to the same row
+    # We'll simulate ~10 cells per row on average
+    cells_per_row = 10
+    num_rows = (seq_len + cells_per_row - 1) // cells_per_row
+    node_indices = torch.arange(num_rows)
+    node_indices = node_indices.repeat_interleave(cells_per_row)[:seq_len]
+    node_indices = node_indices.to(torch.int32)
+
+    # Table and column indices: simulate ~5 tables, ~20 columns per table
+    num_tables = 5
+    num_cols_per_table = 20
+    table_indices = torch.randint(0, num_tables, (seq_len,), dtype=torch.int32)
+    column_indices = torch.randint(0, num_tables * num_cols_per_table, (seq_len,), dtype=torch.int32)
+
+    # Foreign-to-primary neighbor indices
+    # Each cell has up to MAX_F2P_NEIGHBORS parent row references
+    # Use -1 for padding (no neighbor)
+    f2p = torch.randint(-1, num_rows, (seq_len, MAX_F2P_NEIGHBORS), dtype=torch.int32)
+
+    # Numeric values (z-score normalized)
+    # Use float32 here; converted to bfloat16 on CUDA via Batch.to_device()
+    number_vals = torch.randn(seq_len, 1, dtype=torch.float32)
+    datetime_vals = torch.randn(seq_len, 1, dtype=torch.float32)
+    boolean_vals = torch.randn(seq_len, 1, dtype=torch.float32)
+
+    # Text embeddings (pre-computed sentence transformer output)
+    text_vals = torch.randn(seq_len, d_text, dtype=torch.float32)
+    column_name_vals = torch.randn(seq_len, d_text, dtype=torch.float32)
+
+    # Semantic types: 0=number, 1=text, 2=datetime, 3=boolean
+    semantic_types = torch.randint(0, 4, (seq_len,), dtype=torch.long)
+
+    # Masks: positions to hide and predict
+    # Mask ~15% of non-text positions (model doesn't support text masking)
+    masks = torch.rand(seq_len) < 0.15  # noqa: PLR2004
+    masks &= semantic_types != SemanticsType.TEXT.value
+
+    # Ensure at least one masked position for loss computation
+    if not masks.any():
+        non_text = (semantic_types != SemanticsType.TEXT.value).nonzero(as_tuple=True)[0]
+        if len(non_text) > 0:
+            masks[non_text[0]] = True
+
+    # is_targets: same as masks for now
+    is_targets = masks.clone()
+
+    # is_task_nodes: first ~10% of rows are task table rows
+    task_row_threshold = num_rows // 10
+    is_task_nodes = node_indices < task_row_threshold
+
+    # No padding in dummy data
+    is_padding = torch.zeros(seq_len, dtype=torch.bool)
+
+    # Class value indices (unused, set to -1)
+    class_indices = torch.full((seq_len,), -1, dtype=torch.int32)
+
+    return DummySample(
+        node_indices=node_indices,
+        table_name_indices=table_indices,
+        column_name_indices=column_indices,
+        f2p_neighbor_indices=f2p,
+        number_values=number_vals,
+        datetime_values=datetime_vals,
+        boolean_values=boolean_vals,
+        text_values=text_vals,
+        column_name_values=column_name_vals,
+        semantic_types=semantic_types,
+        masks=masks,
+        is_targets=is_targets,
+        is_task_nodes=is_task_nodes,
+        is_padding=is_padding,
+        class_value_indices=class_indices,
+    )
+
+
+class DummySampleDataset(Dataset[DummySample]):
+    """
+    Dataset that returns individual dummy samples for DataLoader batching.
+
+    Pre-generates a pool of samples at initialization to avoid slow on-the-fly
+    random tensor generation during training. Each __getitem__ returns a single
+    sample (no batch dimension); the DataLoader handles batching.
+    """
+
+    def __init__(
+        self,
+        data_config: DummyDataConfig,
+        model_config: ModelConfig,
+    ) -> None:
+        self.data_config = data_config
+        self.seq_len = model_config.seq_len
+        self.d_text = model_config.d_text
+        self.num_samples = data_config.total_num_samples
+
+        # Pre-generate a pool of samples to cycle through (faster than on-fly)
+        self._pool_size = min(1000, self.num_samples)
+        logger.info(f"Pre-generating {self._pool_size} dummy samples on CPU...")
+        self._sample_pool: list[DummySample] = [create_dummy_sample(self.seq_len, self.d_text) for _ in range(self._pool_size)]
+        logger.info("Done pre-generating samples.")
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> DummySample:
+        # Return from pre-generated pool (cycling through)
+        return self._sample_pool[idx % self._pool_size]
+
+
+def collate_samples(samples: list[DummySample]) -> Batch:
+    """
+    Collate a list of DummySample dicts into a single Batch.
+
+    This is the collate_fn for the DataLoader. It stacks individual samples
+    along a new batch dimension (dim=0).
+
+    Args:
+        samples: List of DummySample dicts, each with tensors of shape
+                 (seq_len, ...).
+
+    Returns:
+        A Batch with tensors of shape (batch_size, seq_len, ...).
+    """
+    batch_size = len(samples)
+
+    return Batch(
+        node_indices=torch.stack([s["node_indices"] for s in samples]),
+        table_name_indices=torch.stack([s["table_name_indices"] for s in samples]),
+        column_name_indices=torch.stack([s["column_name_indices"] for s in samples]),
+        f2p_neighbor_indices=torch.stack([s["f2p_neighbor_indices"] for s in samples]),
+        number_values=torch.stack([s["number_values"] for s in samples]),
+        datetime_values=torch.stack([s["datetime_values"] for s in samples]),
+        boolean_values=torch.stack([s["boolean_values"] for s in samples]),
+        text_values=torch.stack([s["text_values"] for s in samples]),
+        column_name_values=torch.stack([s["column_name_values"] for s in samples]),
+        semantic_types=torch.stack([s["semantic_types"] for s in samples]),
+        masks=torch.stack([s["masks"] for s in samples]),
+        is_targets=torch.stack([s["is_targets"] for s in samples]),
+        is_task_nodes=torch.stack([s["is_task_nodes"] for s in samples]),
+        is_padding=torch.stack([s["is_padding"] for s in samples]),
+        class_value_indices=torch.stack([s["class_value_indices"] for s in samples]),
+        true_batch_size=batch_size,
+    )
