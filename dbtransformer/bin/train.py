@@ -302,16 +302,14 @@ class Trainer:
 
     def train(self) -> None:
         """Run the full training loop."""
-        # 1. Initialize weights and biases setup on rank 0 only
-        if not self.config.wandb.enabled or self.ddp_parameters.global_rank != 0:
-            return
-
-        self.wandb_run = wandb.init(
-            entity=self.config.wandb.wandb_entity,
-            project=self.config.wandb.wandb_project,
-            config=asdict(self.config),
-        )
-        logger.info(f"W&B run: {self.wandb_run.name}")
+        # Initialize W&B on rank 0 only
+        if self.config.wandb.enabled and self.is_leader:
+            self.wandb_run = wandb.init(
+                entity=self.config.wandb.wandb_entity,
+                project=self.config.wandb.wandb_project,
+                config=asdict(self.config),
+            )
+            logger.info(f"W&B run: {self.wandb_run.name}")
 
         self._warmup_compile()
 
