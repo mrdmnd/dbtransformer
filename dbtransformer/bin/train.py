@@ -350,11 +350,8 @@ class Trainer:
             batches_since_log += 1
             current_batch = batch_num + 1
 
-            # Sync and log metrics every sync_every_n_batches
-            if current_batch % self.config.training.sync_every_n_batches == 0:
-                if self.ddp_parameters.world_size > 1:
-                    dist.all_reduce(accumulated_loss, op=dist.ReduceOp.AVG)
-
+            # Log metrics every log_every_n_batches
+            if current_batch % self.config.training.log_every_n_batches == 0:
                 total_loss_scalar = accumulated_loss.item()
 
                 if self.is_leader:

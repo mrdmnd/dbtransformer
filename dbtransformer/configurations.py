@@ -60,10 +60,10 @@ class TrainingConfig:
     # Total requested batches to train for.
     max_batches: int = 300
 
-    # Synchronization and saving
+    # Logging and saving
 
-    # Synchronize the loss across all ranks every N batches.
-    sync_every_n_batches: int = 10
+    # Log metrics every N batches.
+    log_every_n_batches: int = 10
 
     # Save a snapshot every N batches.
     save_every_n_batches: int = 100
