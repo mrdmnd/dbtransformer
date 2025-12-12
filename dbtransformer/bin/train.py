@@ -153,9 +153,15 @@ class Trainer:
             logger.info("Wrapping model with DDP")
         self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_parameters.local_rank])
 
-        if self.is_leader:
-            logger.info("Compiling model")
-        self.model = torch.compile(self.model, dynamic=False)  # type: ignore[assignment]
+        # Compile model unless profiling (record_function annotations inside
+        # the compiled forward pass get eliminated, so we skip compile for
+        # detailed profiling)
+        if config.profiling.profile_mode == "disabled":
+            if self.is_leader:
+                logger.info("Compiling model")
+            self.model = torch.compile(self.model, dynamic=False)  # type: ignore[assignment]
+        elif self.is_leader:
+            logger.info("Skipping model compilation (profiling enabled)")
 
         # Load snapshot after DDP/compile so state dict keys match
         if Path(config.training.snapshot_path).exists():
@@ -219,26 +225,33 @@ class Trainer:
 
     def _run_batch(self, batch: Batch) -> torch.Tensor:
         """Run a single training batch and return the loss (as a tensor)."""
-        batch.to_device(
-            self.ddp_parameters.device,
-            float_dtype=self.config.model.model_dtype,
-        )
+        with torch.autograd.profiler.record_function("batch_to_device"):
+            batch.to_device(
+                self.ddp_parameters.device,
+                float_dtype=self.config.model.model_dtype,
+            )
 
-        self.optimizer.zero_grad(set_to_none=True)
+        with torch.autograd.profiler.record_function("optimizer_zero_grad"):
+            self.optimizer.zero_grad(set_to_none=True)
 
         # Model returns ModelOutput with loss already computed
-        output: ModelOutput = self.model(batch)
-        loss = output["loss"]
-        loss.backward()
+        with torch.autograd.profiler.record_function("forward_pass"):
+            output: ModelOutput = self.model(batch)
+            loss = output["loss"]
+
+        with torch.autograd.profiler.record_function("backward_pass"):
+            loss.backward()
 
         # Gradient clipping
         # This has to happen *after* loss.backward(), which automatically
         # handles DDP gradient averaging, but *before* optimizer.step(),
         # which needs the clipped gradients to update parameters.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.max_grad_norm)
+        with torch.autograd.profiler.record_function("gradient_clipping"):
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.max_grad_norm)
 
-        self.optimizer.step()
-        self.scheduler.step()
+        with torch.autograd.profiler.record_function("optimizer_step"):
+            self.optimizer.step()
+            self.scheduler.step()
 
         # Explicit sync to ensure GPU work completes before next batch.
         # This prevents sync time from "leaking" into data loading.
@@ -350,7 +363,8 @@ class Trainer:
         )
 
         for batch_num in pbar:
-            batch = next(batch_iter)
+            with torch.autograd.profiler.record_function("data_loading"):
+                batch = next(batch_iter)
             batch_loss = self._run_batch(batch)
             accumulated_loss += batch_loss
             batches_since_log += 1
@@ -479,9 +493,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    wandb_config = WandbConfig()
-    if args.no_wandb:
-        wandb_config.enabled = False
+    wandb_config = WandbConfig(enabled=not args.no_wandb)
     profile_config = ProfilingConfig()
     if args.profile is not None:
         profile_config.profile_mode = args.profile

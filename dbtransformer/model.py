@@ -436,23 +436,23 @@ class RelationalTransformer(nn.Module):
         # =======================================================
         #  INPUT EMBEDDING STEP
         # =======================================================
+        with torch.autograd.profiler.record_function("input_embedding"):
+            encoded: Float[Tensor, "b s d"] = (
+                self.number_norm(self.number_encoder(number_values)) * is_number[..., None]
+                + self.text_norm(self.text_encoder(text_values)) * is_text[..., None]
+                + self.datetime_norm(self.datetime_encoder(datetime_values)) * is_datetime[..., None]
+                + self.boolean_norm(self.boolean_encoder(boolean_values)) * is_boolean[..., None]
+            )
 
-        encoded: Float[Tensor, "b s d"] = (
-            self.number_norm(self.number_encoder(number_values)) * is_number[..., None]
-            + self.text_norm(self.text_encoder(text_values)) * is_text[..., None]
-            + self.datetime_norm(self.datetime_encoder(datetime_values)) * is_datetime[..., None]
-            + self.boolean_norm(self.boolean_encoder(boolean_values)) * is_boolean[..., None]
-        )
+            mask_embedded: Float[Tensor, "b s d"] = self.mask_embeddings[semantic_type]
 
-        mask_embedded: Float[Tensor, "b s d"] = self.mask_embeddings[semantic_type]
+            visible = (~masks & ~is_padding)[..., None]
+            hidden = (masks & ~is_padding)[..., None]
 
-        visible = (~masks & ~is_padding)[..., None]
-        hidden = (masks & ~is_padding)[..., None]
-
-        # Input to the model starts as the column name embedding, plus the encoded
-        # values, plus the embeddings for whatever is masked.
-        x: Float[Tensor, "b s d"] = self.column_name_norm(self.column_name_encoder(column_name_values)) * (~is_padding)[..., None]
-        x = x + encoded * visible + mask_embedded * hidden
+            # Input to the model starts as the column name embedding, plus the encoded
+            # values, plus the embeddings for whatever is masked.
+            x: Float[Tensor, "b s d"] = self.column_name_norm(self.column_name_encoder(column_name_values)) * (~is_padding)[..., None]
+            x = x + encoded * visible + mask_embedded * hidden
 
         # =======================================================
         #  Compute ATTENTION MASKS
@@ -460,55 +460,59 @@ class RelationalTransformer(nn.Module):
         # Both modes compute the same relational masks.
         # For "flash" mode (SDPA): use dense bool tensors directly
         # For "flex" mode: convert to sparse BlockMasks for FlexAttention
+        with torch.autograd.profiler.record_function("mask_computation"):
+            # Active mask for attention - both positions must be non-padding
+            active: Bool[Tensor, "b s s"] = ~is_padding[:, :, None] & ~is_padding[:, None, :]
 
-        # Active mask for attention - both positions must be non-padding
-        active: Bool[Tensor, "b s s"] = ~is_padding[:, :, None] & ~is_padding[:, None, :]
+            # Cells in the same node can attend to each other
+            same_node: Bool[Tensor, "b s s"] = node_indices[:, :, None] == node_indices[:, None, :]
 
-        # Cells in the same node can attend to each other
-        same_node: Bool[Tensor, "b s s"] = node_indices[:, :, None] == node_indices[:, None, :]
+            # If KV index is in Q's foreign-to-primary (parent) neighborhood
+            # Shape: (b, s, s, max_f2p) -> (b, s, s) via any()
+            kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
 
-        # If KV index is in Q's foreign-to-primary (parent) neighborhood
-        # Shape: (b, s, s, max_f2p) -> (b, s, s) via any()
-        kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
+            # If Q index is in KV's primary-to-foreign (child) neighborhood
+            q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(dim=-1)
 
-        # If Q index is in KV's primary-to-foreign (child) neighborhood
-        q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(dim=-1)
+            # If this is the same column AND same table
+            same_column_and_table: Bool[Tensor, "b s s"] = (column_name_indices[:, :, None] == column_name_indices[:, None, :]) & (
+                table_name_indices[:, :, None] == table_name_indices[:, None, :]
+            )
 
-        # If this is the same column AND same table
-        same_column_and_table: Bool[Tensor, "b s s"] = (column_name_indices[:, :, None] == column_name_indices[:, None, :]) & (
-            table_name_indices[:, :, None] == table_name_indices[:, None, :]
-        )
-
-        # Final attention masks, per-type (dense bool tensors)
-        column_mask: Bool[Tensor, "b s s"] = same_column_and_table & active
-        feature_mask: Bool[Tensor, "b s s"] = (same_node | kv_in_f2p) & active
-        neighbor_mask: Bool[Tensor, "b s s"] = q_in_p2f & active
-        full_mask: Bool[Tensor, "b s s"] = active
+            # Final attention masks, per-type (dense bool tensors)
+            column_mask: Bool[Tensor, "b s s"] = same_column_and_table & active
+            feature_mask: Bool[Tensor, "b s s"] = (same_node | kv_in_f2p) & active
+            neighbor_mask: Bool[Tensor, "b s s"] = q_in_p2f & active
+            full_mask: Bool[Tensor, "b s s"] = active
 
         # =======================================================
         # Pass input through the blocks!
         # =======================================================
         if self.use_flash:
             # Flash/SDPA mode: use dense bool masks directly
-            for block in self.blocks:
-                x = block(x, column_mask, feature_mask, neighbor_mask, full_mask)
+            with torch.autograd.profiler.record_function("transformer_blocks_flash"):
+                for block in self.blocks:
+                    x = block(x, column_mask, feature_mask, neighbor_mask, full_mask)
         else:
             # Flex attention mode: convert to sparse BlockMasks
-            col_attn_mask = _generate_block_mask(column_mask.contiguous(), b, s, device)
-            feature_attn_mask = _generate_block_mask(feature_mask.contiguous(), b, s, device)
-            neighbor_attn_mask = _generate_block_mask(neighbor_mask.contiguous(), b, s, device)
-            full_attn_mask = _generate_block_mask(full_mask.contiguous(), b, s, device)
+            with torch.autograd.profiler.record_function("block_mask_creation"):
+                col_attn_mask = _generate_block_mask(column_mask.contiguous(), b, s, device)
+                feature_attn_mask = _generate_block_mask(feature_mask.contiguous(), b, s, device)
+                neighbor_attn_mask = _generate_block_mask(neighbor_mask.contiguous(), b, s, device)
+                full_attn_mask = _generate_block_mask(full_mask.contiguous(), b, s, device)
 
-            for block in self.blocks:
-                x = block(
-                    x,
-                    col_attn_mask,
-                    feature_attn_mask,
-                    neighbor_attn_mask,
-                    full_attn_mask,
-                )
+            with torch.autograd.profiler.record_function("transformer_blocks_flex"):
+                for block in self.blocks:
+                    x = block(
+                        x,
+                        col_attn_mask,
+                        feature_attn_mask,
+                        neighbor_attn_mask,
+                        full_attn_mask,
+                    )
 
-        x = self.out_norm(x)
+        with torch.autograd.profiler.record_function("output_norm"):
+            x = self.out_norm(x)
 
         # =======================================================
         # OUTPUT DECODING & LOSS
@@ -517,24 +521,28 @@ class RelationalTransformer(nn.Module):
         # Boolean indexing uses nonzero internally, which torch.compile can't
         # handle. Instead, we run decoders on all positions and mask the output.
         # This is an intentional tradeoff (extra compute to avoid graph breaks).
-        yhat_number: Float[Tensor, "b s 1"] = self.number_decoder(x) * is_number[..., None]
-        yhat_datetime: Float[Tensor, "b s 1"] = self.datetime_decoder(x) * is_datetime[..., None]
-        yhat_boolean: Float[Tensor, "b s 1"] = self.boolean_decoder(x) * is_boolean[..., None]
-        yhat_text: Float[Tensor, "b s d_text"] = self.text_decoder(x) * is_text[..., None]
+        with torch.autograd.profiler.record_function("output_decoding"):
+            yhat_number: Float[Tensor, "b s 1"] = self.number_decoder(x) * is_number[..., None]
+            yhat_datetime: Float[Tensor, "b s 1"] = self.datetime_decoder(x) * is_datetime[..., None]
+            yhat_boolean: Float[Tensor, "b s 1"] = self.boolean_decoder(x) * is_boolean[..., None]
+            yhat_text: Float[Tensor, "b s d_text"] = self.text_decoder(x) * is_text[..., None]
 
-        # Compute per-position losses (before masking)
-        loss_number: Float[Tensor, "b s"] = F.huber_loss(yhat_number, number_values, reduction="none").mean(-1)
-        loss_datetime: Float[Tensor, "b s"] = F.huber_loss(yhat_datetime, datetime_values, reduction="none").mean(-1)
-        loss_boolean: Float[Tensor, "b s"] = F.binary_cross_entropy_with_logits(yhat_boolean, (boolean_values > 0).float(), reduction="none").mean(-1)
+        with torch.autograd.profiler.record_function("loss_computation"):
+            # Compute per-position losses (before masking)
+            loss_number: Float[Tensor, "b s"] = F.huber_loss(yhat_number, number_values, reduction="none").mean(-1)
+            loss_datetime: Float[Tensor, "b s"] = F.huber_loss(yhat_datetime, datetime_values, reduction="none").mean(-1)
+            loss_boolean: Float[Tensor, "b s"] = F.binary_cross_entropy_with_logits(
+                yhat_boolean, (boolean_values > 0).float(), reduction="none"
+            ).mean(-1)
 
-        # Select the right loss per position based on semantic type
-        combined_loss: Float[Tensor, "b s"] = loss_number * is_number + loss_datetime * is_datetime + loss_boolean * is_boolean
+            # Select the right loss per position based on semantic type
+            combined_loss: Float[Tensor, "b s"] = loss_number * is_number + loss_datetime * is_datetime + loss_boolean * is_boolean
 
-        # Single masked sum and division
-        # By fiat, we've decided that we're not allowed to mask any text, so although
-        # we aren't computing loss on text positions, we're not going to get any
-        # numerator contribution from the masks and so this is fine as written.
-        loss_out: Float[Tensor, ""] = (combined_loss * masks).sum() / masks.sum()
+            # Single masked sum and division
+            # By fiat, we've decided that we're not allowed to mask any text, so although
+            # we aren't computing loss on text positions, we're not going to get any
+            # numerator contribution from the masks and so this is fine as written.
+            loss_out: Float[Tensor, ""] = (combined_loss * masks).sum() / masks.sum()
 
         return ModelOutput(
             loss=loss_out,
