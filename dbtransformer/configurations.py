@@ -49,6 +49,12 @@ class ModelConfig:
     batch_size: int = 32
     compile_model: bool = True
 
+    # Attention mode: "flex" uses FlexAttention with sparse BlockMasks,
+    # "flash" uses F.scaled_dot_product_attention with dense bool masks.
+    # Both respect the relational attention structure. Use "flash" to compare
+    # SDPA performance vs FlexAttention with the same masks.
+    attention_mode: Literal["flex", "flash"] = "flex"
+
 
 @dataclass
 class TrainingConfig:

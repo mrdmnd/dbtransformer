@@ -52,7 +52,14 @@ MAX_F2P_NEIGHBORS = 5
 
 @jaxtyped(typechecker=None)
 class FlexAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, attention_type: AttentionType) -> None:
+    """Attention using FlexAttention with sparse BlockMasks."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        attention_type: AttentionType,
+    ) -> None:
         super().__init__()
         self.attention_type = attention_type
         self.num_heads = num_heads
@@ -61,7 +68,11 @@ class FlexAttentionBlock(nn.Module):
         self.wv = nn.Linear(d_model, d_model, bias=False)
         self.wo = nn.Linear(d_model, d_model, bias=False)
 
-    def forward(self, x: Float[Tensor, "b s d"], mask: BlockMask) -> Float[Tensor, "b s d"]:
+    def forward(
+        self,
+        x: Float[Tensor, "b s d"],
+        mask: BlockMask,
+    ) -> Float[Tensor, "b s d"]:
         q: Float[Tensor, "b s d"] = self.wq(x)
         k: Float[Tensor, "b s d"] = self.wk(x)
         v: Float[Tensor, "b s d"] = self.wv(x)
@@ -70,9 +81,64 @@ class FlexAttentionBlock(nn.Module):
         k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
         v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
 
-        # mypy doesn't know that flex_attention returns a Tensor, but it always does
-        # unless return_lse=True, which we don't use, so just ignore the warning.
-        attn_out: Float[Tensor, "b h s d"] = flex_attention(q, k, v, block_mask=mask)  # type: ignore[assignment]
+        # mypy doesn't know that flex_attention returns a Tensor, but it always
+        # does unless return_lse=True, which we don't use.
+        attn_out: Float[Tensor, "b h s d"] = flex_attention(  # type: ignore
+            q, k, v, block_mask=mask
+        )
+        out: Float[Tensor, "b s d"] = rearrange(attn_out, "b h s d -> b s (h d)")
+        return self.wo(out)
+
+
+@jaxtyped(typechecker=None)
+class DenseAttentionBlock(nn.Module):
+    """Attention using F.scaled_dot_product_attention (FlashAttention backend).
+
+    Uses dense boolean masks instead of FlexAttention's BlockMasks.
+    Still respects the relational attention structure, but uses SDPA kernels
+    which may be faster than FlexAttention for some mask patterns.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        attention_type: AttentionType,
+    ) -> None:
+        super().__init__()
+        self.attention_type = attention_type
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.wk = nn.Linear(d_model, d_model, bias=False)
+        self.wv = nn.Linear(d_model, d_model, bias=False)
+        self.wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(
+        self,
+        x: Float[Tensor, "b s d"],
+        mask: Bool[Tensor, "b s s"],
+    ) -> Float[Tensor, "b s d"]:
+        q: Float[Tensor, "b s d"] = self.wq(x)
+        k: Float[Tensor, "b s d"] = self.wk(x)
+        v: Float[Tensor, "b s d"] = self.wv(x)
+
+        q = rearrange(q, "b s (h d) -> b h s d", h=self.num_heads)
+        k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
+        v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
+
+        # SDPA expects mask where True = attend, False = mask out.
+        # We pass the mask as attn_mask; SDPA handles the rest.
+        # enable_flash=True requires the mask to be None or a specific format,
+        # so we use the "efficient" backend which handles bool masks.
+        attn_out: Float[Tensor, "b h s d"] = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask[:, None, :, :],  # broadcast over heads
+            dropout_p=0.0,
+            is_causal=False,
+        )
         out: Float[Tensor, "b s d"] = rearrange(attn_out, "b h s d -> b s (h d)")
         return self.wo(out)
 
@@ -91,6 +157,7 @@ class FFN(nn.Module):
 
 
 # Implements the "Relational Transformer Block" from the paper.
+# Supports both FlexAttention (sparse BlockMasks) and SDPA (dense masks).
 @jaxtyped(typechecker=None)
 class RelationalBlock(nn.Module):
     def __init__(
@@ -98,28 +165,32 @@ class RelationalBlock(nn.Module):
         d_model: int,
         num_heads: int,
         d_ff: int,
+        use_flash: bool = False,
     ) -> None:
         super().__init__()
+        self.use_flash = use_flash
+
         self.column_norm = nn.RMSNorm(d_model)
         self.feature_norm = nn.RMSNorm(d_model)
         self.neighbor_norm = nn.RMSNorm(d_model)
         self.full_norm = nn.RMSNorm(d_model)
         self.ffn_norm = nn.RMSNorm(d_model)
 
-        self.column_attn = FlexAttentionBlock(d_model, num_heads, AttentionType.COLUMN)
-        self.feature_attn = FlexAttentionBlock(d_model, num_heads, AttentionType.FEATURE)
-        self.neighbor_attn = FlexAttentionBlock(d_model, num_heads, AttentionType.NEIGHBOR)
-        self.full_attn = FlexAttentionBlock(d_model, num_heads, AttentionType.FULL)
+        attn_cls = DenseAttentionBlock if use_flash else FlexAttentionBlock
+        self.column_attn = attn_cls(d_model, num_heads, AttentionType.COLUMN)
+        self.feature_attn = attn_cls(d_model, num_heads, AttentionType.FEATURE)
+        self.neighbor_attn = attn_cls(d_model, num_heads, AttentionType.NEIGHBOR)
+        self.full_attn = attn_cls(d_model, num_heads, AttentionType.FULL)
 
         self.ffn = FFN(d_model, d_ff)
 
     def forward(
         self,
         x: Float[Tensor, "b s d"],
-        col_attn_mask: BlockMask,
-        feature_attn_mask: BlockMask,
-        neighbor_attn_mask: BlockMask,
-        full_attn_mask: BlockMask,
+        col_attn_mask: BlockMask | Bool[Tensor, "b s s"],
+        feature_attn_mask: BlockMask | Bool[Tensor, "b s s"],
+        neighbor_attn_mask: BlockMask | Bool[Tensor, "b s s"],
+        full_attn_mask: BlockMask | Bool[Tensor, "b s s"],
     ) -> Float[Tensor, "b s d"]:
         # Don't use += operations to avoid autograd issues
         x = x + self.column_attn(self.column_norm(x), col_attn_mask)  # noqa: PLR6104
@@ -290,6 +361,7 @@ class RelationalTransformer(nn.Module):
     ) -> None:
         super().__init__()
         self.d_model = config.d_model
+        self.use_flash = config.attention_mode == "flash"
 
         # Set up initial embedding layers
         self.column_name_encoder = nn.Linear(config.d_text, config.d_model, bias=True)
@@ -308,8 +380,19 @@ class RelationalTransformer(nn.Module):
         # Mask Embeddings
         # (number, text, datetime, boolean)
         self.mask_embeddings = nn.Parameter(torch.randn(4, config.d_model))
-        # Transformer Blocks
-        self.blocks = nn.ModuleList([RelationalBlock(config.d_model, config.num_heads, config.d_ff) for _ in range(config.num_blocks)])
+
+        # Transformer Blocks - use flash (SDPA) or flex attention based on config
+        self.blocks = nn.ModuleList(
+            [
+                RelationalBlock(
+                    config.d_model,
+                    config.num_heads,
+                    config.d_ff,
+                    use_flash=self.use_flash,
+                )
+                for _ in range(config.num_blocks)
+            ]
+        )
 
         # Output Norm
         self.out_norm = nn.RMSNorm(config.d_model)
@@ -320,7 +403,7 @@ class RelationalTransformer(nn.Module):
         self.boolean_decoder = nn.Linear(config.d_model, 1, bias=True)
         self.text_decoder = nn.Linear(config.d_model, config.d_text, bias=True)
 
-    def forward(self, batch: Batch) -> ModelOutput:
+    def forward(self, batch: Batch) -> ModelOutput:  # noqa: PLR0915
         node_indices: Int[Tensor, "b s"] = batch.node_indices
         f2p_neighbor_indices: Int[Tensor, "b s 5"] = batch.f2p_neighbor_indices
 
@@ -372,8 +455,11 @@ class RelationalTransformer(nn.Module):
         x = x + encoded * visible + mask_embedded * hidden
 
         # =======================================================
-        #  Compute and compile ATTENTION MASKS for Flex Attention
+        #  Compute ATTENTION MASKS
         # =======================================================
+        # Both modes compute the same relational masks.
+        # For "flash" mode (SDPA): use dense bool tensors directly
+        # For "flex" mode: convert to sparse BlockMasks for FlexAttention
 
         # Active mask for attention - both positions must be non-padding
         active: Bool[Tensor, "b s s"] = ~is_padding[:, :, None] & ~is_padding[:, None, :]
@@ -381,11 +467,11 @@ class RelationalTransformer(nn.Module):
         # Cells in the same node can attend to each other
         same_node: Bool[Tensor, "b s s"] = node_indices[:, :, None] == node_indices[:, None, :]
 
-        # If the KV index is in Q's foreign-to-primary (parent) neighborhood set
+        # If KV index is in Q's foreign-to-primary (parent) neighborhood
         # Shape: (b, s, s, max_f2p) -> (b, s, s) via any()
         kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
 
-        # If the Q index is in KV's primary-to-foreign (child) neighborhood set
+        # If Q index is in KV's primary-to-foreign (child) neighborhood
         q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(dim=-1)
 
         # If this is the same column AND same table
@@ -399,16 +485,28 @@ class RelationalTransformer(nn.Module):
         neighbor_mask: Bool[Tensor, "b s s"] = q_in_p2f & active
         full_mask: Bool[Tensor, "b s s"] = active
 
-        col_attn_mask: BlockMask = _generate_block_mask(column_mask.contiguous(), b, s, device)
-        feature_attn_mask: BlockMask = _generate_block_mask(feature_mask.contiguous(), b, s, device)
-        neighbor_attn_mask: BlockMask = _generate_block_mask(neighbor_mask.contiguous(), b, s, device)
-        full_attn_mask: BlockMask = _generate_block_mask(full_mask.contiguous(), b, s, device)
-
         # =======================================================
         # Pass input through the blocks!
         # =======================================================
-        for block in self.blocks:
-            x = block(x, col_attn_mask, feature_attn_mask, neighbor_attn_mask, full_attn_mask)
+        if self.use_flash:
+            # Flash/SDPA mode: use dense bool masks directly
+            for block in self.blocks:
+                x = block(x, column_mask, feature_mask, neighbor_mask, full_mask)
+        else:
+            # Flex attention mode: convert to sparse BlockMasks
+            col_attn_mask = _generate_block_mask(column_mask.contiguous(), b, s, device)
+            feature_attn_mask = _generate_block_mask(feature_mask.contiguous(), b, s, device)
+            neighbor_attn_mask = _generate_block_mask(neighbor_mask.contiguous(), b, s, device)
+            full_attn_mask = _generate_block_mask(full_mask.contiguous(), b, s, device)
+
+            for block in self.blocks:
+                x = block(
+                    x,
+                    col_attn_mask,
+                    feature_attn_mask,
+                    neighbor_attn_mask,
+                    full_attn_mask,
+                )
 
         x = self.out_norm(x)
 

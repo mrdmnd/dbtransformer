@@ -464,6 +464,19 @@ if __name__ == "__main__":
         help="Output dir for torch profiler (default: ./profiler_logs)",
     )
 
+    # Attention mode argument
+    parser.add_argument(
+        "--attention-mode",
+        type=str,
+        choices=["flex", "flash"],
+        default="flex",
+        help=(
+            "Attention implementation: 'flex' uses FlexAttention with sparse "
+            "BlockMasks (default), 'flash' uses SDPA/FlashAttention with "
+            "dense bool masks. Both respect relational structure."
+        ),
+    )
+
     args = parser.parse_args()
 
     wandb_config = WandbConfig()
@@ -475,8 +488,10 @@ if __name__ == "__main__":
     if args.profile_output is not None:
         profile_config.profile_output = args.profile_output
 
+    model_config = ModelConfig(attention_mode=args.attention_mode)
+
     overall_config = OverallConfig(
-        model=ModelConfig(),
+        model=model_config,
         training=TrainingConfig(),
         data=DummyDataConfig(),
         profiling=profile_config,
