@@ -45,15 +45,7 @@ class ModelConfig:
     d_model: int = 256
     d_text: int = 384
     d_ff: int = 4 * d_model
-    seq_len: int = 1024
-    batch_size: int = 32
     compile_model: bool = True
-
-    # Attention mode: "flex" uses FlexAttention with sparse BlockMasks,
-    # "flash" uses F.scaled_dot_product_attention with dense bool masks.
-    # Both respect the relational attention structure. Use "flash" to compare
-    # SDPA performance vs FlexAttention with the same masks.
-    attention_mode: Literal["flex", "flash"] = "flex"
 
 
 @dataclass
@@ -62,6 +54,8 @@ class TrainingConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 0.1
     max_grad_norm: float = 1.0  # Gradient clipping
+    seq_len: int = 1024
+    batch_size: int = 32
 
     # Total requested batches to train for.
     max_batches: int = 300

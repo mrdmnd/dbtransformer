@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from dbtransformer.configurations import DummyDataConfig, ModelConfig
+from dbtransformer.configurations import DummyDataConfig, ModelConfig, TrainingConfig
 from dbtransformer.model import MAX_F2P_NEIGHBORS, Batch
 from dbtransformer.sampler_types import SemanticType
 
@@ -115,7 +115,13 @@ def create_dummy_sample(seq_len: int, d_text: int) -> DummySample:
 
 
 def create_dummy_batch(batch_size: int, seq_len: int, d_text: int) -> Batch:
-    """Create a full pre-batched Batch directly (no collation needed)."""
+    """Create a full pre-batched Batch directly (no collation needed).
+
+    Args:
+        batch_size: Number of samples in the batch.
+        seq_len: Sequence length per sample.
+        d_text: Dimension of text embeddings.
+    """
     # Node indices: groups of cells belong to the same row
     cells_per_row = 10
     num_rows = (seq_len + cells_per_row - 1) // cells_per_row
@@ -155,10 +161,11 @@ def create_dummy_batch(batch_size: int, seq_len: int, d_text: int) -> Batch:
     task_row_threshold = num_rows // 10
     is_task_node = node_indices < task_row_threshold
 
+    # Padding: none for now.
     is_padding = torch.zeros(batch_size, seq_len, dtype=torch.bool)
 
-    # Compute the attention masks from the index tensors
-    col_mask, feat_mask, neighbor_mask = Batch.compute_attention_masks(
+    # Compute dense boolean attention masks from the index tensors
+    col_mask, feat_mask, neighbor_mask, full_mask = Batch.compute_attention_masks(
         node_indices=node_indices,
         table_name_indices=table_indices,
         column_name_indices=column_indices,
@@ -179,6 +186,7 @@ def create_dummy_batch(batch_size: int, seq_len: int, d_text: int) -> Batch:
         column_attn_mask=col_mask.contiguous(),
         feature_attn_mask=feat_mask.contiguous(),
         neighbor_attn_mask=neighbor_mask.contiguous(),
+        full_attn_mask=full_mask.contiguous(),
     )
 
 
@@ -194,9 +202,10 @@ class PreBatchedDummyDataset(Dataset[Batch]):
         self,
         data_config: DummyDataConfig,
         model_config: ModelConfig,
+        training_config: TrainingConfig,
     ) -> None:
-        self.batch_size = model_config.batch_size
-        self.seq_len = model_config.seq_len
+        self.batch_size = training_config.batch_size
+        self.seq_len = training_config.seq_len
         self.d_text = model_config.d_text
 
         # Number of batches (not samples!)
@@ -204,7 +213,9 @@ class PreBatchedDummyDataset(Dataset[Batch]):
 
         # Pre-generate a pool of batches
         self._pool_size = min(64, self.num_batches)
-        self._batch_pool: list[Batch] = [create_dummy_batch(self.batch_size, self.seq_len, self.d_text) for _ in range(self._pool_size)]
+        self._batch_pool: list[Batch] = [
+            create_dummy_batch(self.batch_size, self.seq_len, self.d_text) for _ in range(self._pool_size)
+        ]
 
     def __len__(self) -> int:
         return self.num_batches
@@ -229,15 +240,18 @@ class DummySampleDataset(Dataset[DummySample]):
         self,
         data_config: DummyDataConfig,
         model_config: ModelConfig,
+        training_config: TrainingConfig,
     ) -> None:
         self.data_config = data_config
-        self.seq_len = model_config.seq_len
+        self.seq_len = training_config.seq_len
         self.d_text = model_config.d_text
         self.num_samples = data_config.total_num_samples
 
         # Pre-generate a pool of samples to cycle through
         self._pool_size = min(1000, self.num_samples)
-        self._sample_pool: list[DummySample] = [create_dummy_sample(self.seq_len, self.d_text) for _ in range(self._pool_size)]
+        self._sample_pool: list[DummySample] = [
+            create_dummy_sample(self.seq_len, self.d_text) for _ in range(self._pool_size)
+        ]
 
     def __len__(self) -> int:
         return self.num_samples
@@ -247,8 +261,7 @@ class DummySampleDataset(Dataset[DummySample]):
 
 
 def collate_samples(samples: list[DummySample]) -> Batch:
-    """
-    Collate a list of DummySample dicts into a single Batch.
+    """Collate a list of DummySample dicts into a single Batch.
 
     NOTE: This is slow! Consider using PreBatchedDummyDataset instead.
     """
@@ -259,8 +272,8 @@ def collate_samples(samples: list[DummySample]) -> Batch:
     f2p_neighbor_indices = torch.stack([s["f2p_neighbor_indices"] for s in samples])
     is_padding = torch.stack([s["is_padding"] for s in samples])
 
-    # Compute attention masks from the index tensors
-    col_mask, feat_mask, neighbor_mask = Batch.compute_attention_masks(
+    # Compute dense boolean attention masks from the index tensors
+    col_mask, feat_mask, neighbor_mask, full_mask = Batch.compute_attention_masks(
         node_indices=node_indices,
         table_name_indices=table_name_indices,
         column_name_indices=column_name_indices,
@@ -278,7 +291,8 @@ def collate_samples(samples: list[DummySample]) -> Batch:
         masks=torch.stack([s["masks"] for s in samples]),
         is_task_node=torch.stack([s["is_task_nodes"] for s in samples]),
         is_padding=is_padding,
-        column_attn_mask=col_mask,
-        feature_attn_mask=feat_mask,
-        neighbor_attn_mask=neighbor_mask,
+        column_attn_mask=col_mask.contiguous(),
+        feature_attn_mask=feat_mask.contiguous(),
+        neighbor_attn_mask=neighbor_mask.contiguous(),
+        full_attn_mask=full_mask.contiguous(),
     )

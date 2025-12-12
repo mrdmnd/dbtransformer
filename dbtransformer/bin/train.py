@@ -122,7 +122,7 @@ class Trainer:
         # Use pre-batched dataset (no collation needed = much faster!)
         # Alternative - use DummySampleDataset which returns individual samples for batching.
         # That needs the collate_samples function, which seems slow.
-        self.dataset = PreBatchedDummyDataset(config.data, config.model)
+        self.dataset = PreBatchedDummyDataset(config.data, config.model, config.training)
         self.sampler: DistributedSampler[int] = DistributedSampler(
             self.dataset,
             num_replicas=self.ddp_parameters.world_size,
@@ -401,7 +401,7 @@ class Trainer:
 
         elapsed = time.time() - start_time
         batches_trained = self.config.training.max_batches - self.batches_run
-        samples_per_sec = (batches_trained * self.config.model.batch_size * self.ddp_parameters.world_size) / elapsed
+        samples_per_sec = (batches_trained * self.config.training.batch_size * self.ddp_parameters.world_size) / elapsed
         if self.is_leader:
             logger.info(f"Global throughput: {samples_per_sec:.1f} samples/sec")
 
@@ -468,8 +468,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=0,
-        help="DataLoader workers (0=sync, 1+=async, default: 0)",
+        default=4,
+        help="DataLoader workers (0=sync, 1+=async, default: 4)",
     )
     # Profiling arguments
     parser.add_argument(
@@ -486,25 +486,24 @@ if __name__ == "__main__":
         help="Output dir for torch profiler (default: ./profiler_logs)",
     )
 
-    # Attention mode argument
-    parser.add_argument(
-        "--attention-mode",
-        type=str,
-        choices=["flex", "flash"],
-        default="flex",
-        help=(
-            "Attention implementation: 'flex' uses FlexAttention with sparse "
-            "BlockMasks (default), 'flash' uses SDPA/FlashAttention with "
-            "dense bool masks. Both respect relational structure."
-        ),
-    )
-
-    # Batch size argument
+    # Training arguments
     parser.add_argument(
         "--batch-size",
         type=int,
         default=32,
         help="Batch size per GPU (default: 32). Try larger values like 64, 128 for better GPU utilization.",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=1024,
+        help="Sequence length (default: 1024).",
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=300,
+        help="Maximum number of batches to train for (default: 300).",
     )
 
     args = parser.parse_args()
@@ -516,14 +515,15 @@ if __name__ == "__main__":
     if args.profile_output is not None:
         profile_config.profile_output = args.profile_output
 
-    model_config = ModelConfig(
-        attention_mode=args.attention_mode,
-        batch_size=args.batch_size,
-    )
+    training_config = TrainingConfig()
+    training_config.batch_size = args.batch_size
+    training_config.seq_len = args.seq_len
+    training_config.max_batches = args.max_batches
+    training_config.num_workers = args.num_workers
 
     overall_config = OverallConfig(
-        model=model_config,
-        training=TrainingConfig(),
+        model=ModelConfig(),
+        training=training_config,
         data=DummyDataConfig(),
         profiling=profile_config,
         wandb=wandb_config,
