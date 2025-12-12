@@ -83,9 +83,7 @@ class FlexAttentionBlock(nn.Module):
 
         # mypy doesn't know that flex_attention returns a Tensor, but it always
         # does unless return_lse=True, which we don't use.
-        attn_out: Float[Tensor, "b h s d"] = flex_attention(  # type: ignore
-            q, k, v, block_mask=mask
-        )
+        attn_out: Float[Tensor, "b h s d"] = flex_attention(q, k, v, block_mask=mask)  # type: ignore
         out: Float[Tensor, "b s d"] = rearrange(attn_out, "b h s d -> b s (h d)")
         return self.wo(out)
 
@@ -157,7 +155,7 @@ class FFN(nn.Module):
 
 
 # Implements the "Relational Transformer Block" from the paper.
-# Supports both FlexAttention (sparse BlockMasks) and SDPA (dense masks).
+# Supports both FlexAttention (sparse BlockMasks) and FlashAttention SDPA (dense masks).
 @jaxtyped(typechecker=None)
 class RelationalBlock(nn.Module):
     def __init__(
@@ -235,57 +233,49 @@ class Batch:
     # Numeric cell values, z-score normalized per column: (val - mean) / std.
     # NaN values are skipped during preprocessing. Val/test splits use
     # statistics computed from the training set for consistency.
+    # When the cell at the position is not a number, the value is 0.0
     number_values: Float[Tensor, "b s 1"]
 
     # Datetime cell values (converted to seconds since epoch), z-score normalized
     # using *global* statistics computed across ALL datetime columns in the entire
     # database, not per-column. This allows cross-table temporal reasoning.
+    # When the cell at the position is not a datetime, the value is 0.0
     datetime_values: Float[Tensor, "b s 1"]
 
     # Boolean cell values, converted to 0.0/1.0 then z-score normalized
     # per column (same as number_values). Not raw 0/1!
+    # When the cell at the position is not a boolean, the value is 0.0
     boolean_values: Float[Tensor, "b s 1"]
 
     # Pre-computed text embeddings from some SentenceTransformer (MiniLM).
     # During preprocessing, all unique strings are embedded and stored;
     # at runtime these could looked up by index from a memory-mapped file.
+    # When the cell at the position is not a text, the value vector is all zeros.
     text_values: Float[Tensor, "b s d_text"]
 
     # Pre-computed embeddings for column names, formatted as
     # "<column_name> of <table_name>" (e.g., "price of products").
     # TODO(mrdmnd): expand to include column descriptions!
     # Added to every cell's representation as positional context.
+    # This is always present, because every cell comes from a column.
     column_name_values: Float[Tensor, "b s d_text"]
 
-    # Semantic type determining which encoder/decoder head to use:
+    # Semantic type determining which type is present at each position.
     # 0=number, 1=text, 2=datetime, 3=boolean (see SemanticType enum).
     semantic_types: Int[Tensor, "b s"]
 
     # Positions to HIDE from the model (replaced with learned mask embedding)
-    # and compute loss on. This is the MLM-style training signal.
     # In current impl, set identically to is_targets (only mask the target).
     masks: Bool[Tensor, "b s"]
-
-    # Positions that are actual prediction targets for evaluation metrics.
-    # NOT used by the model internally - only used in the training loop to
-    # extract predictions (yhat[is_targets]) for computing AUC/R² scores.
-    # Separated from `masks` to support pretraining with additional random
-    # masking while still tracking the true task targets.
-    is_targets: Bool[Tensor, "b s"]
 
     # Whether this cell belongs to a task table row (train/val/test split)
     # vs a regular database table row. Task tables contain the prediction
     # targets; DB tables provide relational context.
-    is_task_nodes: Bool[Tensor, "b s"]
+    is_task_node: Bool[Tensor, "b s"]
 
     # Whether this position is padding (sequence shorter than seq_len).
     # Padding positions are excluded from all attention masks and losses.
     is_padding: Bool[Tensor, "b s"]
-
-    # Actual number of valid samples in this batch (not padded duplicates).
-    # The last batch may have fewer samples; positions >= true_batch_size
-    # are duplicates that should be ignored during evaluation.
-    true_batch_size: int
 
     # Precomputed attention masks (computed by DataLoader workers on CPU).
     # These avoid expensive 4D tensor expansions in the forward pass.
@@ -303,11 +293,8 @@ class Batch:
         pinned_fields = {}
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
-            if isinstance(value, torch.Tensor):
-                pinned_fields[field.name] = value.pin_memory()
-            else:
-                pinned_fields[field.name] = value
-        return Batch(**pinned_fields)  # type: ignore[arg-type]
+            pinned_fields[field.name] = value.pin_memory()
+        return Batch(**pinned_fields)
 
     def to_device(
         self,
@@ -352,7 +339,7 @@ class Batch:
         Returns (column_mask, feature_mask, neighbor_mask).
         full_mask is trivially derived from is_padding in forward pass.
 
-        Call this in your DataLoader's collate_fn or dataset __getitem__
+        Call this in the DataLoader's collate_fn or dataset __getitem__
         to offload mask computation to CPU workers.
         """
         # Active mask: both positions must be non-padding
@@ -450,7 +437,6 @@ class RelationalTransformer(nn.Module):
         boolean_values: Float[Tensor, "b s 1"] = batch.boolean_values
         column_name_values: Float[Tensor, "b s d_text"] = batch.column_name_values
         masks: Bool[Tensor, "b s"] = batch.masks
-
         is_padding: Bool[Tensor, "b s"] = batch.is_padding
 
         # Semantics types: [0, 1, 2, 3] -> [number, text, datetime, boolean]
@@ -480,7 +466,6 @@ class RelationalTransformer(nn.Module):
             )
 
             mask_embedded: Float[Tensor, "b s d"] = self.mask_embeddings[semantic_type]
-
             visible = (~masks & ~is_padding)[..., None]
             hidden = (masks & ~is_padding)[..., None]
 
@@ -493,7 +478,6 @@ class RelationalTransformer(nn.Module):
         #  ATTENTION MASKS
         # =======================================================
         # Relational masks are precomputed by DataLoader workers on CPU.
-        # full_mask is trivially derived from is_padding (cheap broadcast).
         column_mask = batch.column_attn_mask
         feature_mask = batch.feature_attn_mask
         neighbor_mask = batch.neighbor_attn_mask

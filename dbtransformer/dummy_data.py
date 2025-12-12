@@ -119,8 +119,9 @@ def create_dummy_batch(batch_size: int, seq_len: int, d_text: int) -> Batch:
     # Node indices: groups of cells belong to the same row
     cells_per_row = 10
     num_rows = (seq_len + cells_per_row - 1) // cells_per_row
-    node_indices = torch.arange(num_rows).repeat_interleave(cells_per_row)[:seq_len]
-    node_indices = node_indices.unsqueeze(0).expand(batch_size, -1).to(torch.int32)
+    node_indices = torch.arange(num_rows).repeat_interleave(cells_per_row)
+    node_indices = node_indices[:seq_len].unsqueeze(0).expand(batch_size, -1)
+    node_indices = node_indices.to(torch.int32)
 
     # Table and column indices
     num_tables = 5
@@ -150,20 +151,22 @@ def create_dummy_batch(batch_size: int, seq_len: int, d_text: int) -> Batch:
     masks[:, 0] = True
     masks[:, 0] &= semantic_types[:, 0] != SemanticType.TEXT.value
 
-    is_targets = masks.clone()
-
     # Task nodes: first ~10% of rows
     task_row_threshold = num_rows // 10
-    is_task_nodes = node_indices < task_row_threshold
+    is_task_node = node_indices < task_row_threshold
 
     is_padding = torch.zeros(batch_size, seq_len, dtype=torch.bool)
-    class_indices = torch.full((batch_size, seq_len), -1, dtype=torch.int32)
+
+    # Compute the attention masks from the index tensors
+    col_mask, feat_mask, neighbor_mask = Batch.compute_attention_masks(
+        node_indices=node_indices,
+        table_name_indices=table_indices,
+        column_name_indices=column_indices,
+        f2p_neighbor_indices=f2p,
+        is_padding=is_padding,
+    )
 
     return Batch(
-        node_indices=node_indices.contiguous(),
-        table_name_indices=table_indices.contiguous(),
-        column_name_indices=column_indices.contiguous(),
-        f2p_neighbor_indices=f2p.contiguous(),
         number_values=number_vals.contiguous(),
         datetime_values=datetime_vals.contiguous(),
         boolean_values=boolean_vals.contiguous(),
@@ -171,11 +174,11 @@ def create_dummy_batch(batch_size: int, seq_len: int, d_text: int) -> Batch:
         column_name_values=column_name_vals.contiguous(),
         semantic_types=semantic_types.contiguous(),
         masks=masks.contiguous(),
-        is_targets=is_targets.contiguous(),
-        is_task_nodes=is_task_nodes.contiguous(),
+        is_task_node=is_task_node.contiguous(),
         is_padding=is_padding.contiguous(),
-        class_value_indices=class_indices.contiguous(),
-        true_batch_size=batch_size,
+        column_attn_mask=col_mask.contiguous(),
+        feature_attn_mask=feat_mask.contiguous(),
+        neighbor_attn_mask=neighbor_mask.contiguous(),
     )
 
 
@@ -249,13 +252,23 @@ def collate_samples(samples: list[DummySample]) -> Batch:
 
     NOTE: This is slow! Consider using PreBatchedDummyDataset instead.
     """
-    batch_size = len(samples)
+    # Stack all tensors from samples
+    node_indices = torch.stack([s["node_indices"] for s in samples])
+    table_name_indices = torch.stack([s["table_name_indices"] for s in samples])
+    column_name_indices = torch.stack([s["column_name_indices"] for s in samples])
+    f2p_neighbor_indices = torch.stack([s["f2p_neighbor_indices"] for s in samples])
+    is_padding = torch.stack([s["is_padding"] for s in samples])
+
+    # Compute attention masks from the index tensors
+    col_mask, feat_mask, neighbor_mask = Batch.compute_attention_masks(
+        node_indices=node_indices,
+        table_name_indices=table_name_indices,
+        column_name_indices=column_name_indices,
+        f2p_neighbor_indices=f2p_neighbor_indices,
+        is_padding=is_padding,
+    )
 
     return Batch(
-        node_indices=torch.stack([s["node_indices"] for s in samples]),
-        table_name_indices=torch.stack([s["table_name_indices"] for s in samples]),
-        column_name_indices=torch.stack([s["column_name_indices"] for s in samples]),
-        f2p_neighbor_indices=torch.stack([s["f2p_neighbor_indices"] for s in samples]),
         number_values=torch.stack([s["number_values"] for s in samples]),
         datetime_values=torch.stack([s["datetime_values"] for s in samples]),
         boolean_values=torch.stack([s["boolean_values"] for s in samples]),
@@ -263,9 +276,9 @@ def collate_samples(samples: list[DummySample]) -> Batch:
         column_name_values=torch.stack([s["column_name_values"] for s in samples]),
         semantic_types=torch.stack([s["semantic_types"] for s in samples]),
         masks=torch.stack([s["masks"] for s in samples]),
-        is_targets=torch.stack([s["is_targets"] for s in samples]),
-        is_task_nodes=torch.stack([s["is_task_nodes"] for s in samples]),
-        is_padding=torch.stack([s["is_padding"] for s in samples]),
-        class_value_indices=torch.stack([s["class_value_indices"] for s in samples]),
-        true_batch_size=batch_size,
+        is_task_node=torch.stack([s["is_task_nodes"] for s in samples]),
+        is_padding=is_padding,
+        column_attn_mask=col_mask,
+        feature_attn_mask=feat_mask,
+        neighbor_attn_mask=neighbor_mask,
     )

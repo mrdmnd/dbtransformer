@@ -25,7 +25,15 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 import wandb
-from dbtransformer.configurations import DDPParameters, DummyDataConfig, ModelConfig, OverallConfig, ProfilingConfig, TrainingConfig, WandbConfig
+from dbtransformer.configurations import (
+    DDPParameters,
+    DummyDataConfig,
+    ModelConfig,
+    OverallConfig,
+    ProfilingConfig,
+    TrainingConfig,
+    WandbConfig,
+)
 from dbtransformer.dummy_data import PreBatchedDummyDataset
 from dbtransformer.model import (
     Batch,
