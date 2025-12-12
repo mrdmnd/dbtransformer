@@ -1,0 +1,48 @@
+[package]
+name = "batcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Candle ML framework - using git for CUDA 13.0 support
+candle-core = { git = "https://github.com/huggingface/candle.git", features = ["cuda"] }
+candle-nn = { git = "https://github.com/huggingface/candle.git", features = ["cuda"] }
+candle-transformers = { git = "https://github.com/huggingface/candle.git", features = ["cuda"] }
+
+chrono = "0.4"
+clap = { version = "4.5.53", features = ["derive"] }
+crossbeam-channel = "0.5"
+glob = "0.3.3"
+half = { version = "2.7.1", features = ["rkyv"] }
+hf-hub = "0.4"
+indicatif = "0.18.3"
+itertools = "0.14.0"
+memmap2 = "0.9.9"
+numpy = { version = "0.27.1", features = ["half"] }
+parking_lot = "0.12"
+parquet = "57.1.0"
+polars = { version = "0.51", features = ["lazy", "parquet"] }
+pyo3 = { version = "0.27.2", features = ["abi3-py313"] }
+rand = "0.9.2"
+rayon = "1.10"
+rkyv = "0.8.12"
+safetensors = "0.5"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0"
+tokenizers = "0.21"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wide = "0.7"  # Portable SIMD
+
+[features]
+default = ["cuda"]
+cuda = []
+
+[lib]
+name = "batcher"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "preprocessor"
+path = "src/preprocessor.rs"
