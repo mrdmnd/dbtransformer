@@ -228,33 +228,10 @@ def _generate_block_mask(
 # The sequence is a flattened list of cells from multiple rows (nodes) sampled
 # via BFS traversal of the relational graph starting from a seed row in a task
 # table.
+# We will do some "pre-work" in the data loader to compute some specific sparse
+# attention masks so that we don't have to do it in the forward pass.
 @dataclass
 class Batch:
-    # Row index for each cell. Multiple cells share the same node_index when
-    # they belong to the same row. Used to compute attention masks:
-    # - "same_node" for feature attention (cells in the same row attend)
-    # - "kv_in_f2p" / "q_in_p2f" for neighbor attention (parent/child rows)
-    node_indices: Int[Tensor, "b s"]
-
-    # Unique integer ID for this cell's table. Used with column_name_indices
-    # for equality comparison to compute the "same column AND same table"
-    # attention mask for column attention. Not used for embedding lookup.
-    table_name_indices: Int[Tensor, "b s"]
-
-    # Unique integer ID for this cell's column (globally unique across all
-    # tables). Used with table_name_indices for equality comparison to
-    # compute column attention mask. Not used for embedding lookup -
-    # the actual column name embeddings come via column_name_values.
-    column_name_indices: Int[Tensor, "b s"]
-
-    # Foreign-to-primary (parent) neighbor indices for each cell's row.
-    # If a row has a foreign key referencing another row, that parent row's
-    # index appears here. Padded with -1 for unused slots.
-    # Used for feature attention (attend to parent rows) and neighbor
-    # attention (attend to child rows via the reverse relationship).
-    # Shape: (b, s, max_f2p) where max_f2p is dynamic per batch.
-    f2p_neighbor_indices: Int[Tensor, "b s max_f2p"]
-
     # Numeric cell values, z-score normalized per column: (val - mean) / std.
     # NaN values are skipped during preprocessing. Val/test splits use
     # statistics computed from the training set for consistency.
@@ -305,16 +282,17 @@ class Batch:
     # Padding positions are excluded from all attention masks and losses.
     is_padding: Bool[Tensor, "b s"]
 
-    # For categorical/string cell values, an integer ID for the string.
-    # Set to -1 for non-categorical types. Currently unused in the model
-    # but could enable a categorical prediction head in the future
-    # (predict which category from a vocabulary).
-    class_value_indices: Int[Tensor, "b s"]
-
     # Actual number of valid samples in this batch (not padded duplicates).
     # The last batch may have fewer samples; positions >= true_batch_size
     # are duplicates that should be ignored during evaluation.
     true_batch_size: int
+
+    # Precomputed attention masks (computed by DataLoader workers on CPU).
+    # These avoid expensive 4D tensor expansions in the forward pass.
+    # Note: full_attn_mask is derived from is_padding in forward pass (cheap).
+    column_attn_mask: Bool[Tensor, "b s s"]
+    feature_attn_mask: Bool[Tensor, "b s s"]
+    neighbor_attn_mask: Bool[Tensor, "b s s"]
 
     def pin_memory(self) -> "Batch":
         """Pin all tensors to enable fast async CPU->GPU transfer.
@@ -356,6 +334,53 @@ class Batch:
                         field.name,
                         value.to(device, non_blocking=True),
                     )
+
+    @staticmethod
+    def compute_attention_masks(
+        node_indices: Int[Tensor, "b s"],
+        table_name_indices: Int[Tensor, "b s"],
+        column_name_indices: Int[Tensor, "b s"],
+        f2p_neighbor_indices: Int[Tensor, "b s max_f2p"],
+        is_padding: Bool[Tensor, "b s"],
+    ) -> tuple[
+        Bool[Tensor, "b s s"],
+        Bool[Tensor, "b s s"],
+        Bool[Tensor, "b s s"],
+    ]:
+        """Compute the 3 relational attention masks from index tensors.
+
+        Returns (column_mask, feature_mask, neighbor_mask).
+        full_mask is trivially derived from is_padding in forward pass.
+
+        Call this in your DataLoader's collate_fn or dataset __getitem__
+        to offload mask computation to CPU workers.
+        """
+        # Active mask: both positions must be non-padding
+        active: Bool[Tensor, "b s s"] = ~is_padding[:, :, None] & ~is_padding[:, None, :]
+
+        # Same node (row) - for feature attention
+        same_node: Bool[Tensor, "b s s"] = node_indices[:, :, None] == node_indices[:, None, :]
+
+        # KV is in Q's foreign-to-primary (parent) neighborhood
+        # (b, s, s, max_f2p) -> (b, s, s)
+        kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
+
+        # Q is in KV's primary-to-foreign (child) neighborhood
+        # (b, s, s, max_f2p) -> (b, s, s)
+        q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(dim=-1)
+
+        # Same column AND same table
+        same_column = column_name_indices[:, :, None] == column_name_indices[:, None, :]
+        same_table = table_name_indices[:, :, None] == table_name_indices[:, None, :]
+        same_col_table: Bool[Tensor, "b s s"] = same_column & same_table
+
+        # Final masks (full_mask = active, computed in forward pass)
+        column_mask = same_col_table & active
+        feature_mask = (same_node | kv_in_f2p) & active
+        neighbor_mask = q_in_p2f & active
+        # full_mask = active
+
+        return column_mask, feature_mask, neighbor_mask
 
 
 @jaxtyped(typechecker=None)
@@ -418,20 +443,15 @@ class RelationalTransformer(nn.Module):
         self.boolean_decoder = nn.Linear(config.d_model, 1, bias=True)
         self.text_decoder = nn.Linear(config.d_model, config.d_text, bias=True)
 
-    def forward(self, batch: Batch) -> ModelOutput:  # noqa: PLR0915
-        node_indices: Int[Tensor, "b s"] = batch.node_indices
-        f2p_neighbor_indices: Int[Tensor, "b s 5"] = batch.f2p_neighbor_indices
-
-        number_values: Float[Tensor, "b s d"] = batch.number_values
-        text_values: Float[Tensor, "b s d"] = batch.text_values
-        datetime_values: Float[Tensor, "b s d"] = batch.datetime_values
-        boolean_values: Float[Tensor, "b s d"] = batch.boolean_values
-        column_name_values: Float[Tensor, "b s d"] = batch.column_name_values
-
-        column_name_indices: Int[Tensor, "b s"] = batch.column_name_indices
-        table_name_indices: Int[Tensor, "b s"] = batch.table_name_indices
-        is_padding: Bool[Tensor, "b s"] = batch.is_padding
+    def forward(self, batch: Batch) -> ModelOutput:
+        number_values: Float[Tensor, "b s 1"] = batch.number_values
+        text_values: Float[Tensor, "b s d_text"] = batch.text_values
+        datetime_values: Float[Tensor, "b s 1"] = batch.datetime_values
+        boolean_values: Float[Tensor, "b s 1"] = batch.boolean_values
+        column_name_values: Float[Tensor, "b s d_text"] = batch.column_name_values
         masks: Bool[Tensor, "b s"] = batch.masks
+
+        is_padding: Bool[Tensor, "b s"] = batch.is_padding
 
         # Semantics types: [0, 1, 2, 3] -> [number, text, datetime, boolean]
         semantic_type: Int[Tensor, "b s"] = batch.semantic_types
@@ -444,9 +464,9 @@ class RelationalTransformer(nn.Module):
         # if (masks & is_text).any():
         #     raise ValueError("Masked text positions not supported yet.")
 
-        b: int = node_indices.shape[0]  # Batch Size
-        s: int = node_indices.shape[1]  # Sequence Length
-        device = node_indices.device
+        b: int = is_padding.shape[0]  # Batch Size
+        s: int = is_padding.shape[1]  # Sequence Length
+        device = is_padding.device
 
         # =======================================================
         #  INPUT EMBEDDING STEP
@@ -470,35 +490,14 @@ class RelationalTransformer(nn.Module):
             x = x + encoded * visible + mask_embedded * hidden
 
         # =======================================================
-        #  Compute ATTENTION MASKS
+        #  ATTENTION MASKS
         # =======================================================
-        # Both modes compute the same relational masks.
-        # For "flash" mode (SDPA): use dense bool tensors directly
-        # For "flex" mode: convert to sparse BlockMasks for FlexAttention
-        with torch.autograd.profiler.record_function("mask_computation"):
-            # Active mask for attention - both positions must be non-padding
-            active: Bool[Tensor, "b s s"] = ~is_padding[:, :, None] & ~is_padding[:, None, :]
-
-            # Cells in the same node can attend to each other
-            same_node: Bool[Tensor, "b s s"] = node_indices[:, :, None] == node_indices[:, None, :]
-
-            # If KV index is in Q's foreign-to-primary (parent) neighborhood
-            # Shape: (b, s, s, max_f2p) -> (b, s, s) via any()
-            kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
-
-            # If Q index is in KV's primary-to-foreign (child) neighborhood
-            q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(dim=-1)
-
-            # If this is the same column AND same table
-            same_column_and_table: Bool[Tensor, "b s s"] = (column_name_indices[:, :, None] == column_name_indices[:, None, :]) & (
-                table_name_indices[:, :, None] == table_name_indices[:, None, :]
-            )
-
-            # Final attention masks, per-type (dense bool tensors)
-            column_mask: Bool[Tensor, "b s s"] = same_column_and_table & active
-            feature_mask: Bool[Tensor, "b s s"] = (same_node | kv_in_f2p) & active
-            neighbor_mask: Bool[Tensor, "b s s"] = q_in_p2f & active
-            full_mask: Bool[Tensor, "b s s"] = active
+        # Relational masks are precomputed by DataLoader workers on CPU.
+        # full_mask is trivially derived from is_padding (cheap broadcast).
+        column_mask = batch.column_attn_mask
+        feature_mask = batch.feature_attn_mask
+        neighbor_mask = batch.neighbor_attn_mask
+        full_mask: Bool[Tensor, "b s s"] = ~is_padding[:, :, None] & ~is_padding[:, None, :]
 
         # =======================================================
         # Pass input through the blocks!
