@@ -8,12 +8,6 @@ Always run with uv run torchrun:
 """
 
 import os
-
-# Set OpenMP threads before importing numpy/torch to avoid CPU over-subscription
-# in distributed training. Adjust based on: total_cores / num_gpu_processes.
-# This silences the torchrun warning about OMP_NUM_THREADS.
-if "OMP_NUM_THREADS" not in os.environ:
-    os.environ["OMP_NUM_THREADS"] = "8"
 import random
 import time
 from collections.abc import Iterator
