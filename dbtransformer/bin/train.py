@@ -32,7 +32,7 @@ from tqdm import tqdm
 
 import wandb
 from dbtransformer.configurations import DDPParameters, DummyDataConfig, ModelConfig, OverallConfig, ProfilingConfig, TrainingConfig, WandbConfig
-from dbtransformer.dummy_data import DummySampleDataset, collate_samples
+from dbtransformer.dummy_data import PreBatchedDummyDataset
 from dbtransformer.model import (
     Batch,
     ModelOutput,
@@ -117,8 +117,11 @@ class Trainer:
         if self.is_leader:
             logger.info(f"Model: {num_params:,} params (~{num_params / 1e6:.1f}M)")
 
-        self.dataset = DummySampleDataset(config.data, config.model)
-        self.sampler: DistributedSampler = DistributedSampler(
+        # Use pre-batched dataset (no collation needed = much faster!)
+        # Alternative - use DummySampleDataset which returns individual samples for batching.
+        # That needs the collate_samples function, which seems slow.
+        self.dataset = PreBatchedDummyDataset(config.data, config.model)
+        self.sampler: DistributedSampler[int] = DistributedSampler(
             self.dataset,
             num_replicas=self.ddp_parameters.world_size,
             rank=self.ddp_parameters.global_rank,
@@ -127,11 +130,11 @@ class Trainer:
         )
         self.dataloader = DataLoader(
             self.dataset,
-            batch_size=config.model.batch_size,
+            batch_size=None,  # Already batched!
             num_workers=config.training.num_workers,
-            pin_memory=True,
+            pin_memory=True,  # Batch.pin_memory() enables fast async transfer
             sampler=self.sampler,
-            collate_fn=collate_samples,
+            collate_fn=None,  # No collation needed!
             persistent_workers=config.training.num_workers > 0,
             prefetch_factor=2 if config.training.num_workers > 0 else None,
         )

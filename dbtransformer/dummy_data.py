@@ -114,6 +114,103 @@ def create_dummy_sample(seq_len: int, d_text: int) -> DummySample:
     )
 
 
+def create_dummy_batch(batch_size: int, seq_len: int, d_text: int) -> Batch:
+    """Create a full pre-batched Batch directly (no collation needed)."""
+    # Node indices: groups of cells belong to the same row
+    cells_per_row = 10
+    num_rows = (seq_len + cells_per_row - 1) // cells_per_row
+    node_indices = torch.arange(num_rows).repeat_interleave(cells_per_row)[:seq_len]
+    node_indices = node_indices.unsqueeze(0).expand(batch_size, -1).to(torch.int32)
+
+    # Table and column indices
+    num_tables = 5
+    num_cols_per_table = 20
+    table_indices = torch.randint(0, num_tables, (batch_size, seq_len), dtype=torch.int32)
+    column_indices = torch.randint(0, num_tables * num_cols_per_table, (batch_size, seq_len), dtype=torch.int32)
+
+    # Foreign-to-primary neighbor indices
+    f2p = torch.randint(-1, num_rows, (batch_size, seq_len, MAX_F2P_NEIGHBORS), dtype=torch.int32)
+
+    # Numeric values (z-score normalized)
+    number_vals = torch.randn(batch_size, seq_len, 1, dtype=torch.float32)
+    datetime_vals = torch.randn(batch_size, seq_len, 1, dtype=torch.float32)
+    boolean_vals = torch.randn(batch_size, seq_len, 1, dtype=torch.float32)
+
+    # Text embeddings
+    text_vals = torch.randn(batch_size, seq_len, d_text, dtype=torch.float32)
+    column_name_vals = torch.randn(batch_size, seq_len, d_text, dtype=torch.float32)
+
+    # Semantic types: 0=number, 1=text, 2=datetime, 3=boolean
+    semantic_types = torch.randint(0, 4, (batch_size, seq_len), dtype=torch.long)
+
+    # Masks: ~15% of non-text positions
+    masks = torch.rand(batch_size, seq_len) < 0.15  # noqa: PLR2004
+    masks &= semantic_types != SemanticType.TEXT.value
+    # Ensure at least one masked position per sample
+    masks[:, 0] = True
+    masks[:, 0] &= semantic_types[:, 0] != SemanticType.TEXT.value
+
+    is_targets = masks.clone()
+
+    # Task nodes: first ~10% of rows
+    task_row_threshold = num_rows // 10
+    is_task_nodes = node_indices < task_row_threshold
+
+    is_padding = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+    class_indices = torch.full((batch_size, seq_len), -1, dtype=torch.int32)
+
+    return Batch(
+        node_indices=node_indices.contiguous(),
+        table_name_indices=table_indices.contiguous(),
+        column_name_indices=column_indices.contiguous(),
+        f2p_neighbor_indices=f2p.contiguous(),
+        number_values=number_vals.contiguous(),
+        datetime_values=datetime_vals.contiguous(),
+        boolean_values=boolean_vals.contiguous(),
+        text_values=text_vals.contiguous(),
+        column_name_values=column_name_vals.contiguous(),
+        semantic_types=semantic_types.contiguous(),
+        masks=masks.contiguous(),
+        is_targets=is_targets.contiguous(),
+        is_task_nodes=is_task_nodes.contiguous(),
+        is_padding=is_padding.contiguous(),
+        class_value_indices=class_indices.contiguous(),
+        true_batch_size=batch_size,
+    )
+
+
+class PreBatchedDummyDataset(Dataset[Batch]):
+    """
+    Dataset that returns pre-batched Batches directly.
+
+    No collation needed - DataLoader just passes through the Batch objects.
+    This is MUCH faster than collating individual samples.
+    """
+
+    def __init__(
+        self,
+        data_config: DummyDataConfig,
+        model_config: ModelConfig,
+    ) -> None:
+        self.batch_size = model_config.batch_size
+        self.seq_len = model_config.seq_len
+        self.d_text = model_config.d_text
+
+        # Number of batches (not samples!)
+        self.num_batches = data_config.total_num_samples // self.batch_size
+
+        # Pre-generate a pool of batches
+        self._pool_size = min(64, self.num_batches)
+        self._batch_pool: list[Batch] = [create_dummy_batch(self.batch_size, self.seq_len, self.d_text) for _ in range(self._pool_size)]
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+    def __getitem__(self, idx: int) -> Batch:
+        return self._batch_pool[idx % self._pool_size]
+
+
+# Keep old classes for backwards compatibility
 class DummySampleDataset(Dataset[DummySample]):
     """
     Dataset that returns individual dummy samples for DataLoader batching.
@@ -121,6 +218,8 @@ class DummySampleDataset(Dataset[DummySample]):
     Pre-generates a pool of samples at initialization to avoid slow on-the-fly
     random tensor generation during training. Each __getitem__ returns a single
     sample (no batch dimension); the DataLoader handles batching.
+
+    NOTE: Consider using PreBatchedDummyDataset instead for much faster loading.
     """
 
     def __init__(
@@ -133,7 +232,7 @@ class DummySampleDataset(Dataset[DummySample]):
         self.d_text = model_config.d_text
         self.num_samples = data_config.total_num_samples
 
-        # Pre-generate a pool of samples to cycle through (faster than on-fly)
+        # Pre-generate a pool of samples to cycle through
         self._pool_size = min(1000, self.num_samples)
         self._sample_pool: list[DummySample] = [create_dummy_sample(self.seq_len, self.d_text) for _ in range(self._pool_size)]
 
@@ -141,7 +240,6 @@ class DummySampleDataset(Dataset[DummySample]):
         return self.num_samples
 
     def __getitem__(self, idx: int) -> DummySample:
-        # Return from pre-generated pool (cycling through)
         return self._sample_pool[idx % self._pool_size]
 
 
@@ -149,15 +247,7 @@ def collate_samples(samples: list[DummySample]) -> Batch:
     """
     Collate a list of DummySample dicts into a single Batch.
 
-    This is the collate_fn for the DataLoader. It stacks individual samples
-    along a new batch dimension (dim=0).
-
-    Args:
-        samples: List of DummySample dicts, each with tensors of shape
-                 (seq_len, ...).
-
-    Returns:
-        A Batch with tensors of shape (batch_size, seq_len, ...).
+    NOTE: This is slow! Consider using PreBatchedDummyDataset instead.
     """
     batch_size = len(samples)
 

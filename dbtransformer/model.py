@@ -316,6 +316,21 @@ class Batch:
     # are duplicates that should be ignored during evaluation.
     true_batch_size: int
 
+    def pin_memory(self) -> "Batch":
+        """Pin all tensors to enable fast async CPU->GPU transfer.
+
+        Called automatically by DataLoader when pin_memory=True.
+        Returns a new Batch with pinned tensors (required by DataLoader API).
+        """
+        pinned_fields = {}
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if isinstance(value, torch.Tensor):
+                pinned_fields[field.name] = value.pin_memory()
+            else:
+                pinned_fields[field.name] = value
+        return Batch(**pinned_fields)  # type: ignore[arg-type]
+
     def to_device(
         self,
         device: torch.device,
@@ -543,10 +558,7 @@ class RelationalTransformer(nn.Module):
             # we aren't computing loss on text positions, we're not going to get any
             # numerator contribution from the masks and so this is fine as written.
             # Dummy term touches text_decoder params for DDP gradient sync.
-            loss_out: Float[Tensor, ""] = (
-                (combined_loss * masks).sum() / masks.sum()
-                + 0.0 * yhat_text.sum()
-            )
+            loss_out: Float[Tensor, ""] = (combined_loss * masks).sum() / masks.sum() + 0.0 * yhat_text.sum()
 
         return ModelOutput(
             loss=loss_out,
