@@ -165,7 +165,7 @@ def create_dummy_batch(batch_size: int, seq_len: int, d_text: int) -> Batch:
     is_padding = torch.zeros(batch_size, seq_len, dtype=torch.bool)
 
     # Compute dense boolean attention masks from the index tensors
-    col_mask, feat_mask, neighbor_mask, full_mask = Batch.compute_attention_masks(
+    col_mask, feat_mask, neighbor_mask = Batch.compute_attention_masks(
         node_indices=node_indices,
         table_name_indices=table_indices,
         column_name_indices=column_indices,
@@ -186,7 +186,6 @@ def create_dummy_batch(batch_size: int, seq_len: int, d_text: int) -> Batch:
         column_attn_mask=col_mask.contiguous(),
         feature_attn_mask=feat_mask.contiguous(),
         neighbor_attn_mask=neighbor_mask.contiguous(),
-        full_attn_mask=full_mask.contiguous(),
     )
 
 
@@ -273,7 +272,7 @@ def collate_samples(samples: list[DummySample]) -> Batch:
     is_padding = torch.stack([s["is_padding"] for s in samples])
 
     # Compute dense boolean attention masks from the index tensors
-    col_mask, feat_mask, neighbor_mask, full_mask = Batch.compute_attention_masks(
+    col_mask, feat_mask, neighbor_mask = Batch.compute_attention_masks(
         node_indices=node_indices,
         table_name_indices=table_name_indices,
         column_name_indices=column_name_indices,
@@ -294,5 +293,4 @@ def collate_samples(samples: list[DummySample]) -> Batch:
         column_attn_mask=col_mask.contiguous(),
         feature_attn_mask=feat_mask.contiguous(),
         neighbor_attn_mask=neighbor_mask.contiguous(),
-        full_attn_mask=full_mask.contiguous(),
     )

@@ -227,10 +227,10 @@ class Batch:
 
     # Dense boolean attention masks (b, s, s). BlockMasks are created from these
     # in the forward pass to ensure proper torch.compile tracing.
+    # Note: full_attn_mask is computed in the forward pass from is_padding.
     column_attn_mask: Bool[Tensor, "b s s"]
     feature_attn_mask: Bool[Tensor, "b s s"]
     neighbor_attn_mask: Bool[Tensor, "b s s"]
-    full_attn_mask: Bool[Tensor, "b s s"]
 
     def pin_memory(self) -> "Batch":
         """Pin all tensors to enable fast async CPU->GPU transfer.
@@ -282,11 +282,11 @@ class Batch:
         Bool[Tensor, "b s s"],
         Bool[Tensor, "b s s"],
         Bool[Tensor, "b s s"],
-        Bool[Tensor, "b s s"],
     ]:
-        """Compute the 4 relational attention masks from index tensors.
+        """Compute the 3 relational attention masks from index tensors.
 
-        Returns (column_mask, feature_mask, neighbor_mask, full_mask).
+        Returns (column_mask, feature_mask, neighbor_mask).
+        Note: full_attn_mask is just ~is_padding broadcasted, computed in forward pass.
 
         Call this in the DataLoader's collate_fn or dataset __getitem__
         to offload mask computation to CPU workers.
@@ -299,24 +299,27 @@ class Batch:
 
         # KV is in Q's foreign-to-primary (parent) neighborhood
         # (b, s, s, max_f2p) -> (b, s, s)
-        kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
+        kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(
+            dim=-1
+        )
 
         # Q is in KV's primary-to-foreign (child) neighborhood
         # (b, s, s, max_f2p) -> (b, s, s)
-        q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(dim=-1)
+        q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(
+            dim=-1
+        )
 
         # Same column AND same table
         same_column = column_name_indices[:, :, None] == column_name_indices[:, None, :]
         same_table = table_name_indices[:, :, None] == table_name_indices[:, None, :]
         same_col_table: Bool[Tensor, "b s s"] = same_column & same_table
 
-        # Final masks (full_mask = active, computed in forward pass)
+        # Final masks (full_mask computed in forward pass from is_padding)
         column_mask = same_col_table & active
         feature_mask = (same_node | kv_in_f2p) & active
         neighbor_mask = q_in_p2f & active
-        full_mask = active
 
-        return column_mask, feature_mask, neighbor_mask, full_mask
+        return column_mask, feature_mask, neighbor_mask
 
 
 @jaxtyped(typechecker=None)
@@ -357,7 +360,9 @@ class RelationalTransformer(nn.Module):
         self.mask_embeddings = nn.Parameter(torch.randn(4, config.d_model))
 
         # Transformer Blocks
-        self.blocks = nn.ModuleList([RelationalBlock(config.d_model, config.num_heads, config.d_ff) for _ in range(config.num_blocks)])
+        self.blocks = nn.ModuleList([
+            RelationalBlock(config.d_model, config.num_heads, config.d_ff) for _ in range(config.num_blocks)
+        ])
 
         # Output Norm
         self.out_norm = nn.RMSNorm(config.d_model)
@@ -405,7 +410,9 @@ class RelationalTransformer(nn.Module):
 
             # Input to the model starts as the column name embedding, plus the encoded
             # values, plus the embeddings for whatever is masked.
-            x: Float[Tensor, "b s d"] = self.column_name_norm(self.column_name_encoder(column_name_values)) * (~is_padding)[..., None]
+            x: Float[Tensor, "b s d"] = (
+                self.column_name_norm(self.column_name_encoder(column_name_values)) * (~is_padding)[..., None]
+            )
             x = x + encoded * visible + mask_embedded * hidden
 
         # =======================================================
@@ -418,7 +425,9 @@ class RelationalTransformer(nn.Module):
             col_block_mask = generate_block_mask(batch.column_attn_mask, batch_size, seq_len)
             feature_block_mask = generate_block_mask(batch.feature_attn_mask, batch_size, seq_len)
             neighbor_block_mask = generate_block_mask(batch.neighbor_attn_mask, batch_size, seq_len)
-            full_block_mask = generate_block_mask(batch.full_attn_mask, batch_size, seq_len)
+            # full_attn_mask is just the active mask (non-padding positions), computed here
+            full_attn_mask: Bool[Tensor, "b s s"] = ~is_padding[:, :, None] & ~is_padding[:, None, :]
+            full_block_mask = generate_block_mask(full_attn_mask, batch_size, seq_len)
 
         # =======================================================
         # Pass input through the blocks!
@@ -452,13 +461,17 @@ class RelationalTransformer(nn.Module):
         with torch.autograd.profiler.record_function("loss_computation"):
             # Compute per-position losses (before masking)
             loss_number: Float[Tensor, "b s"] = F.huber_loss(yhat_number, number_values, reduction="none").mean(-1)
-            loss_datetime: Float[Tensor, "b s"] = F.huber_loss(yhat_datetime, datetime_values, reduction="none").mean(-1)
+            loss_datetime: Float[Tensor, "b s"] = F.huber_loss(yhat_datetime, datetime_values, reduction="none").mean(
+                -1
+            )
             loss_boolean: Float[Tensor, "b s"] = F.binary_cross_entropy_with_logits(
                 yhat_boolean, (boolean_values > 0).float(), reduction="none"
             ).mean(-1)
 
             # Select the right loss per position based on semantic type
-            combined_loss: Float[Tensor, "b s"] = loss_number * is_number + loss_datetime * is_datetime + loss_boolean * is_boolean
+            combined_loss: Float[Tensor, "b s"] = (
+                loss_number * is_number + loss_datetime * is_datetime + loss_boolean * is_boolean
+            )
 
             # Single masked sum and division
             # By fiat, we've decided that we're not allowed to mask any text, so although
