@@ -299,15 +299,11 @@ class Batch:
 
         # KV is in Q's foreign-to-primary (parent) neighborhood
         # (b, s, s, max_f2p) -> (b, s, s)
-        kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(
-            dim=-1
-        )
+        kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
 
         # Q is in KV's primary-to-foreign (child) neighborhood
         # (b, s, s, max_f2p) -> (b, s, s)
-        q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(
-            dim=-1
-        )
+        q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(dim=-1)
 
         # Same column AND same table
         same_column = column_name_indices[:, :, None] == column_name_indices[:, None, :]
@@ -360,9 +356,7 @@ class RelationalTransformer(nn.Module):
         self.mask_embeddings = nn.Parameter(torch.randn(4, config.d_model))
 
         # Transformer Blocks
-        self.blocks = nn.ModuleList([
-            RelationalBlock(config.d_model, config.num_heads, config.d_ff) for _ in range(config.num_blocks)
-        ])
+        self.blocks = nn.ModuleList([RelationalBlock(config.d_model, config.num_heads, config.d_ff) for _ in range(config.num_blocks)])
 
         # Output Norm
         self.out_norm = nn.RMSNorm(config.d_model)
@@ -410,9 +404,7 @@ class RelationalTransformer(nn.Module):
 
             # Input to the model starts as the column name embedding, plus the encoded
             # values, plus the embeddings for whatever is masked.
-            x: Float[Tensor, "b s d"] = (
-                self.column_name_norm(self.column_name_encoder(column_name_values)) * (~is_padding)[..., None]
-            )
+            x: Float[Tensor, "b s d"] = self.column_name_norm(self.column_name_encoder(column_name_values)) * (~is_padding)[..., None]
             x = x + encoded * visible + mask_embedded * hidden
 
         # =======================================================
@@ -461,17 +453,13 @@ class RelationalTransformer(nn.Module):
         with torch.autograd.profiler.record_function("loss_computation"):
             # Compute per-position losses (before masking)
             loss_number: Float[Tensor, "b s"] = F.huber_loss(yhat_number, number_values, reduction="none").mean(-1)
-            loss_datetime: Float[Tensor, "b s"] = F.huber_loss(yhat_datetime, datetime_values, reduction="none").mean(
-                -1
-            )
+            loss_datetime: Float[Tensor, "b s"] = F.huber_loss(yhat_datetime, datetime_values, reduction="none").mean(-1)
             loss_boolean: Float[Tensor, "b s"] = F.binary_cross_entropy_with_logits(
                 yhat_boolean, (boolean_values > 0).float(), reduction="none"
             ).mean(-1)
 
             # Select the right loss per position based on semantic type
-            combined_loss: Float[Tensor, "b s"] = (
-                loss_number * is_number + loss_datetime * is_datetime + loss_boolean * is_boolean
-            )
+            combined_loss: Float[Tensor, "b s"] = loss_number * is_number + loss_datetime * is_datetime + loss_boolean * is_boolean
 
             # Single masked sum and division
             # By fiat, we've decided that we're not allowed to mask any text, so although

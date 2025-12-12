@@ -212,9 +212,7 @@ class PreBatchedDummyDataset(Dataset[Batch]):
 
         # Pre-generate a pool of batches
         self._pool_size = min(64, self.num_batches)
-        self._batch_pool: list[Batch] = [
-            create_dummy_batch(self.batch_size, self.seq_len, self.d_text) for _ in range(self._pool_size)
-        ]
+        self._batch_pool: list[Batch] = [create_dummy_batch(self.batch_size, self.seq_len, self.d_text) for _ in range(self._pool_size)]
 
     def __len__(self) -> int:
         return self.num_batches
@@ -248,9 +246,7 @@ class DummySampleDataset(Dataset[DummySample]):
 
         # Pre-generate a pool of samples to cycle through
         self._pool_size = min(1000, self.num_samples)
-        self._sample_pool: list[DummySample] = [
-            create_dummy_sample(self.seq_len, self.d_text) for _ in range(self._pool_size)
-        ]
+        self._sample_pool: list[DummySample] = [create_dummy_sample(self.seq_len, self.d_text) for _ in range(self._pool_size)]
 
     def __len__(self) -> int:
         return self.num_samples
