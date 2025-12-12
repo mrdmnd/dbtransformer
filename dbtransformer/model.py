@@ -542,7 +542,11 @@ class RelationalTransformer(nn.Module):
             # By fiat, we've decided that we're not allowed to mask any text, so although
             # we aren't computing loss on text positions, we're not going to get any
             # numerator contribution from the masks and so this is fine as written.
-            loss_out: Float[Tensor, ""] = (combined_loss * masks).sum() / masks.sum()
+            # Dummy term touches text_decoder params for DDP gradient sync.
+            loss_out: Float[Tensor, ""] = (
+                (combined_loss * masks).sum() / masks.sum()
+                + 0.0 * yhat_text.sum()
+            )
 
         return ModelOutput(
             loss=loss_out,

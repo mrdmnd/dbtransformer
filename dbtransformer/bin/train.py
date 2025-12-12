@@ -151,7 +151,10 @@ class Trainer:
         )
         if self.is_leader:
             logger.info("Wrapping model with DDP")
-        self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_parameters.local_rank])
+        self.model = DistributedDataParallel(
+            self.model,
+            device_ids=[self.ddp_parameters.local_rank],
+        )
 
         # Compile model unless profiling (record_function annotations inside
         # the compiled forward pass get eliminated, so we skip compile for
