@@ -74,4 +74,4 @@ uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py
 
 ### get profiler traces to local storage
 
- scp -i ~/.ssh/primeintellect_ed25519 -P 42069 -r root@62.169.159.172:/app/profiler_logs ./profiler_log_dump
+rm -rf profiler_log_dump && scp -i ~/.ssh/primeintellect_ed25519 -P 42069 -r root@62.169.159.172:/app/profiler_logs ./profiler_log_dump

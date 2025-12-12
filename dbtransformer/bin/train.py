@@ -497,6 +497,14 @@ if __name__ == "__main__":
         ),
     )
 
+    # Batch size argument
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size per GPU (default: 32). Try larger values like 64, 128 for better GPU utilization.",
+    )
+
     args = parser.parse_args()
 
     wandb_config = WandbConfig(enabled=not args.no_wandb)
@@ -506,7 +514,10 @@ if __name__ == "__main__":
     if args.profile_output is not None:
         profile_config.profile_output = args.profile_output
 
-    model_config = ModelConfig(attention_mode=args.attention_mode)
+    model_config = ModelConfig(
+        attention_mode=args.attention_mode,
+        batch_size=args.batch_size,
+    )
 
     overall_config = OverallConfig(
         model=model_config,
