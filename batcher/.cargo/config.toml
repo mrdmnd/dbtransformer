@@ -1,2 +1,2 @@
 [env]
-PYO3_PYTHON = "/home/mrdmnd/dbtransformer/.venv/bin/python"
+PYO3_PYTHON = { value = "../.venv/bin/python", relative = true }
