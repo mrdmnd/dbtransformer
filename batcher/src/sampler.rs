@@ -5,13 +5,14 @@
 use crate::types::{
     ColumnIdx, Database, NormalizedCellValue, RawCellValue, RowIdx, SemanticType, TableIdx,
 };
+use fixedbitset::FixedBitSet;
 use half::f16;
 use numpy::PyArray1;
 use pyo3::prelude::*;
 use pyo3::{IntoPyObjectExt, Py, PyAny};
 use rand::prelude::*;
-use rand::seq::index;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::path::Path;
 
 /// Raw pointer wrapper that implements Send+Sync for parallel mutable access.
@@ -68,6 +69,76 @@ impl SequenceIndices {
             column: vec![0; seq_len],
         }
     }
+}
+
+/// Reusable buffers for BFS traversal, avoiding per-sequence allocations.
+/// These are pooled per-thread and reused across sequences.
+struct TraversalBuffers {
+    /// Visited bitset - 8x smaller than Vec<bool>
+    visited: FixedBitSet,
+    /// Foreign-to-primary frontier: (depth, row_idx)
+    f2p_frontier: Vec<(usize, RowIdx)>,
+    /// Primary-to-foreign frontier by depth level
+    p2f_frontier: Vec<Vec<RowIdx>>,
+    /// Temporary buffer for f2p neighbors
+    f2p_neighbors: Vec<RowIdx>,
+    /// Temporary buffer for children
+    children: Vec<RowIdx>,
+}
+
+impl TraversalBuffers {
+    fn new(num_rows: usize) -> Self {
+        Self {
+            visited: FixedBitSet::with_capacity(num_rows),
+            f2p_frontier: Vec::with_capacity(1024),
+            p2f_frontier: Vec::with_capacity(32),
+            f2p_neighbors: Vec::with_capacity(16),
+            children: Vec::with_capacity(256),
+        }
+    }
+
+    /// Reset all buffers for reuse without deallocating.
+    fn reset(&mut self, num_rows: usize) {
+        // Grow visited if needed, then clear
+        if self.visited.len() < num_rows {
+            self.visited.grow(num_rows);
+        }
+        self.visited.clear();
+
+        // Clear vectors but keep capacity
+        self.f2p_frontier.clear();
+        for level in &mut self.p2f_frontier {
+            level.clear();
+        }
+        self.f2p_neighbors.clear();
+        self.children.clear();
+    }
+}
+
+// Thread-local storage for traversal buffers to avoid repeated allocations
+thread_local! {
+    static TRAVERSAL_BUFFERS: RefCell<Option<TraversalBuffers>> = const { RefCell::new(None) };
+}
+
+/// Get or create thread-local traversal buffers, resizing if needed.
+fn get_traversal_buffers(num_rows: usize) -> TraversalBuffers {
+    TRAVERSAL_BUFFERS.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        match opt.take() {
+            Some(mut buffers) => {
+                buffers.reset(num_rows);
+                buffers
+            }
+            None => TraversalBuffers::new(num_rows),
+        }
+    })
+}
+
+/// Return traversal buffers to thread-local storage for reuse.
+fn return_traversal_buffers(buffers: TraversalBuffers) {
+    TRAVERSAL_BUFFERS.with(|cell| {
+        *cell.borrow_mut() = Some(buffers);
+    });
 }
 
 /// Flat vectors for batch data. Python reshapes these to (batch_size, seq_len, ...).
@@ -555,6 +626,7 @@ impl Sampler {
         (0..self.batch_size).into_par_iter().for_each(|i| {
             let j = (start_idx + i) % items_len;
             let item = &self.items[j];
+            let db = &self.databases[item.database_idx];
 
             let seq_offset = i * seq_len;
             let text_offset = i * seq_len * d_text;
@@ -562,6 +634,9 @@ impl Sampler {
 
             // Each thread gets its own index buffers for attention mask computation
             let mut indices = SequenceIndices::new(seq_len);
+
+            // Get thread-local traversal buffers (reused across sequences)
+            let mut trav = get_traversal_buffers(db.num_rows());
 
             unsafe {
                 let slice = SequenceSlice {
@@ -603,8 +678,11 @@ impl Sampler {
                     ),
                 };
 
-                self.fill_sequence(item, slice, &mut indices);
+                self.fill_sequence(item, slice, &mut indices, &mut trav);
             }
+
+            // Return buffers to thread-local pool for reuse
+            return_traversal_buffers(trav);
         });
     }
 
@@ -613,15 +691,16 @@ impl Sampler {
         item: &SamplerItem,
         mut seq: SequenceSlice<'_>,
         idx: &mut SequenceIndices,
+        trav: &mut TraversalBuffers,
     ) {
         let db = &self.databases[item.database_idx];
         let seed_row = db.get_row(item.row_idx);
         let seed_table = db.get_table(seed_row.table_idx);
         let seed_timestamp = self.get_row_timestamp(db, item.row_idx);
 
-        let mut visited = vec![false; db.num_rows()];
-        let mut f2p_frontier: Vec<(usize, RowIdx)> = vec![(0, item.row_idx)];
-        let mut p2f_frontier: Vec<Vec<RowIdx>> = Vec::new();
+        // Use pre-allocated buffers from trav (already reset)
+        trav.f2p_frontier.push((0, item.row_idx));
+
         let mut seq_i = 0;
         let mut rng = StdRng::seed_from_u64(
             self.epoch
@@ -631,44 +710,44 @@ impl Sampler {
 
         loop {
             // Select next node: prioritize f2p (parent) edges
-            let (depth, row_idx) = if let Some(frontier_item) = f2p_frontier.pop() {
+            let (depth, row_idx) = if let Some(frontier_item) = trav.f2p_frontier.pop() {
                 frontier_item
             } else {
                 let mut found = None;
-                for (d, nodes) in p2f_frontier.iter().enumerate() {
+                for (d, nodes) in trav.p2f_frontier.iter().enumerate() {
                     if !nodes.is_empty() {
                         found = Some(d);
                         break;
                     }
                 }
                 if let Some(d) = found {
-                    let r = rng.random_range(0..p2f_frontier[d].len());
-                    let len = p2f_frontier[d].len();
-                    p2f_frontier[d].swap(r, len - 1);
-                    (d, p2f_frontier[d].pop().unwrap())
+                    let r = rng.random_range(0..trav.p2f_frontier[d].len());
+                    let len = trav.p2f_frontier[d].len();
+                    trav.p2f_frontier[d].swap(r, len - 1);
+                    (d, trav.p2f_frontier[d].pop().unwrap())
                 } else {
                     break;
                 }
             };
 
-            if visited[row_idx.0 as usize] {
+            if trav.visited.contains(row_idx.0 as usize) {
                 continue;
             }
-            visited[row_idx.0 as usize] = true;
+            trav.visited.insert(row_idx.0 as usize);
 
             let row = db.get_row(row_idx);
             let table = db.get_table(row.table_idx);
 
             // Collect f2p neighbors (rows this row points TO via FK)
-            let mut f2p_neighbors: Vec<RowIdx> = Vec::new();
+            trav.f2p_neighbors.clear();
             for &edge_idx in &db.edges_from[row_idx.0 as usize] {
                 let edge = &db.fk_edges[edge_idx];
-                f2p_neighbors.push(edge.to_row);
-                f2p_frontier.push((depth + 1, edge.to_row));
+                trav.f2p_neighbors.push(edge.to_row);
+                trav.f2p_frontier.push((depth + 1, edge.to_row));
             }
 
             // Follow reverse edges (p2f: child rows -> this row)
-            let mut children: Vec<RowIdx> = Vec::new();
+            trav.children.clear();
             for &edge_idx in &db.edges_to[row_idx.0 as usize] {
                 let edge = &db.fk_edges[edge_idx];
 
@@ -681,23 +760,29 @@ impl Sampler {
 
                 let child_table = db.get_table(db.get_row(edge.from_row).table_idx);
                 if child_table.idx == seed_table.idx || item.is_task_table {
-                    children.push(edge.from_row);
+                    trav.children.push(edge.from_row);
                 }
             }
 
             // Subsample if too many children
-            let sampled_children = if children.len() > self.max_bfs_width {
-                let idxs = index::sample(&mut rng, children.len(), self.max_bfs_width).into_vec();
-                idxs.into_iter().map(|i| children[i]).collect()
-            } else {
-                children
-            };
+            let num_children = trav.children.len();
+            let sample_count = num_children.min(self.max_bfs_width);
 
-            for child_row in sampled_children {
-                while p2f_frontier.len() <= depth + 1 {
-                    p2f_frontier.push(Vec::new());
+            if num_children > self.max_bfs_width {
+                // Shuffle first sample_count elements using Fisher-Yates partial shuffle
+                for i in 0..sample_count {
+                    let j = rng.random_range(i..num_children);
+                    trav.children.swap(i, j);
                 }
-                p2f_frontier[depth + 1].push(child_row);
+            }
+
+            // Add sampled children to p2f frontier
+            for i in 0..sample_count {
+                let child_row = trav.children[i];
+                while trav.p2f_frontier.len() <= depth + 1 {
+                    trav.p2f_frontier.push(Vec::with_capacity(64));
+                }
+                trav.p2f_frontier[depth + 1].push(child_row);
             }
 
             // Fill cells from this row
@@ -720,7 +805,12 @@ impl Sampler {
                 idx.table[seq_i] = row.table_idx.0 as i32;
                 idx.column[seq_i] = global_col_idx.0 as i32;
 
-                for (j, &neighbor_row) in f2p_neighbors.iter().take(MAX_F2P_NEIGHBORS).enumerate() {
+                for (j, &neighbor_row) in trav
+                    .f2p_neighbors
+                    .iter()
+                    .take(MAX_F2P_NEIGHBORS)
+                    .enumerate()
+                {
                     idx.f2p_neighbors[seq_i * MAX_F2P_NEIGHBORS + j] = neighbor_row.0 as i32;
                 }
 
@@ -1039,7 +1129,7 @@ mod tests {
         let batch_size = 32;
         let seq_len = 1024;
         let d_text = 768;
-        let num_batches = 100;
+        let num_batches = 2000;
 
         let sampler = create_test_sampler(
             vec![(db_path.to_string(), 7, 51, vec![])],
@@ -1082,7 +1172,7 @@ mod tests {
 
         // Single trajectory: batch_size = 1
         let batch_size = 1;
-        let seq_len = 256; // Smaller seq_len for readability
+        let seq_len = 128; // Smaller seq_len for readability
         let d_text = 768;
 
         let sampler = create_test_sampler(

@@ -45,6 +45,25 @@ pub enum SemanticType {
 }
 
 // ============================================================================
+// Table Type (for distinguishing DB tables from task tables)
+// ============================================================================
+
+/// Type of table - distinguishes regular database tables from task tables
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug, Hash, PartialEq, Eq))]
+pub enum TableType {
+    /// Regular database table (the core relational data)
+    #[default]
+    Db,
+    /// Task table - training split
+    Train,
+    /// Task table - validation split
+    Val,
+    /// Task table - test split
+    Test,
+}
+
+// ============================================================================
 // Cell Values
 // ============================================================================
 
@@ -118,6 +137,8 @@ pub struct Table {
     pub name: String,
     /// Global table index
     pub idx: TableIdx,
+    /// Type of table (Db, Train, Val, Test)
+    pub table_type: TableType,
     /// Range of column indices for this table [start, end)
     pub column_range: (ColumnIdx, ColumnIdx),
     /// Range of row indices for this table [start, end)
@@ -151,6 +172,8 @@ pub struct Row {
     pub idx: RowIdx,
     /// Which table this row belongs to
     pub table_idx: TableIdx,
+    /// True if this row belongs to a task table (Train/Val/Test), false for Db tables
+    pub is_task_row: bool,
     /// Raw cell values (for temporal filtering, FK lookups, debugging)
     pub raw: Vec<RawCellValue>,
     /// Normalized cell values (for ML consumption, populated by Database::normalize())

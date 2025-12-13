@@ -99,5 +99,6 @@ data/
 wandb/
 snapshot.pt
 profiler_logs/
+batcher/sample_data_f1/
 
 .DS_Store

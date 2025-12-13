@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use batcher::{
     Column, ColumnIdx, Database, Embedder, EmbedderConfig, ForeignKeyEdge, RawCellValue, Row,
-    RowIdx, SemanticType, Table, TableIdx, TextIdx,
+    RowIdx, SemanticType, Table, TableIdx, TableType, TextIdx,
 };
 use clap::Parser;
 use half::f16;
@@ -24,6 +24,7 @@ use tracing_subscriber::FmtSubscriber;
 /// Intermediate structure for parsing parquet metadata
 struct ParquetTableMeta {
     name: String,
+    table_type: TableType,
     primary_key: Option<String>,
     foreign_keys: HashMap<String, String>, // col_name -> target_table_name
     time_column: Option<String>,
@@ -124,7 +125,11 @@ impl<'a> EmbeddingContext<'a> {
 }
 
 /// Parse parquet file metadata to extract relational info
-fn parse_parquet_metadata(parquet_file: &PathBuf) -> ParquetTableMeta {
+fn parse_parquet_metadata(
+    parquet_file: &PathBuf,
+    table_name: String,
+    table_type: TableType,
+) -> ParquetTableMeta {
     let file = File::open(parquet_file).expect("Failed to open parquet file");
     let reader = SerializedFileReader::new(file).expect("Failed to create parquet reader");
     let metadata = reader.metadata();
@@ -159,19 +164,77 @@ fn parse_parquet_metadata(parquet_file: &PathBuf) -> ParquetTableMeta {
         }
     }
 
-    let name = parquet_file
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_string();
-
     ParquetTableMeta {
-        name,
+        name: table_name,
+        table_type,
         primary_key,
         foreign_keys,
         time_column,
     }
+}
+
+/// Collect parquet files and metadata from a dataset directory.
+/// Expects structure:
+///   <data_dir>/db/*.parquet - core database tables
+///   <data_dir>/tasks/<task-name>/{train,val,test}.parquet - task tables (optional)
+/// Returns (parquet_path, table_name, table_type) for each table.
+fn collect_parquet_sources(data_dir: &PathBuf) -> Vec<(PathBuf, String, TableType)> {
+    let mut sources = Vec::new();
+
+    // Collect DB tables from data_dir/db/
+    let db_dir = data_dir.join("db");
+    let mut db_files: Vec<_> = glob::glob(db_dir.join("*.parquet").to_str().unwrap())
+        .unwrap()
+        .filter_map(|p| p.ok())
+        .collect();
+    db_files.sort();
+
+    for parquet_file in db_files {
+        let name = parquet_file
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        sources.push((parquet_file, name, TableType::Db));
+    }
+
+    // Collect task tables from data_dir/tasks/ if it exists
+    let tasks_dir = data_dir.join("tasks");
+    if tasks_dir.exists() && tasks_dir.is_dir() {
+        // Find all task subdirectories
+        let mut task_dirs: Vec<_> = std::fs::read_dir(&tasks_dir)
+            .expect("Failed to read tasks directory")
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.file_type().ok()?.is_dir() {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        task_dirs.sort();
+
+        for task_dir in task_dirs {
+            let task_name = task_dir.file_name().unwrap().to_str().unwrap().to_string();
+
+            // Look for train.parquet, val.parquet, test.parquet
+            for (split_name, table_type) in [
+                ("train", TableType::Train),
+                ("val", TableType::Val),
+                ("test", TableType::Test),
+            ] {
+                let split_path = task_dir.join(format!("{}.parquet", split_name));
+                if split_path.exists() {
+                    // Use task_name as the table name (like relational-transformer)
+                    sources.push((split_path, task_name.clone(), table_type));
+                }
+            }
+        }
+    }
+
+    sources
 }
 
 /// Load all parquet files and build the unified Database.
@@ -180,21 +243,28 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
     let mut db = Database::new();
     let mut embed_ctx = EmbeddingContext::new(embedder);
 
-    // Collect and sort parquet files for consistent ordering
-    let mut parquet_files: Vec<_> = glob::glob(data_dir.join("*.parquet").to_str().unwrap())
-        .unwrap()
-        .filter_map(|p| p.ok())
-        .collect();
-    parquet_files.sort();
+    // Collect all parquet sources (db tables + task tables)
+    let parquet_sources = collect_parquet_sources(data_dir);
 
     // First pass: parse metadata and build table/column schema
     let mut table_metas: Vec<ParquetTableMeta> = Vec::new();
     let mut dataframes: Vec<DataFrame> = Vec::new();
-    let mut table_name_to_idx: HashMap<String, TableIdx> = HashMap::new();
+    // Map from (table_name, table_type) to TableIdx for FK resolution
+    let mut table_key_to_idx: HashMap<(String, TableType), TableIdx> = HashMap::new();
+    // Also keep a name-only map for FK lookups (FKs point to Db tables by name)
+    let mut db_table_name_to_idx: HashMap<String, TableIdx> = HashMap::new();
 
-    for (table_idx, parquet_file) in parquet_files.iter().enumerate() {
-        let meta = parse_parquet_metadata(parquet_file);
-        table_name_to_idx.insert(meta.name.clone(), TableIdx(table_idx as u32));
+    for (table_idx, (parquet_file, table_name, table_type)) in parquet_sources.iter().enumerate() {
+        let meta = parse_parquet_metadata(parquet_file, table_name.clone(), *table_type);
+        table_key_to_idx.insert(
+            (table_name.clone(), *table_type),
+            TableIdx(table_idx as u32),
+        );
+
+        // For Db tables, also add to the name-only lookup (for FK resolution)
+        if *table_type == TableType::Db {
+            db_table_name_to_idx.insert(table_name.clone(), TableIdx(table_idx as u32));
+        }
 
         // Load the dataframe
         let file = File::open(parquet_file).expect("Failed to open parquet file");
@@ -207,8 +277,16 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
     }
 
     info!(
-        "Loaded {} parquet files, building schema...",
-        parquet_files.len()
+        "Loaded {} parquet files ({} db tables, {} task table splits), building schema...",
+        parquet_sources.len(),
+        parquet_sources
+            .iter()
+            .filter(|(_, _, t)| *t == TableType::Db)
+            .count(),
+        parquet_sources
+            .iter()
+            .filter(|(_, _, t)| *t != TableType::Db)
+            .count(),
     );
 
     // Second pass: build tables and columns, embed column descriptions
@@ -246,11 +324,11 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
                 time_col = Some(col_idx);
             }
 
-            // Check if this is a FK
+            // Check if this is a FK - FKs always point to Db tables
             let fk_target = meta
                 .foreign_keys
                 .get(col_name.as_str())
-                .and_then(|target_table| table_name_to_idx.get(target_table).copied());
+                .and_then(|target_table| db_table_name_to_idx.get(target_table).copied());
 
             let column = Column {
                 name: col_name.to_string(),
@@ -278,6 +356,7 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
         let table = Table {
             name: meta.name.clone(),
             idx: table_idx,
+            table_type: meta.table_type,
             column_range: (col_start, col_end),
             row_range: (row_start, row_end),
             primary_key_col: pk_col,
@@ -310,6 +389,8 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
         // Copy values out to avoid borrow issues
         let row_start = db.tables[table_num].row_range.0.0;
         let col_start = db.tables[table_num].column_range.0.0;
+        let table_type = db.tables[table_num].table_type;
+        let is_task_row = table_type != TableType::Db;
 
         for row_num in 0..df.height() {
             let row_idx = RowIdx(row_start + row_num as u32);
@@ -402,6 +483,7 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
             db.rows.push(Row {
                 idx: row_idx,
                 table_idx,
+                is_task_row,
                 raw: raw_cells,
                 normalized: Vec::new(), // Will be populated by db.normalize()
             });
@@ -459,7 +541,10 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
     about = "Preprocess parquet data files and metadata into an in-memory graph representation."
 )]
 struct Args {
-    /// Path to directory containing parquet files and metadata.json file
+    /// Path to dataset directory containing db/ and optionally tasks/ subdirectories.
+    /// Structure:
+    ///   <data-dir>/db/*.parquet          - core database tables
+    ///   <data-dir>/tasks/<task>/{train,val,test}.parquet - task tables (optional)
     #[arg(short, long)]
     data_dir: PathBuf,
 
@@ -488,6 +573,11 @@ fn main() {
 
     // Load database with inline embedding
     info!("Loading database from: {:?}", args.data_dir);
+    info!("  DB tables from: {:?}", args.data_dir.join("db"));
+    let tasks_dir = args.data_dir.join("tasks");
+    if tasks_dir.exists() {
+        info!("  Task tables from: {:?}", tasks_dir);
+    }
     let mut db = load_database(&args.data_dir, &embedder);
 
     // Normalize all cell values (z-score for numbers/booleans/datetimes, TextIdx for text)
@@ -538,11 +628,18 @@ fn main() {
             .time_col
             .map(|c| format!("'{}'", db.column_name(c)))
             .unwrap_or_else(|| "(no time col)".to_string());
+        let type_display = match table.table_type {
+            TableType::Db => "Db",
+            TableType::Train => "Train",
+            TableType::Val => "Val",
+            TableType::Test => "Test",
+        };
 
         info!(
-            "  [{}] {} : {} cols, {} rows, pk_col={}, time_col={}",
+            "  [{}] {} ({}) : {} cols, {} rows, pk_col={}, time_col={}",
             table.idx.0,
             db.table_name(table.idx),
+            type_display,
             table.num_columns(),
             table.num_rows(),
             pk_display,
