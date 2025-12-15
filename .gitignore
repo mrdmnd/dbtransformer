@@ -100,5 +100,6 @@ wandb/
 snapshot.pt
 profiler_logs/
 batcher/sample_data_f1/
+batcher/sample_data_f1.rkyv
 
 .DS_Store
