@@ -18,20 +18,6 @@ class DDPParameters:
     device: torch.device  # The specific device this global_rank points to.
 
 
-# This isn't part of the training system; but it's used for data preprocessing.
-@dataclass
-class EmbedderConfig:
-    embedder_model_dtype: torch.dtype = torch.bfloat16
-    embedder_model_name: str = "Qwen/Qwen3-Embedding-0.6B"
-    compile_embedder: bool = True
-
-    # Input strings longer than this are truncated.
-    max_length: int = 1024
-
-    # MUST MATCH d_text in ModelConfig!
-    mrl_dimension: int = 384
-
-
 ##########################
 # Training Configuration
 ##########################
@@ -53,14 +39,16 @@ class TrainingConfig:
     # Hyperparameters
     learning_rate: float = 1e-3
     weight_decay: float = 0.1
-    max_grad_norm: float = 1.0  # Gradient clipping
+    max_grad_norm: float = 1.0  # Used for gradient clipping
     seq_len: int = 1024
     batch_size: int = 32
 
     # Total requested batches to train for.
     max_batches: int = 300
 
-    # Logging and saving
+    # Evaluation
+    eval_every_n_batches: int = 100
+    max_eval_batches: int = 16
 
     # Log metrics every N batches.
     log_every_n_batches: int = 10
@@ -76,9 +64,13 @@ class TrainingConfig:
 
 
 @dataclass
-class DummyDataConfig:
-    # Our "full dummy dataset" consists of 8192 samples (of sequences of length `seq_len`)
-    total_num_samples: int = 8192
+class SamplerConfig:
+    """
+    Configuration for the Rust sampler-backed dataset.
+    """
+
+    max_bfs_width: int = 256
+    seed: int = 42
 
 
 @dataclass
@@ -101,14 +93,12 @@ class ProfilingConfig:
     # "full" mode profiles everything (data loading, setup, training)
     # "batch" mode profiles only the training batches (default)
     # "full" mode generates huge profiles (O(10 GB) for a single run) because it is capturing EVERYTHING.
-    # Shapes, memory, stack traces, etc.
     # "batch" mode is much smaller (O(100 MB) for a single run) because it only captures
     # timing information for a few training batches.
     profile_output: str = "./profiler_logs"
     profile_mode: Literal["full", "batch", "disabled"] = "disabled"
 
-    # If the profiler is in "batch" mode, we wait for a few batches, warmup for a few,
-    # and then record for `active` batches.
+    # If the profiler is in "batch" mode, we wait a few batches, warmup, then record for `active` batches.
     # Note: this requires the number of executed batches to be at least the sum of these.
     batch_profile_wait_batches: int = 2
     batch_profile_warmup_batches: int = 2
@@ -126,7 +116,7 @@ class OverallConfig:
 
     model: ModelConfig
     training: TrainingConfig
-    data: DummyDataConfig
+    sampler: SamplerConfig
     profiling: ProfilingConfig
     wandb: WandbConfig
     random_seed: int = 42069

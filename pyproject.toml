@@ -99,14 +99,6 @@ ignore = ["TD003", "F722", "PLR0914", "TRY003", "SIM108", "PLR0913", "PLR0917", 
 # "bugbear" checks are not fixable by default
 unfixable = ["B"]
 
-[tool.mypy]
-files = ["dbtransformer", "tests"]
-disable_error_code = ["import-untyped"]
-
-[[tool.mypy.overrides]]
-module = ["relbench", "relbench.*"]
-ignore_missing_imports = true
-
 [tool.pytest.ini_options]
 log_cli = true
 log_cli_level = "INFO"

@@ -46,7 +46,11 @@ In another process you can wandb login and then
 
 <https://wandb.ai/mttrdmnd-massachusetts-institute-of-technology/dbtransformer?nw=nwusermttrdmnd>
 
-Maintenance bits for me to remember:
+
+
+
+
+Maintenance bits for me to remember (others should ignore):
 
 ## Remote
 
@@ -91,29 +95,32 @@ sample_data_f1
 │   ├── races.parquet
 │   ├── results.parquet
 │   └── standings.parquet
-└── tasks
-    ├── driver-dnf
-    │   ├── test.parquet
-    │   ├── train.parquet
-    │   └── val.parquet
-    ├── driver-position
-    │   ├── test.parquet
-    │   ├── train.parquet
-    │   └── val.parquet
-    └── driver-top3
-        ├── test.parquet
-        ├── train.parquet
-        └── val.parquet
 ```
 
 then run
 
 mrdmnd@khadgar:~/dbtransformer/batcher$ cargo run --release --bin preprocessor -- --data-dir=sample_data_f1 --verbose
 
-which will create a sample_data_f1.rkyv file (for the database, plus the task tables) that is basically the graph representation as a zero copy rust struct.
-
 Then, you can sample from it
 
-example:
 
-mrdmnd@khadgar:~/dbtransformer/batcher$ cargo test test_performance --release -- --nocapture 2>&1
+
+## dataset gathering
+
+```
+import pooch
+from loguru import logger
+from relbench.datasets import get_dataset, get_dataset_names
+from relbench.tasks import get_task, get_task_names
+from tqdm import tqdm
+
+if __name__ == "__main__":
+    logger.info("Downloading all RelBench datasets and tasks")
+
+    cache_dir = f"{pooch.os_cache('relbench')}"
+    logger.info(f"Cache: {cache_dir}")
+
+    for dataset_name in tqdm(get_dataset_names(), colour="green"):
+        logger.info(f"Downloading dataset: {dataset_name}")
+        get_dataset(dataset_name, download=True)
+```

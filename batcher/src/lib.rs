@@ -10,8 +10,8 @@ pub mod types;
 
 // Re-export commonly used types
 pub use types::{
-    Column, ColumnIdx, Database, ForeignKeyEdge, NormalizedCellValue, RawCellValue, Row, RowIdx,
-    SemanticType, Table, TableIdx, TableType, TextIdx,
+    Column, ColumnIdx, Database, ForeignKeyEdge, NormalizedCellValue, Row, RowIdx, SemanticType,
+    Table, TableIdx, TextIdx,
 };
 
 // Re-export embedder types

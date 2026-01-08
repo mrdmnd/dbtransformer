@@ -2,12 +2,11 @@
 // Performs BFS traversal of the FK graph starting from seed rows,
 // producing flat vectors that get reshaped in Python for the model.
 
-use crate::types::{
-    ColumnIdx, Database, NormalizedCellValue, RawCellValue, RowIdx, SemanticType, TableIdx,
-};
+use crate::types::{ColumnIdx, Database, NormalizedCellValue, RowIdx, SemanticType, TableIdx};
 use fixedbitset::FixedBitSet;
 use half::f16;
 use numpy::PyArray1;
+use pyo3::exceptions::{PyIOError, PyKeyError};
 use pyo3::prelude::*;
 use pyo3::{IntoPyObjectExt, Py, PyAny};
 use rand::prelude::*;
@@ -188,6 +187,7 @@ impl BatchVecs {
     }
 
     /// Debug dump of the batch contents
+    #[allow(dead_code)]
     pub fn dump_debug(&self, seq_len: usize, d_text: usize) {
         println!(
             "╔══════════════════════════════════════════════════════════════════════════════╗"
@@ -487,8 +487,43 @@ struct SamplerItem {
     database_idx: usize,
     row_idx: RowIdx,
     target_column: ColumnIdx,
-    columns_to_drop: Vec<ColumnIdx>,
-    is_task_table: bool,
+}
+
+/// (db_path, task_table_idx, target_column_idx, columns_to_drop)
+type DbConfig = (String, u32, u32, Vec<u32>);
+
+fn build_databases_and_items(
+    db_configs: Vec<DbConfig>,
+) -> Result<(Vec<Database>, Vec<SamplerItem>), String> {
+    let mut databases = Vec::new();
+    let mut items = Vec::new();
+
+    for (db_idx, (db_path, task_table_idx, target_column_idx, cols_to_drop)) in
+        db_configs.into_iter().enumerate()
+    {
+        let mut database = Database::load(Path::new(&db_path))
+            .map_err(|e| format!("Failed to load database '{}': {}", db_path, e))?;
+        database.ensure_adjacency();
+
+        let task_table = TableIdx(task_table_idx);
+        let target_column = ColumnIdx(target_column_idx);
+        let columns_to_drop: Vec<ColumnIdx> = cols_to_drop.into_iter().map(ColumnIdx).collect();
+
+        let table = database.get_table(task_table);
+        for row_idx in table.row_range.0.0..table.row_range.1.0 {
+            items.push(SamplerItem {
+                database_idx: db_idx,
+                row_idx: RowIdx(row_idx),
+                target_column,
+                columns_to_drop: columns_to_drop.clone(),
+                is_task_table: true,
+            });
+        }
+
+        databases.push(database);
+    }
+
+    Ok((databases, items))
 }
 
 #[pyclass]
@@ -521,7 +556,7 @@ impl Sampler {
     #[new]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        db_configs: Vec<(String, u32, u32, Vec<u32>)>,
+        db_configs: Vec<DbConfig>,
         batch_size: usize,
         seq_len: usize,
         rank: usize,
@@ -530,36 +565,8 @@ impl Sampler {
         d_text: usize,
         seed: u64,
     ) -> PyResult<Self> {
-        let mut databases = Vec::new();
-        let mut items = Vec::new();
-
-        for (db_idx, (db_path, task_table_idx, target_column_idx, cols_to_drop)) in
-            db_configs.into_iter().enumerate()
-        {
-            let database = Database::load(Path::new(&db_path)).map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!(
-                    "Failed to load database '{}': {}",
-                    db_path, e
-                ))
-            })?;
-
-            let task_table = TableIdx(task_table_idx);
-            let target_column = ColumnIdx(target_column_idx);
-            let columns_to_drop: Vec<ColumnIdx> = cols_to_drop.into_iter().map(ColumnIdx).collect();
-
-            let table = database.get_table(task_table);
-            for row_idx in table.row_range.0.0..table.row_range.1.0 {
-                items.push(SamplerItem {
-                    database_idx: db_idx,
-                    row_idx: RowIdx(row_idx),
-                    target_column,
-                    columns_to_drop: columns_to_drop.clone(),
-                    is_task_table: true,
-                });
-            }
-
-            databases.push(database);
-        }
+        let (databases, items) =
+            build_databases_and_items(db_configs).map_err(pyo3::exceptions::PyIOError::new_err)?;
 
         Ok(Self {
             databases,
@@ -588,6 +595,46 @@ impl Sampler {
         let mut rng = StdRng::seed_from_u64(epoch.wrapping_add(self.seed));
         self.items.shuffle(&mut rng);
     }
+}
+
+#[pyfunction]
+pub fn resolve_db_config(
+    db_path: String,
+    task_table: String,
+    target_column: String,
+    columns_to_drop: Vec<String>,
+) -> PyResult<(u32, u32, Vec<u32>)> {
+    let database = Database::load(Path::new(&db_path))
+        .map_err(|e| PyIOError::new_err(format!("Failed to load database '{}': {}", db_path, e)))?;
+
+    let table = database
+        .tables
+        .iter()
+        .find(|t| t.name == task_table)
+        .ok_or_else(|| PyKeyError::new_err(format!("Table '{}' not found", task_table)))?;
+    let table_idx = table.idx;
+
+    let find_column = |name: &str| -> PyResult<ColumnIdx> {
+        database
+            .columns
+            .iter()
+            .find(|c| c.name == name && c.table_idx == table_idx)
+            .map(|c| c.idx)
+            .ok_or_else(|| {
+                PyKeyError::new_err(format!(
+                    "Column '{}' not found on table '{}'",
+                    name, task_table
+                ))
+            })
+    };
+
+    let target_column_idx = find_column(&target_column)?;
+    let drop_idxs: Vec<u32> = columns_to_drop
+        .iter()
+        .map(|c| find_column(c).map(|idx| idx.0))
+        .collect::<PyResult<Vec<u32>>>()?;
+
+    Ok((table_idx.0, target_column_idx.0, drop_idxs))
 }
 
 impl Sampler {
@@ -694,6 +741,8 @@ impl Sampler {
         trav: &mut TraversalBuffers,
     ) {
         let db = &self.databases[item.database_idx];
+        let edges_from = &db.edges_from;
+        let edges_to = &db.edges_to;
         let seed_row = db.get_row(item.row_idx);
         let seed_table = db.get_table(seed_row.table_idx);
         let seed_timestamp = self.get_row_timestamp(db, item.row_idx);
@@ -740,7 +789,7 @@ impl Sampler {
 
             // Collect f2p neighbors (rows this row points TO via FK)
             trav.f2p_neighbors.clear();
-            for &edge_idx in &db.edges_from[row_idx.0 as usize] {
+            for &edge_idx in &edges_from[row_idx.0 as usize] {
                 let edge = &db.fk_edges[edge_idx];
                 trav.f2p_neighbors.push(edge.to_row);
                 trav.f2p_frontier.push((depth + 1, edge.to_row));
@@ -748,7 +797,7 @@ impl Sampler {
 
             // Follow reverse edges (p2f: child rows -> this row)
             trav.children.clear();
-            for &edge_idx in &db.edges_to[row_idx.0 as usize] {
+            for &edge_idx in &edges_to[row_idx.0 as usize] {
                 let edge = &db.fk_edges[edge_idx];
 
                 // Temporal constraint: don't include future rows
@@ -1025,10 +1074,18 @@ impl Sampler {
         let time_col = table.time_col?;
         let local_idx = (time_col.0 - table.column_range.0.0) as usize;
 
-        match row.raw.get(local_idx) {
-            Some(RawCellValue::Datetime(ts)) => Some(*ts),
-            _ => None,
+        if let Some(ts) = row.raw_timestamp {
+            return Some(ts);
         }
+
+        if let Some(NormalizedCellValue::Scalar(z)) = row.normalized.get(local_idx) {
+            // Reconstruct from normalized datetime if raw values were stripped.
+            let mean = db.datetime_norm_mean.unwrap_or(0.0);
+            let std = db.datetime_norm_std.unwrap_or(1.0).max(1e-8);
+            return Some(*z * std + mean);
+        }
+
+        None
     }
 }
 
@@ -1036,36 +1093,24 @@ impl Sampler {
 mod tests {
     use super::*;
 
+    fn sample_data_path_or_skip() -> Option<&'static str> {
+        let db_path = "sample_data_f1.rkyv";
+        if Path::new(db_path).exists() {
+            Some(db_path)
+        } else {
+            eprintln!("Skipping: {} not found", db_path);
+            None
+        }
+    }
+
     fn create_test_sampler(
-        db_configs: Vec<(String, u32, u32, Vec<u32>)>,
+        db_configs: Vec<DbConfig>,
         batch_size: usize,
         seq_len: usize,
         d_text: usize,
     ) -> Sampler {
-        let mut databases = Vec::new();
-        let mut items = Vec::new();
-
-        for (db_idx, (db_path, task_table_idx, target_column_idx, cols_to_drop)) in
-            db_configs.into_iter().enumerate()
-        {
-            let database = Database::load(Path::new(&db_path)).expect("Failed to load database");
-            let task_table = TableIdx(task_table_idx);
-            let target_column = ColumnIdx(target_column_idx);
-            let columns_to_drop: Vec<ColumnIdx> = cols_to_drop.into_iter().map(ColumnIdx).collect();
-
-            let table = database.get_table(task_table);
-            for row_idx in table.row_range.0.0..table.row_range.1.0 {
-                items.push(SamplerItem {
-                    database_idx: db_idx,
-                    row_idx: RowIdx(row_idx),
-                    target_column,
-                    columns_to_drop: columns_to_drop.clone(),
-                    is_task_table: true,
-                });
-            }
-
-            databases.push(database);
-        }
+        let (databases, items) = build_databases_and_items(db_configs)
+            .unwrap_or_else(|e| panic!("Failed to build test sampler: {}", e));
 
         Sampler {
             databases,
@@ -1083,11 +1128,9 @@ mod tests {
 
     #[test]
     fn test_batch_generation() {
-        let db_path = "sample_data_f1.rkyv";
-        if !Path::new(db_path).exists() {
-            eprintln!("Skipping: {} not found", db_path);
+        let Some(db_path) = sample_data_path_or_skip() else {
             return;
-        }
+        };
 
         let batch_size = 32;
         let seq_len = 1024;
@@ -1120,11 +1163,9 @@ mod tests {
     fn test_performance() {
         use std::time::Instant;
 
-        let db_path = "sample_data_f1.rkyv";
-        if !Path::new(db_path).exists() {
-            eprintln!("Skipping: {} not found", db_path);
+        let Some(db_path) = sample_data_path_or_skip() else {
             return;
-        }
+        };
 
         let batch_size = 32;
         let seq_len = 1024;
@@ -1164,11 +1205,9 @@ mod tests {
 
     #[test]
     fn test_single_trajectory_debug() {
-        let db_path = "sample_data_f1.rkyv";
-        if !Path::new(db_path).exists() {
-            eprintln!("Skipping: {} not found", db_path);
+        let Some(db_path) = sample_data_path_or_skip() else {
             return;
-        }
+        };
 
         // Single trajectory: batch_size = 1
         let batch_size = 1;
@@ -1205,9 +1244,9 @@ mod tests {
         );
         println!("Columns to drop: {:?}", item.columns_to_drop);
 
-        // Print raw values of seed row
-        println!("\nSeed row raw values:");
-        for (i, cell) in row.raw.iter().enumerate() {
+        // Print normalized values of seed row
+        println!("\nSeed row normalized values:");
+        for (i, cell) in row.normalized.iter().enumerate() {
             let col_idx = table.column_range.0.0 + i as u32;
             let col = db.get_column(ColumnIdx(col_idx));
             println!("  {}: {:?}", col.name, cell);

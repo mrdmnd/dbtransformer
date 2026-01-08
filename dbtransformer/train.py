@@ -12,7 +12,6 @@ import random
 import time
 from collections.abc import Iterator
 from dataclasses import asdict
-from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -26,23 +25,25 @@ from tqdm import tqdm
 
 import wandb
 from dbtransformer.configurations import (
+    DEFAULT_OVERALL_CONFIG,
     DDPParameters,
-    DummyDataConfig,
     ModelConfig,
     OverallConfig,
     ProfilingConfig,
+    SamplerDataConfig,
     TrainingConfig,
     WandbConfig,
 )
-from dbtransformer.dummy_data import PreBatchedDummyDataset
 from dbtransformer.model import (
     Batch,
     ModelOutput,
     RelationalTransformer,
+    SemanticType,
 )
 from dbtransformer.profiling import (
     get_profiler_context,
 )
+from dbtransformer.sampler_dataset import SamplerBatchDataset, SamplerNotBuiltError
 
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available. This script requires CUDA.")
@@ -119,24 +120,60 @@ class Trainer:
         if self.is_leader:
             logger.info(f"Model: {num_params:,} params (~{num_params / 1e6:.1f}M)")
 
-        # Use pre-batched dataset (no collation needed = much faster!)
-        # Alternative - use DummySampleDataset which returns individual samples for batching.
-        # That needs the collate_samples function, which seems slow.
-        self.dataset = PreBatchedDummyDataset(config.data, config.model, config.training)
-        self.sampler: DistributedSampler[int] = DistributedSampler(
-            self.dataset,
-            num_replicas=self.ddp_parameters.world_size,
-            rank=self.ddp_parameters.global_rank,
-            shuffle=True,
-            drop_last=False,
-        )
+        # Rust sampler dataset yields full Batch objects (no collation needed).
+        try:
+            self.dataset = SamplerBatchDataset(
+                config.data,
+                config.model,
+                config.training,
+                self.ddp_parameters,
+            )
+        except SamplerNotBuiltError as exc:
+            logger.error(str(exc))
+            raise
+
+        # Optional eval dataset (same sampler backend, typically different db configs)
+        self.eval_dataloader: DataLoader[Batch] | None = None
+        if config.data.eval_db_configs:
+            try:
+                eval_data_cfg = SamplerDataConfig(
+                    db_configs=config.data.eval_db_configs,
+                    eval_db_configs=[],
+                    max_bfs_width=config.data.max_bfs_width,
+                    seed=config.data.seed,
+                )
+                self.eval_dataset = SamplerBatchDataset(
+                    eval_data_cfg,
+                    config.model,
+                    config.training,
+                    self.ddp_parameters,
+                    db_configs_override=config.data.eval_db_configs,
+                )
+                self.eval_dataloader = DataLoader(
+                    self.eval_dataset,
+                    batch_size=None,
+                    num_workers=config.training.num_workers,
+                    pin_memory=True,
+                    sampler=None,
+                    shuffle=False,
+                    collate_fn=None,
+                    persistent_workers=config.training.num_workers > 0,
+                    prefetch_factor=2 if config.training.num_workers > 0 else None,
+                )
+            except SamplerNotBuiltError as exc:
+                logger.error(f"Failed to build eval sampler: {exc}")
+                raise
+
+        # Rust sampler already partitions by rank/world_size internally.
+        self.dist_sampler = None
         self.dataloader = DataLoader(
             self.dataset,
-            batch_size=None,  # Already batched!
+            batch_size=None,
             num_workers=config.training.num_workers,
-            pin_memory=True,  # Batch.pin_memory() enables fast async transfer
-            sampler=self.sampler,
-            collate_fn=None,  # No collation needed!
+            pin_memory=True,
+            sampler=None,
+            shuffle=False,
+            collate_fn=None,
             persistent_workers=config.training.num_workers > 0,
             prefetch_factor=2 if config.training.num_workers > 0 else None,
         )
@@ -282,9 +319,137 @@ class Trainer:
         in distributed training.
         """
         while True:
-            self.sampler.set_epoch(self.current_epoch)
+            if self.dist_sampler is not None:
+                self.dist_sampler.set_epoch(self.current_epoch)
+            if hasattr(self.dataset, "set_epoch"):
+                self.dataset.set_epoch(self.current_epoch)
             yield from self.dataloader
             self.current_epoch += 1
+
+    def _gather_varlen(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gather variable-length 1D tensors across ranks and concatenate."""
+        if not dist.is_initialized():
+            return tensor
+
+        local_len = torch.tensor([tensor.shape[0]], device=tensor.device, dtype=torch.int64)
+        lengths = [torch.zeros_like(local_len) for _ in range(dist.get_world_size())]
+        dist.all_gather(lengths, local_len)
+        max_len = int(torch.stack(lengths).max())
+
+        if tensor.shape[0] < max_len:
+            pad = torch.zeros(max_len - tensor.shape[0], device=tensor.device, dtype=tensor.dtype)
+            tensor_padded = torch.cat([tensor, pad], dim=0)
+        else:
+            tensor_padded = tensor
+
+        gathered = [torch.zeros_like(tensor_padded) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, tensor_padded)
+
+        trimmed = []
+        for t, l in zip(gathered, lengths):
+            trimmed.append(t[: int(l.item())])
+        return torch.cat(trimmed, dim=0)
+
+    def _evaluate(self) -> dict[str, float]:
+        """Run a bounded evaluation loop over the eval dataloader."""
+        if self.eval_dataloader is None:
+            return {}
+
+        # Fixed epoch for eval to keep ordering deterministic
+        if hasattr(self.eval_dataset, "set_epoch"):
+            self.eval_dataset.set_epoch(0)
+
+        self.model.eval()
+
+        device = self.ddp_parameters.device
+        float_dtype = self.config.model.model_dtype
+
+        loss_sum = torch.zeros([], device=device, dtype=torch.float32)
+        batch_count = torch.zeros([], device=device, dtype=torch.float32)
+
+        bool_preds_list: list[torch.Tensor] = []
+        bool_labels_list: list[torch.Tensor] = []
+        num_preds_list: list[torch.Tensor] = []
+        num_labels_list: list[torch.Tensor] = []
+
+        max_batches = self.config.training.max_eval_batches
+
+        with torch.inference_mode():
+            for i, batch in enumerate(self.eval_dataloader):
+                if i >= max_batches:
+                    break
+
+                batch.to_device(device, float_dtype=float_dtype)
+                output: ModelOutput = self.model(batch)
+
+                loss_sum += output["loss"].detach()
+                batch_count += 1.0
+
+                mask_active = batch.masks & (~batch.is_padding)
+                semantic = batch.semantic_types
+
+                bool_mask = mask_active & (semantic == SemanticType.BOOLEAN.value)
+                if bool_mask.any():
+                    preds = torch.sigmoid(output["yhat_boolean"][bool_mask]).flatten()
+                    labels = (batch.boolean_values[bool_mask] > 0).float().flatten()
+                    bool_preds_list.append(preds.detach())
+                    bool_labels_list.append(labels.detach())
+
+                num_mask = mask_active & (semantic == SemanticType.NUMBER.value)
+                if num_mask.any():
+                    preds = output["yhat_number"][num_mask].flatten()
+                    labels = batch.number_values[num_mask].flatten()
+                    num_preds_list.append(preds.detach())
+                    num_labels_list.append(labels.detach())
+
+        # Reduce loss totals
+        if dist.is_initialized():
+            for tensor in [loss_sum, batch_count]:
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+        metrics: dict[str, float] = {}
+        if batch_count.item() > 0:
+            metrics["eval/loss"] = (loss_sum / batch_count).item()
+
+        # Concatenate local preds/labels then gather across ranks
+        if bool_preds_list:
+            bool_preds = torch.cat(bool_preds_list, dim=0)
+            bool_labels = torch.cat(bool_labels_list, dim=0)
+            bool_preds = self._gather_varlen(bool_preds)
+            bool_labels = self._gather_varlen(bool_labels)
+
+            if self.is_leader:
+                try:
+                    from sklearn.metrics import roc_auc_score
+                except Exception:
+                    logger.warning("sklearn not available; skipping AUC metric")
+                else:
+                    auc = roc_auc_score(bool_labels.cpu().numpy(), bool_preds.cpu().numpy())
+                    metrics["eval/auc_boolean"] = float(auc)
+
+        if num_preds_list:
+            num_preds = torch.cat(num_preds_list, dim=0)
+            num_labels = torch.cat(num_labels_list, dim=0)
+            num_preds = self._gather_varlen(num_preds)
+            num_labels = self._gather_varlen(num_labels)
+
+            if self.is_leader:
+                # R2: 1 - SS_res / SS_tot
+                y = num_labels.cpu().numpy()
+                yhat = num_preds.cpu().numpy()
+                ss_res = float(np.sum((y - yhat) ** 2))
+                ss_tot = float(np.sum((y - y.mean()) ** 2)) if y.size > 0 else 0.0
+                if ss_tot > 0:
+                    r2 = 1.0 - ss_res / ss_tot
+                    metrics["eval/r2_number"] = r2
+
+        if self.is_leader and metrics:
+            logger.info("Eval metrics: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+            if self.wandb_run is not None:
+                self.wandb_run.log(metrics, step=self.batches_run)
+
+        self.model.train()
+        return metrics
 
     def _init_wandb(self) -> None:
         """Initialize Weights & Biases on rank 0 only."""
@@ -378,6 +543,13 @@ class Trainer:
             batches_since_log += 1
             current_batch = batch_num + 1
 
+            if (
+                self.eval_dataloader is not None
+                and self.config.training.eval_every_n_batches > 0
+                and current_batch % self.config.training.eval_every_n_batches == 0
+            ):
+                self._evaluate()
+
             # Log metrics every log_every_n_batches
             if current_batch % self.config.training.log_every_n_batches == 0:
                 total_loss_scalar = accumulated_loss.item()
@@ -449,84 +621,6 @@ def main(config: OverallConfig) -> None:
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Distributed training with torchrun")
-
-    # Training arguments
-    parser.add_argument(
-        "--snapshot-path",
-        type=str,
-        default="snapshot.pt",
-        help="Path to save/load snapshots (default: snapshot.pt)",
-    )
-    parser.add_argument(
-        "--no-wandb",
-        action="store_true",
-        help="Disable W&B logging",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="DataLoader workers (0=sync, 1+=async, default: 4)",
-    )
-    # Profiling arguments
-    parser.add_argument(
-        "--profile",
-        type=str,
-        choices=["full", "batch"],
-        default=None,
-        help="Enable profiling: 'full' for everything, 'batch' for a few run_batch invocations (step-based)",
-    )
-    parser.add_argument(
-        "--profile-output",
-        type=str,
-        default="./profiler_logs",
-        help="Output dir for torch profiler (default: ./profiler_logs)",
-    )
-
-    # Training arguments
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Batch size per GPU (default: 32). Try larger values like 64, 128 for better GPU utilization.",
-    )
-    parser.add_argument(
-        "--seq-len",
-        type=int,
-        default=1024,
-        help="Sequence length (default: 1024).",
-    )
-    parser.add_argument(
-        "--max-batches",
-        type=int,
-        default=300,
-        help="Maximum number of batches to train for (default: 300).",
-    )
-
-    args = parser.parse_args()
-
-    wandb_config = WandbConfig(enabled=not args.no_wandb)
-    profile_config = ProfilingConfig()
-    if args.profile is not None:
-        profile_config.profile_mode = args.profile
-    if args.profile_output is not None:
-        profile_config.profile_output = args.profile_output
-
-    training_config = TrainingConfig()
-    training_config.batch_size = args.batch_size
-    training_config.seq_len = args.seq_len
-    training_config.max_batches = args.max_batches
-    training_config.num_workers = args.num_workers
-
-    overall_config = OverallConfig(
-        model=ModelConfig(),
-        training=training_config,
-        data=DummyDataConfig(),
-        profiling=profile_config,
-        wandb=wandb_config,
-    )
-
-    main(overall_config)
+    # Use baked-in dataclass defaults; customize by editing DEFAULT_OVERALL_CONFIG or
+    # import and call main(config) yourself.
+    main(DEFAULT_OVERALL_CONFIG)

@@ -7,89 +7,93 @@ use half::f16;
 use rkyv::{Archive, Deserialize, Serialize};
 
 // ============================================================================
-// Index Types (newtypes for type safety)
+// Index Types
 // ============================================================================
 
-/// Global table index
+/// Global table index in the database
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug, Hash, PartialEq, Eq))]
-pub struct TableIdx(pub u32);
+pub struct TableIdx(pub usize);
 
-/// Global column index (across all tables)
+/// Global column index (unique across all tables) in the database
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug, Hash, PartialEq, Eq))]
-pub struct ColumnIdx(pub u32);
+pub struct ColumnIdx(pub usize);
 
-/// Global row index (across all tables)
+/// Global row index (unique across all tables) in the database
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug, Hash, PartialEq, Eq))]
-pub struct RowIdx(pub u32);
+pub struct RowIdx(pub usize);
 
-/// Index into the text vocabulary
+/// Index into an 'interned' text vocabulary.
+/// All of the text values in the DB cells get embedded by a frozen embedding model, and stored here.
+/// We don't do this for the column description embeddings though - those are stored directly on the Column object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug, Hash, PartialEq, Eq))]
-pub struct TextIdx(pub u32);
+pub struct TextIdx(pub usize);
 
 // ============================================================================
 // Semantic Types
 // ============================================================================
 
-/// Semantic type of a column - determines normalization and encoding strategy
+/// Semantic type of a database column - determines normalization and encoding strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum SemanticType {
-    Number = 0,
-    Text = 1,
-    Datetime = 2,
-    Boolean = 3,
-}
+    // Integers and floats, where numerical ordering is meaningful
+    // e.g. product price, age, discount percentage, etc.
+    // Prediction task is REGRESSION
+    // Polars Float{16, 32, 64} and Decimal are auto-detected into this stype.
+    // Polars Int{8, 16, 32, 64, 128} are auto-detected into this stype, unless explicitly marked as Categorical in the metadata.
+    // Polars Duration is auto-detected into this stype.
+    // I'm not actually sure what do do about polars UInt types.
+    Numerical = 0,
 
-// ============================================================================
-// Table Type (for distinguishing DB tables from task tables)
-// ============================================================================
+    // Strings, integers, or booleans, with a limited number of unique values.
+    // e.g. product type, subscription status, etc.
+    // Prediction task is CLASSIFICATION
+    // Polars dtype Boolean, Categorical, Enum are auto-detected into this type.
+    // Polars String and Int{8, 16, 32, 64, 128} are NOT auto-detected into this type, unless explicitly marked as Categorical in the metadata.
+    Categorical = 1,
 
-/// Type of table - distinguishes regular database tables from task tables
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Archive, Serialize, Deserialize)]
-#[rkyv(derive(Debug, Hash, PartialEq, Eq))]
-pub enum TableType {
-    /// Regular database table (the core relational data)
-    #[default]
-    Db,
-    /// Task table - training split
-    Train,
-    /// Task table - validation split
-    Val,
-    /// Task table - test split
-    Test,
+    // Date/time values
+    // Use this instead of "Numerical" for values that are specifically timestamps.
+    // Prediction task is REGRESSION
+    // Polars Date, Datetime, and Time are auto-detected into this stype.
+    // The other Polars types are NOT auto-detected into this stype.
+    // Notably, "Duration" is turned into a Numerical type.
+    Timestamp = 2,
+
+    // Multi-token strings where semantic meaning is important
+    // e.g. product description, customer review, etc.
+    // If the column is *stored* as text, but represents a categorical value, prefer to use the Categorical type.
+    // No prediction task is associated with this type... YET...
+    Text = 3,
+
+    // All other Polars dtypes are unsupported..
+    // Binary, Extension, ...
+    Unsupported = 5,
 }
 
 // ============================================================================
 // Cell Values
 // ============================================================================
 
-/// Raw cell value - preserves original data for temporal filtering, FK lookups, and debugging
-#[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
-pub enum RawCellValue {
-    /// Raw numeric value (as read from source)
-    Number(f32),
-    /// Actual string content
-    Text(String),
-    /// Raw seconds since epoch (for temporal filtering)
-    Datetime(f32),
-    /// Raw boolean value
-    Boolean(bool),
-    /// Missing value
-    Null,
-}
+// For loading into an ML model, we want to normalize our cell values.
+// For numerical values, we'll use z-score normalization, using the column-specific mean and std.
+// For categorical values, we'll ... not sure?
+// For timestamp values, we'll also use z-score normalization, but we'll use the global mean and std for timestamps.
+// Identifier values are not normalized.
+// For text values, we'll use a frozen embedding model to embed the text into some fixed-size vector.
 
-/// Normalized cell value - ready for ML consumption
 #[derive(Debug, Clone, Copy, PartialEq, Archive, Serialize, Deserialize)]
 pub enum NormalizedCellValue {
-    /// Z-score normalized scalar (for Number, Boolean, Datetime)
-    Scalar(f32),
+    /// Z-score normalized scalar (for Nu
+    Numerical(f32),
     /// Index into text value vocabulary (for embedding lookup)
     Text(TextIdx),
-    /// Missing value (represented as NaN in practice, but explicit for clarity)
+    /// Missing value (rexplicit for clarity right now)
+    /// Note - this is different from floating point NaN.
     Null,
 }
 
@@ -97,33 +101,41 @@ pub enum NormalizedCellValue {
 // Schema: Column
 // ============================================================================
 
-/// Column metadata (all string references are via TextIdx)
+/// Column metadata
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct Column {
     /// Column name
     pub name: String,
-    /// Global column index
+
+    /// Global column index in the database
     pub idx: ColumnIdx,
-    /// Local index within the table (0, 1, 2, ...)
-    pub local_idx: u32,
+
     /// Which table this column belongs to
     pub table_idx: TableIdx,
-    /// Schema string for embedding (index into vocab, e.g., "circuitId of circuits")
-    pub schema_idx: TextIdx,
+
     /// Semantic type determines normalization strategy
     pub dtype: SemanticType,
-    /// True if this is the primary key column
+
+    /// True if this is the primary key column for the parent table
     pub is_primary_key: bool,
-    /// If this is a foreign key, the table it references
-    pub fk_target_table: Option<TableIdx>,
+
     /// If this is a foreign key, the column in the target table it references
     pub fk_target_column: Option<ColumnIdx>,
+
     // We store the frozen embedding of "<column_name> of <table_name>" directly on this object.
+    // At creation time; it may not be available yet, but we create these Column objects as `mut` and let the embedder
+    // assign the vector later.
     pub column_description_embedding: Option<Vec<f16>>,
+
     /// Normalization mean (for Number/Boolean columns, computed per-column)
+    /// Assigned during preprocessing once column statistics are known.
     pub norm_mean: Option<f32>,
+
     /// Normalization std (for Number/Boolean columns, computed per-column)
+    /// Assigned during preprocessing once column statistics are known.
     pub norm_std: Option<f32>,
+    // TODO(mrdmnd): consider computing online mean and variance as we go? Then we can skip the normalization secondary
+    // pass.
 }
 
 // ============================================================================
@@ -135,48 +147,48 @@ pub struct Column {
 pub struct Table {
     /// Table name
     pub name: String,
-    /// Global table index
+
+    /// Global table index in the database
     pub idx: TableIdx,
-    /// Type of table (Db, Train, Val, Test)
-    pub table_type: TableType,
+
     /// Range of column indices for this table [start, end)
     pub column_range: (ColumnIdx, ColumnIdx),
+
     /// Range of row indices for this table [start, end)
     pub row_range: (RowIdx, RowIdx),
+
     /// Primary key column (global index)
     pub primary_key_col: Option<ColumnIdx>,
-    /// Time column for temporal queries (global index)
+
+    /// Reference time column for temporal queries (global index)
     pub time_col: Option<ColumnIdx>,
 }
 
 impl Table {
     /// Number of columns in this table
-    pub fn num_columns(&self) -> u32 {
+    pub fn num_columns(&self) -> usize {
         self.column_range.1.0 - self.column_range.0.0
     }
 
     /// Number of rows in this table
-    pub fn num_rows(&self) -> u32 {
+    pub fn num_rows(&self) -> usize {
         self.row_range.1.0 - self.row_range.0.0
     }
 }
 
-// ============================================================================
-// Data: Row
-// ============================================================================
-
-/// A row containing both raw and normalized cell values
+/// A post-processed row contains normalized cell values.
+/// For sampling purposes, we'll also want to keep the *raw* values for the time column, if present.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct Row {
     /// Global row index
     pub idx: RowIdx,
     /// Which table this row belongs to
     pub table_idx: TableIdx,
-    /// True if this row belongs to a task table (Train/Val/Test), false for Db tables
-    pub is_task_row: bool,
-    /// Raw cell values (for temporal filtering, FK lookups, debugging)
-    pub raw: Vec<RawCellValue>,
-    /// Normalized cell values (for ML consumption, populated by Database::normalize())
+
+    /// Raw timestamp for the table's time column (epoch seconds), if present.
+    pub raw_timestamp: Option<f32>,
+
+    /// Normalized cell values (for ML consumption)
     pub normalized: Vec<NormalizedCellValue>,
 }
 
@@ -203,19 +215,19 @@ pub struct ForeignKeyEdge {
 #[derive(Debug, Archive, Serialize, Deserialize)]
 pub struct Database {
     // --- Vocabulary (text value embeddings) ---
-    /// Maps seen text values to their TextIdx
+    /// Maps discovered text values to their TextIdx
+    /// Think about this like an "interned" string table.
     pub text_value_lookup: HashMap<String, TextIdx>,
+
     /// Embeddings for each text value (indexed by TextIdx.0)
+    /// Will have a number of rows equal to the number of unique text values in the database.
     pub text_value_embeddings: Vec<Vec<f16>>,
 
-    // --- Schema ---
-    /// All tables (indexed by TableIdx)
+    // --- Schema / metadata ---
     pub tables: Vec<Table>,
-    /// All columns (indexed by ColumnIdx)
     pub columns: Vec<Column>,
 
     // --- Data ---
-    /// All rows (indexed by RowIdx)
     pub rows: Vec<Row>,
 
     // --- Graph Edges (FK relationships) ---
@@ -290,13 +302,21 @@ impl Database {
             return true;
         };
 
+        // Prefer precomputed raw timestamp if available
+        if let Some(ts) = row.raw_timestamp {
+            return ts <= cutoff_timestamp;
+        }
+
         // Get the local column index within the table
         let local_col_idx = (time_col.0 - table.column_range.0.0) as usize;
 
-        // Check the raw cell value (uses raw epoch seconds, not normalized)
-        match row.raw.get(local_col_idx) {
-            Some(RawCellValue::Datetime(ts)) => *ts <= cutoff_timestamp,
-            _ => true, // Include rows with null or missing time values
+        if let Some(NormalizedCellValue::Scalar(z)) = row.normalized.get(local_col_idx) {
+            let mean = self.datetime_norm_mean.unwrap_or(0.0);
+            let std = self.datetime_norm_std.unwrap_or(1.0).max(1e-8);
+            let ts = *z * std + mean;
+            ts <= cutoff_timestamp
+        } else {
+            true
         }
     }
 
@@ -363,6 +383,33 @@ impl Database {
         self.text_value_lookup.len()
     }
 
+    /// Build adjacency lists (outgoing and incoming) from fk_edges.
+    pub fn build_adjacency(&self) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+        let mut edges_from: Vec<Vec<usize>> = vec![Vec::new(); self.rows.len()];
+        let mut edges_to: Vec<Vec<usize>> = vec![Vec::new(); self.rows.len()];
+
+        for (edge_idx, edge) in self.fk_edges.iter().enumerate() {
+            edges_from[edge.from_row.0 as usize].push(edge_idx);
+            edges_to[edge.to_row.0 as usize].push(edge_idx);
+        }
+
+        (edges_from, edges_to)
+    }
+
+    /// Rebuild and store adjacency lists from fk_edges.
+    pub fn rebuild_adjacency(&mut self) {
+        let (edges_from, edges_to) = self.build_adjacency();
+        self.edges_from = edges_from;
+        self.edges_to = edges_to;
+    }
+
+    /// Ensure adjacency lists exist and are sized correctly.
+    pub fn ensure_adjacency(&mut self) {
+        if self.edges_from.len() != self.rows.len() || self.edges_to.len() != self.rows.len() {
+            self.rebuild_adjacency();
+        }
+    }
+
     /// Save the database to a file using rkyv serialization.
     ///
     /// This creates a compact binary representation that can be quickly loaded back.
@@ -388,183 +435,14 @@ impl Database {
         let mut reader = BufReader::new(file);
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes)?;
-        let db = rkyv::from_bytes::<Self, rkyv::rancor::Error>(&bytes).map_err(|e| {
+        let mut db = rkyv::from_bytes::<Self, rkyv::rancor::Error>(&bytes).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Deserialization error: {e}"),
             )
         })?;
+        db.ensure_adjacency();
         Ok(db)
-    }
-
-    /// Normalize all raw cell values and populate the normalized vectors.
-    ///
-    /// This computes:
-    /// - Per-column z-score normalization for Number and Boolean columns
-    /// - Global z-score normalization for all Datetime values
-    /// - TextIdx references for Text values (pointing to embedding table)
-    ///
-    /// Should be called after all raw data is loaded but before saving.
-    pub fn normalize(&mut self) {
-        // First pass: collect statistics
-        // - Per-column: sum and count for Number/Boolean
-        // - Global: sum and count for all Datetime values
-        let num_cols = self.columns.len();
-        let mut col_sums: Vec<f64> = vec![0.0; num_cols];
-        let mut col_counts: Vec<u64> = vec![0; num_cols];
-        let mut datetime_sum: f64 = 0.0;
-        let mut datetime_count: u64 = 0;
-
-        for row in &self.rows {
-            let table = &self.tables[row.table_idx.0 as usize];
-            let col_start = table.column_range.0.0 as usize;
-
-            for (local_idx, cell) in row.raw.iter().enumerate() {
-                let col_idx = col_start + local_idx;
-                let col = &self.columns[col_idx];
-
-                match (cell, col.dtype) {
-                    (RawCellValue::Number(v), SemanticType::Number) => {
-                        col_sums[col_idx] += *v as f64;
-                        col_counts[col_idx] += 1;
-                    }
-                    (RawCellValue::Boolean(v), SemanticType::Boolean) => {
-                        col_sums[col_idx] += if *v { 1.0 } else { 0.0 };
-                        col_counts[col_idx] += 1;
-                    }
-                    (RawCellValue::Datetime(v), SemanticType::Datetime) => {
-                        datetime_sum += *v as f64;
-                        datetime_count += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Compute means
-        let col_means: Vec<f64> = col_sums
-            .iter()
-            .zip(col_counts.iter())
-            .map(|(sum, count)| if *count > 0 { sum / *count as f64 } else { 0.0 })
-            .collect();
-
-        let datetime_mean = if datetime_count > 0 {
-            datetime_sum / datetime_count as f64
-        } else {
-            0.0
-        };
-
-        // Second pass: compute variance
-        let mut col_var_sums: Vec<f64> = vec![0.0; num_cols];
-        let mut datetime_var_sum: f64 = 0.0;
-
-        for row in &self.rows {
-            let table = &self.tables[row.table_idx.0 as usize];
-            let col_start = table.column_range.0.0 as usize;
-
-            for (local_idx, cell) in row.raw.iter().enumerate() {
-                let col_idx = col_start + local_idx;
-                let col = &self.columns[col_idx];
-
-                match (cell, col.dtype) {
-                    (RawCellValue::Number(v), SemanticType::Number) => {
-                        let diff = *v as f64 - col_means[col_idx];
-                        col_var_sums[col_idx] += diff * diff;
-                    }
-                    (RawCellValue::Boolean(v), SemanticType::Boolean) => {
-                        let val = if *v { 1.0 } else { 0.0 };
-                        let diff = val - col_means[col_idx];
-                        col_var_sums[col_idx] += diff * diff;
-                    }
-                    (RawCellValue::Datetime(v), SemanticType::Datetime) => {
-                        let diff = *v as f64 - datetime_mean;
-                        datetime_var_sum += diff * diff;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Compute stds (with minimum of 1e-8 to avoid division by zero)
-        let col_stds: Vec<f64> = col_var_sums
-            .iter()
-            .zip(col_counts.iter())
-            .map(|(var_sum, count)| {
-                if *count > 1 {
-                    (var_sum / (*count - 1) as f64).sqrt().max(1e-8)
-                } else {
-                    1.0 // Single value or no values: use std=1 to avoid NaN
-                }
-            })
-            .collect();
-
-        let datetime_std = if datetime_count > 1 {
-            (datetime_var_sum / (datetime_count - 1) as f64)
-                .sqrt()
-                .max(1e-8)
-        } else {
-            1.0
-        };
-
-        // Store normalization parameters
-        self.datetime_norm_mean = Some(datetime_mean as f32);
-        self.datetime_norm_std = Some(datetime_std as f32);
-
-        for (col_idx, col) in self.columns.iter_mut().enumerate() {
-            match col.dtype {
-                SemanticType::Number | SemanticType::Boolean => {
-                    col.norm_mean = Some(col_means[col_idx] as f32);
-                    col.norm_std = Some(col_stds[col_idx] as f32);
-                }
-                _ => {
-                    col.norm_mean = None;
-                    col.norm_std = None;
-                }
-            }
-        }
-
-        // Third pass: populate normalized vectors
-        for row in &mut self.rows {
-            let table = &self.tables[row.table_idx.0 as usize];
-            let col_start = table.column_range.0.0 as usize;
-
-            row.normalized = row
-                .raw
-                .iter()
-                .enumerate()
-                .map(|(local_idx, cell)| {
-                    let col_idx = col_start + local_idx;
-                    let col = &self.columns[col_idx];
-
-                    match (cell, col.dtype) {
-                        (RawCellValue::Number(v), SemanticType::Number) => {
-                            let z = (*v as f64 - col_means[col_idx]) / col_stds[col_idx];
-                            NormalizedCellValue::Scalar(z as f32)
-                        }
-                        (RawCellValue::Boolean(v), SemanticType::Boolean) => {
-                            let val = if *v { 1.0 } else { 0.0 };
-                            let z = (val - col_means[col_idx]) / col_stds[col_idx];
-                            NormalizedCellValue::Scalar(z as f32)
-                        }
-                        (RawCellValue::Datetime(v), SemanticType::Datetime) => {
-                            let z = (*v as f64 - datetime_mean) / datetime_std;
-                            NormalizedCellValue::Scalar(z as f32)
-                        }
-                        (RawCellValue::Text(s), SemanticType::Text) => {
-                            // Look up the TextIdx for this string
-                            if let Some(&idx) = self.text_value_lookup.get(s) {
-                                NormalizedCellValue::Text(idx)
-                            } else {
-                                // This shouldn't happen if data was loaded correctly
-                                NormalizedCellValue::Null
-                            }
-                        }
-                        (RawCellValue::Null, _) => NormalizedCellValue::Null,
-                        _ => NormalizedCellValue::Null, // Type mismatch fallback
-                    }
-                })
-                .collect();
-        }
     }
 
     /// Verbose debug dump of the entire database structure
@@ -647,16 +525,10 @@ impl Database {
         for col in &self.columns {
             let table_name = &self.tables[col.table_idx.0 as usize].name;
             println!("  Column[{}]: \"{}.{}\"", col.idx.0, table_name, col.name);
-            println!("    local_idx:    {}", col.local_idx);
             println!("    table_idx:    {}", col.table_idx.0);
-            println!("    schema_idx:   {}", col.schema_idx.0);
             println!("    dtype:        {:?}", col.dtype);
             println!("    is_pk:        {}", col.is_primary_key);
-            println!(
-                "    fk_target:    {:?} -> {:?}",
-                col.fk_target_table.map(|t| t.0),
-                col.fk_target_column.map(|c| c.0)
-            );
+            println!("    fk_target:    {:?}", col.fk_target_column.map(|c| c.0));
             println!(
                 "    embedding:    {} dims",
                 col.column_description_embedding
@@ -703,26 +575,11 @@ impl Database {
         println!("└─────────────────────────────────────────────────────────────────────────────┘");
         for row in self.rows.iter().take(20) {
             let table_name = &self.tables[row.table_idx.0 as usize].name;
-            println!("  Row[{}]: table=\"{}\"", row.idx.0, table_name);
-            print!("    raw: [");
-            for (i, cell) in row.raw.iter().enumerate() {
-                if i > 0 {
-                    print!(", ");
-                }
-                match cell {
-                    RawCellValue::Number(v) => print!("Num({:.2})", v),
-                    RawCellValue::Text(s) => {
-                        let preview: String = s.chars().take(15).collect();
-                        let trunc = if s.len() > 15 { ".." } else { "" };
-                        print!("Txt(\"{}{}\")", preview, trunc)
-                    }
-                    RawCellValue::Datetime(v) => print!("Dt({:.0})", v),
-                    RawCellValue::Boolean(v) => print!("Bool({})", v),
-                    RawCellValue::Null => print!("Null"),
-                }
-            }
-            println!("]");
-            print!("    norm: [");
+            println!(
+                "  Row[{}]: table=\"{}\", raw_timestamp={:?}",
+                row.idx.0, table_name, row.raw_timestamp
+            );
+            print!("    values: [");
             for (i, cell) in row.normalized.iter().enumerate() {
                 if i > 0 {
                     print!(", ");
@@ -767,26 +624,33 @@ impl Database {
         println!("┌─────────────────────────────────────────────────────────────────────────────┐");
         println!("│ EDGE ADJACENCY STATS                                                        │");
         println!("└─────────────────────────────────────────────────────────────────────────────┘");
-        let total_from: usize = self.edges_from.iter().map(|v| v.len()).sum();
-        let total_to: usize = self.edges_to.iter().map(|v| v.len()).sum();
-        let max_from = self.edges_from.iter().map(|v| v.len()).max().unwrap_or(0);
-        let max_to = self.edges_to.iter().map(|v| v.len()).max().unwrap_or(0);
-        let non_empty_from = self.edges_from.iter().filter(|v| !v.is_empty()).count();
-        let non_empty_to = self.edges_to.iter().filter(|v| !v.is_empty()).count();
-        println!(
-            "  edges_from: {} lists, {} total edges, max degree {}, {} non-empty",
-            self.edges_from.len(),
-            total_from,
-            max_from,
-            non_empty_from
-        );
-        println!(
-            "  edges_to:   {} lists, {} total edges, max degree {}, {} non-empty",
-            self.edges_to.len(),
-            total_to,
-            max_to,
-            non_empty_to
-        );
+        if self.edges_from.len() == self.rows.len() && self.edges_to.len() == self.rows.len() {
+            let total_from: usize = self.edges_from.iter().map(|v| v.len()).sum();
+            let total_to: usize = self.edges_to.iter().map(|v| v.len()).sum();
+            let max_from = self.edges_from.iter().map(|v| v.len()).max().unwrap_or(0);
+            let max_to = self.edges_to.iter().map(|v| v.len()).max().unwrap_or(0);
+            let non_empty_from = self.edges_from.iter().filter(|v| !v.is_empty()).count();
+            let non_empty_to = self.edges_to.iter().filter(|v| !v.is_empty()).count();
+            println!(
+                "  edges_from: {} lists, {} total edges, max degree {}, {} non-empty",
+                self.edges_from.len(),
+                total_from,
+                max_from,
+                non_empty_from
+            );
+            println!(
+                "  edges_to:   {} lists, {} total edges, max degree {}, {} non-empty",
+                self.edges_to.len(),
+                total_to,
+                max_to,
+                non_empty_to
+            );
+        } else {
+            println!(
+                "  fk_edges:   {} total edges (adjacency not materialized in struct)",
+                self.fk_edges.len()
+            );
+        }
         println!();
 
         // PK Index (first 20)
@@ -822,7 +686,7 @@ impl Database {
             .filter_map(|c| c.column_description_embedding.as_ref())
             .map(|e| e.len() * 2)
             .sum();
-        let cell_count: usize = self.rows.iter().map(|r| r.raw.len()).sum();
+        let cell_count: usize = self.rows.iter().map(|r| r.normalized.len()).sum();
         println!(
             "  Text embeddings:   {:>10} bytes ({:.2} MB)",
             embedding_bytes,

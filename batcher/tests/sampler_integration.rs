@@ -44,10 +44,11 @@ fn inspect_database(db: &Database) {
     println!("\n=== Columns ===");
     for table in &db.tables {
         println!("  Table: {}", table.name);
-        for col_idx in table.column_range.0.0..table.column_range.1.0 {
-            let col = &db.columns[col_idx as usize];
-            let fk_info = if let Some(target) = col.fk_target_table {
-                format!(" -> {}", db.tables[target.0 as usize].name)
+        for col_idx in table.column_range.0..table.column_range.1 {
+            let col = &db.columns[col_idx];
+            let fk_info = if let Some(target_col) = col.fk_target_column {
+                let target_table = db.columns[target_col].table_idx;
+                format!(" -> {}", db.tables[target_table.0 as usize].name)
             } else {
                 String::new()
             };
@@ -70,7 +71,7 @@ fn find_task_table(db: &Database, min_rows: u32) -> Option<(TableIdx, u32, u32)>
                 let col = &db.columns[col_idx as usize];
                 if matches!(col.dtype, batcher::SemanticType::Number)
                     && !col.is_primary_key
-                    && col.fk_target_table.is_none()
+                    && col.fk_target_column.is_none()
                 {
                     return Some((table.idx, col_idx, num_rows));
                 }
@@ -93,7 +94,8 @@ fn test_sampler_batch_generation() {
         return;
     }
 
-    let db = Database::load(Path::new(db_path)).expect("Failed to load database");
+    let mut db = Database::load(Path::new(db_path)).expect("Failed to load database");
+    db.ensure_adjacency();
     inspect_database(&db);
 
     // Find a suitable task table
@@ -147,7 +149,8 @@ fn test_database_load_performance() {
 
     // Measure load time
     let start = Instant::now();
-    let db = Database::load(Path::new(db_path)).expect("Failed to load database");
+    let mut db = Database::load(Path::new(db_path)).expect("Failed to load database");
+    db.ensure_adjacency();
     let load_time = start.elapsed();
 
     println!("\n=== Load Performance ===");

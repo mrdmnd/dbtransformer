@@ -11,172 +11,145 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use batcher::{
-    Column, ColumnIdx, Database, Embedder, EmbedderConfig, ForeignKeyEdge, RawCellValue, Row,
-    RowIdx, SemanticType, Table, TableIdx, TableType, TextIdx,
+    Column as SchemaColumn, ColumnIdx, Database, Embedder, EmbedderConfig, ForeignKeyEdge,
+    NormalizedCellValue, Row, RowIdx, SemanticType, Table, TableIdx, TableType, TextIdx,
 };
 use clap::Parser;
 use half::f16;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use polars::prelude::*;
+use polars::prelude::{Column as PolarsColumn, *};
 use tracing::{Level, debug, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-/// Intermediate structure for parsing parquet metadata
-struct ParquetTableMeta {
+struct TableMeta {
     name: String,
-    table_type: TableType,
-    primary_key: Option<String>,
+    primary_key: Option<String>, // not sure if this should be optional because we want all tables to have a primary key
     foreign_keys: HashMap<String, String>, // col_name -> target_table_name
     time_column: Option<String>,
 }
 
-/// Map polars dtype to our semantic type
-fn dtype_to_semantic(dtype: &DataType) -> SemanticType {
+/// Auto-map polars dtype to our semantic types
+/// It is possible to override this mapping in the metadata.json file for each table.
+/// For example, if you know that a column is categorical, but the underlying datatype is text, you could override the
+/// auto-mapping there (to "categorical").
+/// Similarly, if you know that a column is, say, an identifier, but it's stored as a UInt32, you could override the
+/// auto-mapping as well (to "unsupported").
+fn dtype_to_stype(dtype: &DataType) -> SemanticType {
     match dtype {
-        DataType::Boolean => SemanticType::Boolean,
+        DataType::Boolean => SemanticType::Categorical,
+        DataType::Categorical(_, _) => SemanticType::Categorical,
+        DataType::Enum(_, _) => SemanticType::Categorical,
+
         DataType::String => SemanticType::Text,
-        DataType::Datetime(_, _) | DataType::Date => SemanticType::Datetime,
-        _ => SemanticType::Number, // Int*, UInt*, Float* all become Number
+
+        DataType::Datetime(_, _) => SemanticType::Datetime,
+        DataType::Date => SemanticType::Datetime,
+
+        // TODO(mrdmnd): *should* UInts get automatically turned into Numerical? Or are these likely to be identifiers?
+        DataType::UInt8 => SemanticType::Numerical,
+        DataType::UInt16 => SemanticType::Numerical,
+        DataType::UInt32 => SemanticType::Numerical,
+        DataType::UInt64 => SemanticType::Numerical,
+        DataType::Int8 => SemanticType::Numerical,
+        DataType::Int16 => SemanticType::Numerical,
+        DataType::Int32 => SemanticType::Numerical,
+        DataType::Int64 => SemanticType::Numerical,
+        DataType::Int128 => SemanticType::Numerical,
+        DataType::Float32 => SemanticType::Numerical,
+        DataType::Float64 => SemanticType::Numerical,
+        DataType::Decimal(_, _) => SemanticType::Numerical,
+        DataType::Duration(_) => SemanticType::Numerical,
+
+        // Everything else is definitely unsupported... but let's be explicit about it.
+        _ => SemanticType::Unsupported,
     }
 }
 
 // ============================================================================
-// Embedding Context - manages streaming text embedding during loading
+// Streaming stats + datetime extraction helpers
 // ============================================================================
 
-/// Context for managing embeddings during database loading.
-/// Accumulates text values and embeds them in batches for efficiency.
-struct EmbeddingContext<'a> {
-    embedder: &'a Embedder,
-    /// Pending texts to embed: (text, TextIdx)
-    pending_texts: Vec<(String, TextIdx)>,
-    /// Batch size for embedding
-    batch_size: usize,
+#[derive(Default, Clone, Copy)]
+struct RunningStats {
+    count: u64,
+    mean: f64,
+    m2: f64,
 }
 
-impl<'a> EmbeddingContext<'a> {
-    fn new(embedder: &'a Embedder) -> Self {
-        let batch_size = embedder.config.batch_size;
-        Self {
-            embedder,
-            pending_texts: Vec::with_capacity(batch_size),
-            batch_size,
+impl RunningStats {
+    fn update(&mut self, value: f64) {
+        self.count += 1;
+        let delta = value - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = value - self.mean;
+        self.m2 += delta * delta2;
+    }
+
+    fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    fn std(&self) -> f64 {
+        if self.count > 1 {
+            (self.m2 / (self.count - 1) as f64).sqrt().max(1e-8)
+        } else {
+            1.0
         }
     }
 
-    /// Intern a text value, queueing it for batch embedding.
-    fn intern_text(&mut self, db: &mut Database, text: &str) -> TextIdx {
-        if let Some(&idx) = db.text_value_lookup.get(text) {
-            return idx;
-        }
-
-        let idx = TextIdx(db.text_value_lookup.len() as u32);
-        db.text_value_lookup.insert(text.to_string(), idx);
-        // Push empty placeholder - will be filled when batch is flushed
-        db.text_value_embeddings.push(Vec::new());
-
-        self.pending_texts.push((text.to_string(), idx));
-
-        // Flush batch if full
-        if self.pending_texts.len() >= self.batch_size {
-            self.flush_text_batch(db);
-        }
-
-        idx
-    }
-
-    /// Flush any pending text embeddings
-    fn flush_text_batch(&mut self, db: &mut Database) {
-        if self.pending_texts.is_empty() {
-            return;
-        }
-
-        let texts: Vec<&str> = self.pending_texts.iter().map(|(s, _)| s.as_str()).collect();
-        let count = texts.len();
-
-        match self.embedder.embed_batch_f16(&texts) {
-            Ok(embeddings) => {
-                for ((_, idx), embedding) in self.pending_texts.drain(..).zip(embeddings) {
-                    if (idx.0 as usize) < db.text_value_embeddings.len() {
-                        db.text_value_embeddings[idx.0 as usize] = embedding;
-                    }
-                }
-                debug!("Embedded {} text values", count);
-            }
-            Err(e) => {
-                warn!("Failed to embed text batch: {}", e);
-                self.pending_texts.clear();
-            }
-        }
-    }
-
-    /// Embed a column description synchronously
-    fn embed_column_description(&self, table_name: &str, col_name: &str) -> Vec<f16> {
-        let description = format!("{} of {}", col_name, table_name);
-        self.embedder
-            .embed_one_f16(&description)
-            .expect("Failed to embed column description")
-    }
-
-    /// Finalize: flush any remaining pending texts
-    fn finalize(&mut self, db: &mut Database) {
-        self.flush_text_batch(db);
+    fn has_samples(&self) -> bool {
+        self.count > 0
     }
 }
 
-/// Parse parquet file metadata to extract relational info
-fn parse_parquet_metadata(
-    parquet_file: &PathBuf,
-    table_name: String,
-    table_type: TableType,
-) -> ParquetTableMeta {
-    let file = File::open(parquet_file).expect("Failed to open parquet file");
-    let reader = SerializedFileReader::new(file).expect("Failed to create parquet reader");
-    let metadata = reader.metadata();
-    let file_metadata = metadata.file_metadata();
+// From a polars column that is *known to be* a datetime somehow, extract the number of seconds since epoch.
+fn extract_datetime_seconds(series: &PolarsColumn, row_idx: usize) -> Option<f32> {
+    use polars::prelude::TimeUnit;
+
+    match series.dtype() {
+        DataType::Date => series
+            .cast(&DataType::Int32)
+            .ok()?
+            .i32()
+            .ok()?
+            .get(row_idx)
+            .map(|days| days as f32 * 86_400.0),
+        DataType::Datetime(time_unit, _) => series
+            .cast(&DataType::Int64)
+            .ok()?
+            .i64()
+            .ok()?
+            .get(row_idx)
+            .map(|raw| match time_unit {
+                TimeUnit::Nanoseconds => raw as f32 / 1_000_000_000.0,
+                TimeUnit::Microseconds => raw as f32 / 1_000_000.0,
+                TimeUnit::Milliseconds => raw as f32 / 1_000.0,
+            }),
+        _ => series
+            .cast(&DataType::Float64)
+            .ok()?
+            .f64()
+            .ok()?
+            .get(row_idx)
+            .map(|v| v as f32),
+    }
+}
+
+/// Parse metadata.json to extract relational info from the tables.
+fn parse_datbase_metadata(metadata_file: &PathBuf) -> ParquetTableMeta {
+    let file = File::open(metadata_file).expect("Failed to open metadata file");
+    let metadata = serde_json::from_reader(file).expect("Failed to parse metadata file");
 
     let mut primary_key = None;
     let mut foreign_keys = HashMap::new();
     let mut time_column = None;
 
-    if let Some(kv_metadata) = file_metadata.key_value_metadata() {
-        for kv in kv_metadata {
-            match kv.key.as_str() {
-                "pkey_col" => {
-                    if let Some(value) = &kv.value {
-                        primary_key = serde_json::from_str(value).ok();
-                    }
-                }
-                "fkey_col_to_pkey_table" => {
-                    if let Some(value) = &kv.value {
-                        if let Ok(fks) = serde_json::from_str::<HashMap<String, String>>(value) {
-                            foreign_keys = fks;
-                        }
-                    }
-                }
-                "time_col" => {
-                    if let Some(value) = &kv.value {
-                        time_column = serde_json::from_str(value).ok();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    ParquetTableMeta {
-        name: table_name,
-        table_type,
-        primary_key,
-        foreign_keys,
-        time_column,
-    }
+    metadata
 }
 
 /// Collect parquet files and metadata from a dataset directory.
 /// Expects structure:
-///   <data_dir>/db/*.parquet - core database tables
-///   <data_dir>/tasks/<task-name>/{train,val,test}.parquet - task tables (optional)
+///   <data_dir>/tables/*.parquet - core database tables
 /// Returns (parquet_path, table_name, table_type) for each table.
 fn collect_parquet_sources(data_dir: &PathBuf) -> Vec<(PathBuf, String, TableType)> {
     let mut sources = Vec::new();
@@ -199,47 +172,12 @@ fn collect_parquet_sources(data_dir: &PathBuf) -> Vec<(PathBuf, String, TableTyp
         sources.push((parquet_file, name, TableType::Db));
     }
 
-    // Collect task tables from data_dir/tasks/ if it exists
-    let tasks_dir = data_dir.join("tasks");
-    if tasks_dir.exists() && tasks_dir.is_dir() {
-        // Find all task subdirectories
-        let mut task_dirs: Vec<_> = std::fs::read_dir(&tasks_dir)
-            .expect("Failed to read tasks directory")
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                if entry.file_type().ok()?.is_dir() {
-                    Some(entry.path())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        task_dirs.sort();
-
-        for task_dir in task_dirs {
-            let task_name = task_dir.file_name().unwrap().to_str().unwrap().to_string();
-
-            // Look for train.parquet, val.parquet, test.parquet
-            for (split_name, table_type) in [
-                ("train", TableType::Train),
-                ("val", TableType::Val),
-                ("test", TableType::Test),
-            ] {
-                let split_path = task_dir.join(format!("{}.parquet", split_name));
-                if split_path.exists() {
-                    // Use task_name as the table name (like relational-transformer)
-                    sources.push((split_path, task_name.clone(), table_type));
-                }
-            }
-        }
-    }
-
     sources
 }
 
 /// Load all parquet files and build the unified Database.
 /// Column descriptions and text values are embedded inline using CUDA.
-fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
+fn load_database(database_dir: &PathBuf, embedder: &Embedder) -> Database {
     let mut db = Database::new();
     let mut embed_ctx = EmbeddingContext::new(embedder);
 
@@ -253,18 +191,13 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
     let mut table_key_to_idx: HashMap<(String, TableType), TableIdx> = HashMap::new();
     // Also keep a name-only map for FK lookups (FKs point to Db tables by name)
     let mut db_table_name_to_idx: HashMap<String, TableIdx> = HashMap::new();
+    // Track FK targets per column so we can resolve to target PK column later without storing on Column.
+    let mut pending_fk_targets: Vec<Option<TableIdx>> = Vec::new();
 
     for (table_idx, (parquet_file, table_name, table_type)) in parquet_sources.iter().enumerate() {
         let meta = parse_parquet_metadata(parquet_file, table_name.clone(), *table_type);
-        table_key_to_idx.insert(
-            (table_name.clone(), *table_type),
-            TableIdx(table_idx as u32),
-        );
-
-        // For Db tables, also add to the name-only lookup (for FK resolution)
-        if *table_type == TableType::Db {
-            db_table_name_to_idx.insert(table_name.clone(), TableIdx(table_idx as u32));
-        }
+        table_key_to_idx.insert((table_name.clone(), *table_type), TableIdx(table_idx));
+        db_table_name_to_idx.insert(table_name.clone(), TableIdx(table_idx));
 
         // Load the dataframe
         let file = File::open(parquet_file).expect("Failed to open parquet file");
@@ -290,11 +223,11 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
     );
 
     // Second pass: build tables and columns, embed column descriptions
-    let mut global_col_idx = 0u32;
-    let mut global_row_idx = 0u32;
+    let mut global_col_idx = 0usize;
+    let mut global_row_idx = 0usize;
 
     for (table_idx, (meta, df)) in table_metas.iter().zip(dataframes.iter()).enumerate() {
-        let table_idx = TableIdx(table_idx as u32);
+        let table_idx = TableIdx(table_idx);
 
         let col_start = ColumnIdx(global_col_idx);
         let row_start = RowIdx(global_row_idx);
@@ -303,15 +236,10 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
         let mut pk_col: Option<ColumnIdx> = None;
         let mut time_col: Option<ColumnIdx> = None;
 
-        for (local_idx, field) in df.schema().iter_fields().enumerate() {
+        for (_local_idx, field) in df.schema().iter_fields().enumerate() {
             let col_idx = ColumnIdx(global_col_idx);
             let col_name = field.name();
 
-            // Create schema string for embedding
-            let schema_str = format!("{} of {}", col_name, meta.name);
-            let schema_idx = embed_ctx.intern_text(&mut db, &schema_str);
-
-            // Embed column description inline
             let column_description_embedding =
                 Some(embed_ctx.embed_column_description(&meta.name, col_name));
 
@@ -325,38 +253,35 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
             }
 
             // Check if this is a FK - FKs always point to Db tables
-            let fk_target = meta
+            let fk_target_table = meta
                 .foreign_keys
                 .get(col_name.as_str())
                 .and_then(|target_table| db_table_name_to_idx.get(target_table).copied());
 
-            let column = Column {
+            let column = SchemaColumn {
                 name: col_name.to_string(),
                 idx: col_idx,
-                local_idx: local_idx as u32,
                 table_idx,
-                schema_idx,
-                dtype: dtype_to_semantic(field.dtype()),
+                dtype: dtype_to_stype(field.dtype()),
                 is_primary_key: is_pk,
-                fk_target_table: fk_target,
                 fk_target_column: None, // Will be resolved later
                 column_description_embedding,
-                norm_mean: None, // Will be computed by db.normalize()
-                norm_std: None,  // Will be computed by db.normalize()
+                norm_mean: None, // Will be computed during preprocessing
+                norm_std: None,  // Will be computed during preprocessing
             };
 
             db.columns.push(column);
+            pending_fk_targets.push(fk_target_table);
             global_col_idx += 1;
         }
 
         let col_end = ColumnIdx(global_col_idx);
         let num_rows = df.height() as u32;
-        let row_end = RowIdx(global_row_idx + num_rows);
+        let row_end = RowIdx(global_row_idx + num_rows); // careful with the usize + u32 here?
 
         let table = Table {
             name: meta.name.clone(),
             idx: table_idx,
-            table_type: meta.table_type,
             column_range: (col_start, col_end),
             row_range: (row_start, row_end),
             primary_key_col: pk_col,
@@ -373,164 +298,195 @@ fn load_database(data_dir: &PathBuf, embedder: &Embedder) -> Database {
     );
 
     // Resolve FK target columns (they reference the PK of the target table)
-    for col in &mut db.columns {
-        if let Some(target_table_idx) = col.fk_target_table {
+    for (col, fk_target_table) in db.columns.iter_mut().zip(pending_fk_targets.iter()) {
+        if let Some(target_table_idx) = fk_target_table {
             let target_table = &db.tables[target_table_idx.0 as usize];
             col.fk_target_column = target_table.primary_key_col;
         }
     }
 
-    // Third pass: build rows and raw cell values, discover text strings, populate pk_index
-    info!("Processing rows and discovering text values...");
-    let mut text_columns_count = 0usize;
+    // Third pass: gather statistics and build PK index without storing raw cells
+    info!("Computing column statistics and primary keys...");
+    let mut col_stats: Vec<RunningStats> = vec![RunningStats::default(); db.columns.len()];
+    let mut datetime_stats = RunningStats::default();
+
+    for (table_num, df) in dataframes.iter().enumerate() {
+        let table_idx = TableIdx(table_num);
+        let row_start = db.tables[table_num].row_range.0.0;
+        let col_start = db.tables[table_num].column_range.0.0;
+
+        for row_num in 0..df.height() {
+            let row_idx = RowIdx(row_start + row_num); // careful with the usize + usize here?
+
+            for col_offset in 0..df.width() {
+                let series = df
+                    .select_at_idx(col_offset)
+                    .expect("column index out of bounds");
+                let col_idx = ColumnIdx(col_start + col_offset); // careful with the usize + usize here?
+                let column = &db.columns[col_idx.0];
+
+                match column.dtype {
+                    SemanticType::Text => {}
+                    SemanticType::Number => {
+                        let val = series.cast(&DataType::Float64).unwrap();
+                        if let Some(v) = val.f64().unwrap().get(row_num) {
+                            col_stats[col_idx.0 as usize].update(v);
+                            if column.is_primary_key {
+                                db.pk_index.insert((table_idx, v as i64), row_idx);
+                            }
+                        }
+                    }
+                    SemanticType::Boolean => {
+                        if let Some(v) = series.bool().unwrap().get(row_num) {
+                            let fv = if v { 1.0 } else { 0.0 };
+                            col_stats[col_idx.0 as usize].update(fv);
+                        }
+                    }
+                    SemanticType::Datetime => {
+                        if let Some(ts) = extract_datetime_seconds(series, row_num) {
+                            datetime_stats.update(ts as f64);
+                            db.update_timestamp_range(ts);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Store normalization parameters
+    db.datetime_norm_mean = datetime_stats
+        .has_samples()
+        .then(|| datetime_stats.mean() as f32);
+    db.datetime_norm_std = datetime_stats
+        .has_samples()
+        .then(|| datetime_stats.std() as f32);
+
+    for (col_idx, col) in db.columns.iter_mut().enumerate() {
+        match col.dtype {
+            SemanticType::Number | SemanticType::Boolean => {
+                col.norm_mean = Some(col_stats[col_idx].mean() as f32);
+                col.norm_std = Some(col_stats[col_idx].std() as f32);
+            }
+            _ => {
+                col.norm_mean = None;
+                col.norm_std = None;
+            }
+        }
+    }
+
+    // Fourth pass: build rows with normalized values and FK edges (no raw storage)
+    info!("Building rows with normalized values and foreign keys...");
+    db.rows.reserve(global_row_idx as usize);
+    db.fk_edges.clear();
+    let mut text_cell_count = 0usize;
+
+    let datetime_mean = db.datetime_norm_mean.unwrap_or(0.0);
+    let datetime_std = db.datetime_norm_std.unwrap_or(1.0).max(1e-8);
 
     for (table_num, df) in dataframes.iter().enumerate() {
         let table_idx = TableIdx(table_num as u32);
-        // Copy values out to avoid borrow issues
         let row_start = db.tables[table_num].row_range.0.0;
         let col_start = db.tables[table_num].column_range.0.0;
-        let table_type = db.tables[table_num].table_type;
-        let is_task_row = table_type != TableType::Db;
+        let time_col_local_idx = db.tables[table_num]
+            .time_col
+            .map(|tc| (tc.0 - col_start) as usize);
 
         for row_num in 0..df.height() {
             let row_idx = RowIdx(row_start + row_num as u32);
 
-            let mut raw_cells = Vec::with_capacity(df.width());
+            let mut normalized_cells = Vec::with_capacity(df.width());
+            let mut raw_timestamp: Option<f32> = None;
 
-            for (col_offset, series) in df.get_columns().iter().enumerate() {
+            for col_offset in 0..df.width() {
+                let series = df
+                    .select_at_idx(col_offset)
+                    .expect("column index out of bounds");
                 let col_idx = ColumnIdx(col_start + col_offset as u32);
-                // Copy column info we need
-                let dtype = db.columns[col_idx.0 as usize].dtype;
-                let is_pk = db.columns[col_idx.0 as usize].is_primary_key;
+                let column_dtype = db.columns[col_idx.0 as usize].dtype;
+                let fk_target_column = db.columns[col_idx.0 as usize].fk_target_column;
+                let column_mean = db.columns[col_idx.0 as usize].norm_mean;
+                let column_std = db.columns[col_idx.0 as usize].norm_std;
+                let mut fk_value: Option<i64> = None;
 
-                let cell = match dtype {
-                    SemanticType::Text => {
-                        // Discover text string and embed it, store raw string
-                        match series.str().unwrap().get(row_num) {
-                            Some(s) => {
-                                text_columns_count += 1;
-                                // Intern for embedding, but store the raw string
-                                embed_ctx.intern_text(&mut db, s);
-                                RawCellValue::Text(s.to_string())
-                            }
-                            None => RawCellValue::Null,
+                let normalized = match column_dtype {
+                    SemanticType::Text => match series.str().unwrap().get(row_num) {
+                        Some(s) => {
+                            text_cell_count += 1;
+                            let idx = embed_ctx.intern_text(&mut db, s);
+                            NormalizedCellValue::Text(idx)
                         }
-                    }
+                        None => NormalizedCellValue::Null,
+                    },
                     SemanticType::Number => {
                         let val = series.cast(&DataType::Float64).unwrap();
                         match val.f64().unwrap().get(row_num) {
-                            Some(v) => RawCellValue::Number(v as f32),
-                            None => RawCellValue::Null,
+                            Some(v) => {
+                                fk_value = Some(v as i64);
+                                let mean = column_mean.unwrap_or(0.0);
+                                let std = column_std.unwrap_or(1.0).max(1e-8);
+                                NormalizedCellValue::Scalar(((v as f32) - mean) / std)
+                            }
+                            None => NormalizedCellValue::Null,
                         }
                     }
-                    SemanticType::Datetime => {
-                        // Handle both Date (days since epoch) and Datetime (various TimeUnits)
-                        use polars::prelude::TimeUnit;
-                        let ts_seconds: Option<f64> = match series.dtype() {
-                            DataType::Date => {
-                                // Date is stored as i32 days since epoch
-                                let casted = series.cast(&DataType::Int32).unwrap();
-                                casted
-                                    .i32()
-                                    .unwrap()
-                                    .get(row_num)
-                                    .map(|days| days as f64 * 86400.0) // days -> seconds
+                    SemanticType::Datetime => match extract_datetime_seconds(series, row_num) {
+                        Some(ts) => {
+                            if Some(col_offset) == time_col_local_idx {
+                                raw_timestamp = Some(ts);
                             }
-                            DataType::Datetime(time_unit, _) => {
-                                // Datetime is stored as i64 in the specified TimeUnit
-                                let casted = series.cast(&DataType::Int64).unwrap();
-                                casted
-                                    .i64()
-                                    .unwrap()
-                                    .get(row_num)
-                                    .map(|raw| match time_unit {
-                                        TimeUnit::Nanoseconds => raw as f64 / 1_000_000_000.0,
-                                        TimeUnit::Microseconds => raw as f64 / 1_000_000.0,
-                                        TimeUnit::Milliseconds => raw as f64 / 1_000.0,
-                                    })
-                            }
-                            _ => {
-                                // Fallback: treat as already in reasonable units
-                                let casted = series.cast(&DataType::Float64).unwrap();
-                                casted.f64().unwrap().get(row_num)
-                            }
-                        };
-                        match ts_seconds {
-                            Some(ts) => {
-                                let ts = ts as f32;
-                                db.update_timestamp_range(ts);
-                                RawCellValue::Datetime(ts)
-                            }
-                            None => RawCellValue::Null,
+                            NormalizedCellValue::Scalar((ts - datetime_mean) / datetime_std)
                         }
-                    }
+                        None => NormalizedCellValue::Null,
+                    },
                     SemanticType::Boolean => match series.bool().unwrap().get(row_num) {
-                        Some(v) => RawCellValue::Boolean(v),
-                        None => RawCellValue::Null,
+                        Some(v) => {
+                            let val = if v { 1.0 } else { 0.0 };
+                            let mean = column_mean.unwrap_or(0.0);
+                            let std = column_std.unwrap_or(1.0).max(1e-8);
+                            NormalizedCellValue::Scalar((val - mean) / std)
+                        }
+                        None => NormalizedCellValue::Null,
                     },
                 };
 
-                // Build PK index
-                if is_pk {
-                    if let RawCellValue::Number(v) = cell {
-                        db.pk_index.insert((table_idx, v as i64), row_idx);
+                if let Some(target_column_idx) = fk_target_column {
+                    if let Some(fk_num) = fk_value {
+                        let target_table_idx = db.columns[target_column_idx.0 as usize].table_idx;
+                        if let Some(&target_row_idx) = db.pk_index.get(&(target_table_idx, fk_num))
+                        {
+                            let edge = ForeignKeyEdge {
+                                from_row: row_idx,
+                                from_col: col_idx,
+                                to_row: target_row_idx,
+                            };
+                            db.fk_edges.push(edge);
+                        }
                     }
                 }
 
-                raw_cells.push(cell);
+                normalized_cells.push(normalized);
             }
 
             db.rows.push(Row {
                 idx: row_idx,
                 table_idx,
-                is_task_row,
-                raw: raw_cells,
-                normalized: Vec::new(), // Will be populated by db.normalize()
+                raw_timestamp,
+                normalized: normalized_cells,
             });
         }
     }
+
+    // Build adjacency lists from collected edges
+    db.rebuild_adjacency();
 
     // Flush any remaining pending text embeddings
     embed_ctx.finalize(&mut db);
 
     info!(
         "Discovered {} text cells, {} unique text values",
-        text_columns_count,
+        text_cell_count,
         db.vocab_size()
     );
-
-    // Initialize edge adjacency lists
-    db.edges_from = vec![Vec::new(); db.rows.len()];
-    db.edges_to = vec![Vec::new(); db.rows.len()];
-
-    // Fourth pass: build FK edges
-    for row in &db.rows {
-        let table = &db.tables[row.table_idx.0 as usize];
-
-        for (local_col, cell) in row.raw.iter().enumerate() {
-            let col_idx = ColumnIdx(table.column_range.0.0 + local_col as u32);
-            let column = &db.columns[col_idx.0 as usize];
-
-            if let Some(target_table_idx) = column.fk_target_table {
-                // This is a FK column - look up the target row
-                if let RawCellValue::Number(fk_value) = cell {
-                    let key = (target_table_idx, *fk_value as i64);
-                    if let Some(&target_row_idx) = db.pk_index.get(&key) {
-                        let edge = ForeignKeyEdge {
-                            from_row: row.idx,
-                            from_col: col_idx,
-                            to_row: target_row_idx,
-                        };
-                        let edge_idx = db.fk_edges.len();
-                        db.fk_edges.push(edge);
-
-                        db.edges_from[row.idx.0 as usize].push(edge_idx);
-                        db.edges_to[target_row_idx.0 as usize].push(edge_idx);
-                    }
-                }
-            }
-        }
-    }
 
     db
 }
@@ -566,24 +522,14 @@ fn main() {
     let args = Args::parse();
 
     // Initialize CUDA embedder
-    info!("Initializing CUDA embedder...");
-    let embedder =
-        Embedder::new(EmbedderConfig::default()).expect("Failed to initialize CUDA embedder");
+    info!("Initializing embedder...");
+    let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to initialize embedder");
     info!("Embedder initialized successfully");
 
     // Load database with inline embedding
     info!("Loading database from: {:?}", args.data_dir);
     info!("  DB tables from: {:?}", args.data_dir.join("db"));
-    let tasks_dir = args.data_dir.join("tasks");
-    if tasks_dir.exists() {
-        info!("  Task tables from: {:?}", tasks_dir);
-    }
-    let mut db = load_database(&args.data_dir, &embedder);
-
-    // Normalize all cell values (z-score for numbers/booleans/datetimes, TextIdx for text)
-    info!("Normalizing cell values...");
-    db.normalize();
-    info!("Normalization complete");
+    let db = load_database(&args.data_dir, &embedder);
 
     // Save database to .rkyv file in current working directory
     let output_name = args
@@ -651,8 +597,11 @@ fn main() {
     info!("Columns:");
     for col in &db.columns {
         let fk_info = col
-            .fk_target_table
-            .map(|t| format!(" -> {}", db.table_name(t)))
+            .fk_target_column
+            .map(|c| {
+                let target_table = db.get_column(c).table_idx;
+                format!(" -> {}", db.table_name(target_table))
+            })
             .unwrap_or_default();
 
         info!(
