@@ -320,15 +320,11 @@ class Batch:
 
         # KV is in Q's foreign-to-primary (parent) neighborhood
         # (b, s, s, max_f2p) -> (b, s, s)
-        kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(
-            dim=-1
-        )
+        kv_in_f2p: Bool[Tensor, "b s s"] = (node_indices[:, None, :, None] == f2p_neighbor_indices[:, :, None, :]).any(dim=-1)
 
         # Q is in KV's primary-to-foreign (child) neighborhood
         # (b, s, s, max_f2p) -> (b, s, s)
-        q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(
-            dim=-1
-        )
+        q_in_p2f: Bool[Tensor, "b s s"] = (node_indices[:, :, None, None] == f2p_neighbor_indices[:, None, :, :]).any(dim=-1)
 
         # Same column AND same table
         same_column = column_name_indices[:, :, None] == column_name_indices[:, None, :]
@@ -397,9 +393,7 @@ class RelationalTransformer(nn.Module):
         self.mask_embeddings = nn.Parameter(torch.randn(4, config.d_model))
 
         # Transformer Blocks
-        self.blocks = nn.ModuleList([
-            RelationalBlock(config.d_model, config.num_heads, config.d_ff) for _ in range(config.num_blocks)
-        ])
+        self.blocks = nn.ModuleList([RelationalBlock(config.d_model, config.num_heads, config.d_ff) for _ in range(config.num_blocks)])
 
         # Output Norm
         self.out_norm = nn.RMSNorm(config.d_model)
@@ -457,9 +451,7 @@ class RelationalTransformer(nn.Module):
 
             # Input to the model starts as the column name embedding, plus the encoded
             # values, plus the embeddings for whatever is masked.
-            x: Float[Tensor, "b s d"] = (
-                self.column_name_norm(self.column_name_encoder(column_name_values)) * (~is_padding)[..., None]
-            )
+            x: Float[Tensor, "b s d"] = self.column_name_norm(self.column_name_encoder(column_name_values)) * (~is_padding)[..., None]
             x = x + encoded * visible + mask_embedded * hidden
 
         # =======================================================
@@ -510,9 +502,7 @@ class RelationalTransformer(nn.Module):
 
         with torch.autograd.profiler.record_function("loss_computation"):
             # Compute per-position losses (before masking)
-            loss_numerical: Float[Tensor, "b s"] = F.huber_loss(
-                yhat_numerical, numerical_values, reduction="none"
-            ).mean(-1)
+            loss_numerical: Float[Tensor, "b s"] = F.huber_loss(yhat_numerical, numerical_values, reduction="none").mean(-1)
 
             # Categorical loss: cosine embedding loss in the PROJECTED space.
             # We compare predicted embedding to the PROJECTED target (not raw).
@@ -528,17 +518,11 @@ class RelationalTransformer(nn.Module):
             # Timestamp loss: Huber on z-scored epoch seconds (last component of input).
             # Input uses full 12-d for cyclical awareness; output predicts epoch only.
             timestamp_epoch_target: Float[Tensor, "b s 1"] = timestamp_values[..., -1:]
-            loss_timestamp: Float[Tensor, "b s"] = F.huber_loss(
-                yhat_timestamp, timestamp_epoch_target, reduction="none"
-            ).mean(-1)
+            loss_timestamp: Float[Tensor, "b s"] = F.huber_loss(yhat_timestamp, timestamp_epoch_target, reduction="none").mean(-1)
 
             # Select the right loss per position based on semantic type
             # (numerical, categorical, timestamp are per-position; text handled separately)
-            combined_loss: Float[Tensor, "b s"] = (
-                loss_numerical * is_numerical
-                + loss_categorical * is_categorical
-                + loss_timestamp * is_timestamp
-            )
+            combined_loss: Float[Tensor, "b s"] = loss_numerical * is_numerical + loss_categorical * is_categorical + loss_timestamp * is_timestamp
 
             # Compute masked loss for numerical, categorical, and timestamp
             num_cat_time_mask = masks & (is_numerical | is_categorical | is_timestamp)
@@ -563,9 +547,7 @@ class RelationalTransformer(nn.Module):
 
                 # Compute similarity matrix: (N, d) @ (d, N) -> (N, N)
                 # Each row i contains similarities between prediction i and all targets
-                logits: Float[Tensor, "n n"] = (
-                    pred_norm @ target_norm.T / self.text_contrastive_temperature
-                )
+                logits: Float[Tensor, "n n"] = pred_norm @ target_norm.T / self.text_contrastive_temperature
 
                 # Labels: diagonal (prediction i should match target i)
                 labels = torch.arange(num_text_targets, device=logits.device)

@@ -22,6 +22,7 @@ from torch import nn, optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from wandb.sdk.wandb_run import Run as WandbRun
 
 import wandb
 from dbtransformer.configurations import (
@@ -38,7 +39,6 @@ from dbtransformer.profiling import (
     get_profiler_context,
 )
 from dbtransformer.sampler_dataset import SamplerBatchDataset
-from wandb.sdk.wandb_run import Run as WandbRun
 
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available. This script requires CUDA.")

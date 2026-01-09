@@ -5,7 +5,6 @@ import torch
 from torch.utils.data import Dataset
 
 import tributary
-
 from dbtransformer.configurations import DDPParameters, ModelConfig, TrainingConfig
 from dbtransformer.model import Batch
 
@@ -63,9 +62,7 @@ class SamplerBatchDataset(Dataset[Batch]):
         datetime_values = to_tensor("datetime_values", torch.float32, (self.batch_size, self.seq_len, 1))
         boolean_values = to_tensor("boolean_values", torch.float32, (self.batch_size, self.seq_len, 1))
         text_values = to_tensor("text_values", torch.float32, (self.batch_size, self.seq_len, self.d_text))
-        column_name_values = to_tensor(
-            "column_name_values", torch.float32, (self.batch_size, self.seq_len, self.d_text)
-        )
+        column_name_values = to_tensor("column_name_values", torch.float32, (self.batch_size, self.seq_len, self.d_text))
         semantic_types = to_tensor("semantic_types", torch.long, (self.batch_size, self.seq_len))
         masks = to_tensor("masks", torch.bool, (self.batch_size, self.seq_len))
         is_task_node = to_tensor("is_task_node", torch.bool, (self.batch_size, self.seq_len))

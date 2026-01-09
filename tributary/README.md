@@ -39,7 +39,7 @@ There should be one parquet file for each table in the database, and a metadata.
     "rating": {
         "primary_key_column": "id",
         "foreign_key_column_to_primary_key_table": {
-            "user_id": "user", 
+            "user_id": "user",
             "movie_id": "movie"
         },
         "time_column": "rated_at",
