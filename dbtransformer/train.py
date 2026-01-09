@@ -20,19 +20,13 @@ import torch.distributed as dist
 from loguru import logger
 from torch import nn, optim
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import wandb
 from dbtransformer.configurations import (
-    DEFAULT_OVERALL_CONFIG,
     DDPParameters,
-    ModelConfig,
     OverallConfig,
-    ProfilingConfig,
-    SamplerDataConfig,
-    TrainingConfig,
-    WandbConfig,
 )
 from dbtransformer.model import (
     Batch,
@@ -43,14 +37,14 @@ from dbtransformer.model import (
 from dbtransformer.profiling import (
     get_profiler_context,
 )
-from dbtransformer.sampler_dataset import SamplerBatchDataset, SamplerNotBuiltError
+from dbtransformer.sampler_dataset import SamplerBatchDataset
+from wandb.sdk.wandb_run import Run as WandbRun
 
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available. This script requires CUDA.")
 
 
 def seed_everything(seed: int = 42) -> None:
-    """Set seeds for reproducibility across all random sources."""
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)  # noqa: NPY002
@@ -60,11 +54,6 @@ def seed_everything(seed: int = 42) -> None:
 
 
 def ddp_setup(backend: Literal["gloo", "nccl"]) -> DDPParameters:
-    """
-    Initialize distributed training.
-
-    Handles multi-node (in theory?) and single-node multi-gpu training.
-    """
     local_rank: int = int(os.environ["LOCAL_RANK"])
     global_rank: int = int(os.environ["RANK"])
     device: torch.device = torch.device(f"cuda:{local_rank}")
@@ -83,18 +72,11 @@ def ddp_setup(backend: Literal["gloo", "nccl"]) -> DDPParameters:
 
 
 def ddp_cleanup() -> None:
-    """
-    Clean up distributed training.
-    """
     logger.warning("Cleaning up DDP process group.")
     dist.destroy_process_group()
 
 
 class Trainer:
-    """
-    Handles distributed training with checkpointing support.
-    """
-
     def __init__(
         self,
         config: OverallConfig,
@@ -108,7 +90,7 @@ class Trainer:
 
         self.batches_run = 0
         self.current_epoch = 0  # For sampler shuffling
-        self.wandb_run: wandb.sdk.wandb_run.Run | None = None
+        self.wandb_run: WandbRun | None = None
 
         self.model: nn.Module = RelationalTransformer(config.model)
         self.model.to(
@@ -121,51 +103,15 @@ class Trainer:
             logger.info(f"Model: {num_params:,} params (~{num_params / 1e6:.1f}M)")
 
         # Rust sampler dataset yields full Batch objects (no collation needed).
-        try:
-            self.dataset = SamplerBatchDataset(
-                config.data,
-                config.model,
-                config.training,
-                self.ddp_parameters,
-            )
-        except SamplerNotBuiltError as exc:
-            logger.error(str(exc))
-            raise
+        self.dataset = SamplerBatchDataset(
+            config.data,
+            config.model,
+            config.training,
+            self.ddp_parameters,
+        )
 
-        # Optional eval dataset (same sampler backend, typically different db configs)
-        self.eval_dataloader: DataLoader[Batch] | None = None
-        if config.data.eval_db_configs:
-            try:
-                eval_data_cfg = SamplerDataConfig(
-                    db_configs=config.data.eval_db_configs,
-                    eval_db_configs=[],
-                    max_bfs_width=config.data.max_bfs_width,
-                    seed=config.data.seed,
-                )
-                self.eval_dataset = SamplerBatchDataset(
-                    eval_data_cfg,
-                    config.model,
-                    config.training,
-                    self.ddp_parameters,
-                    db_configs_override=config.data.eval_db_configs,
-                )
-                self.eval_dataloader = DataLoader(
-                    self.eval_dataset,
-                    batch_size=None,
-                    num_workers=config.training.num_workers,
-                    pin_memory=True,
-                    sampler=None,
-                    shuffle=False,
-                    collate_fn=None,
-                    persistent_workers=config.training.num_workers > 0,
-                    prefetch_factor=2 if config.training.num_workers > 0 else None,
-                )
-            except SamplerNotBuiltError as exc:
-                logger.error(f"Failed to build eval sampler: {exc}")
-                raise
-
-        # Rust sampler already partitions by rank/world_size internally.
-        self.dist_sampler = None
+        # Rust sampler already partitions by rank/world_size internally so we DO NOT
+        # need to wrap it with a DistributedSampler.
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=None,
@@ -193,10 +139,7 @@ class Trainer:
         )
         if self.is_leader:
             logger.info("Wrapping model with DDP")
-        self.model = DistributedDataParallel(
-            self.model,
-            device_ids=[self.ddp_parameters.local_rank],
-        )
+        self.model = DistributedDataParallel(self.model, device_ids=[self.ddp_parameters.local_rank])
 
         # Compile model unless profiling (record_function annotations inside
         # the compiled forward pass get eliminated, so we skip compile for

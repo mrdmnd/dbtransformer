@@ -4,3 +4,6 @@ build-backend = "maturin"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+
+
+## You want to do "uv install maturin" and then "maturin init --bindings pyo3" and "maturin develop" to get this working.

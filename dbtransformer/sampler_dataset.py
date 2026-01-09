@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from batcher import Sampler
+import tributary
 
 from dbtransformer.configurations import DDPParameters, ModelConfig, TrainingConfig
 from dbtransformer.model import Batch
@@ -31,7 +31,7 @@ class SamplerBatchDataset(Dataset[Batch]):
         self.seq_len = training_config.seq_len
         self.d_text = model_config.d_text
 
-        self._sampler = batcher.Sampler(
+        self._sampler = tributary.Sampler(
             db_configs=db_configs,
             batch_size=self.batch_size,
             seq_len=self.seq_len,

@@ -95,11 +95,10 @@ dmypy.json
 logs/
 
 # Ignore local data
-data/
+databases_raw/
+databases_preprocessed/
 wandb/
 snapshot.pt
 profiler_logs/
-batcher/sample_data_f1/
-batcher/sample_data_f1.rkyv
 
 .DS_Store

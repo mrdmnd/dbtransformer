@@ -25,13 +25,29 @@ class DDPParameters:
 
 @dataclass
 class ModelConfig:
+    """Model architecture hyperparameters.
+
+    The model uses text embeddings for categoricals (pre-embedded as
+    "<col_name> is <value>"), so no vocabulary size parameter is needed.
+    This enables zero-shot transfer to new databases/categories.
+    """
+
     model_dtype: torch.dtype = torch.bfloat16
     num_blocks: int = 12
     num_heads: int = 8
     d_model: int = 256
     d_text: int = 384
     d_ff: int = 4 * d_model
+    # Timestamp feature dimension: 5 cyclical components (sin/cos each) + 1 linear = 11
+    # Cyclical: minute_of_hour, hour_of_day, day_of_week, day_of_year, month
+    # Linear: epoch_seconds (z-scored, also used as prediction target)
+    d_time: int = 11
     compile_model: bool = True
+
+    # Temperature for text contrastive loss (InfoNCE).
+    # Lower = sharper distinctions, higher = softer.
+    # 0.07 is common in CLIP-style models.
+    text_contrastive_temperature: float = 0.07
 
 
 @dataclass

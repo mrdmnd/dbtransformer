@@ -1,13 +1,13 @@
 [package]
-name = "batcher"
+name = "tributary"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 # Candle ML framework - using git for CUDA 13.0 support
-candle-core = { git = "https://github.com/huggingface/candle.git", features = ["cuda"] }
-candle-nn = { git = "https://github.com/huggingface/candle.git", features = ["cuda"] }
-candle-transformers = { git = "https://github.com/huggingface/candle.git", features = ["cuda"] }
+candle-core = { git = "https://github.com/huggingface/candle.git" }
+candle-nn = { git = "https://github.com/huggingface/candle.git" }
+candle-transformers = { git = "https://github.com/huggingface/candle.git" }
 
 chrono = "0.4"
 fixedbitset = "0.5"
@@ -38,11 +38,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wide = "0.7"  # Portable SIMD
 
 [features]
-default = ["cuda"]
-cuda = []
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 
 [lib]
-name = "batcher"
+name = "tributary"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]

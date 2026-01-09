@@ -81,7 +81,7 @@ rm -rf profiler_log_dump && scp -i ~/.ssh/primeintellect_ed25519 -P 42069 -r roo
 
 
 ## Rust Stuff
-batcher preprocessing: take some directory which looks like
+tributary preprocessing: take some directory which looks like
 
 ```
 sample_data_f1
@@ -99,7 +99,7 @@ sample_data_f1
 
 then run
 
-mrdmnd@khadgar:~/dbtransformer/batcher$ cargo run --release --bin preprocessor -- --data-dir=sample_data_f1 --verbose
+mrdmnd@khadgar:~/dbtransformer/tributary$ cargo run --release --bin preprocessor -- --data-dir=sample_data_f1 --verbose
 
 Then, you can sample from it
 

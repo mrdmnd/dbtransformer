@@ -19,25 +19,25 @@ use thiserror::Error;
 use tokenizers::Tokenizer;
 use tracing::{debug, error, info, warn};
 
-use crate::{ColumnIdx, Database, TextIdx};
+use crate::{ColumnIdx, Database, EmbeddingIdx};
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-/// Default embedding model - BGE is a high-quality embedding model
+/// Default embedding model - BGE is a reasonably high-quality off-the-shelf embedding model
 pub const DEFAULT_EMBEDDING_REPO: &str = "BAAI/bge-base-en-v1.5";
 
 /// Default embedding dimension for bge-base-en-v1.5
 pub const EMBEDDING_DIM: usize = 768;
 
-/// Default batch size for embedding operations (optimized for high-end GPUs)
+/// Default batch size for embedding operations
 pub const DEFAULT_BATCH_SIZE: usize = 256;
 
 /// Default work queue capacity
 pub const DEFAULT_QUEUE_CAPACITY: usize = 10_000;
 
-/// Max sequence length for BERT-based models
+/// Max sequence length
 pub const MAX_SEQ_LEN: usize = 512;
 
 // ============================================================================
@@ -74,7 +74,7 @@ pub type Result<T> = std::result::Result<T, EmbedderError>;
 // Embedder Configuration
 // ============================================================================
 
-/// Configuration for the CUDA embedder
+/// Configuration for the embedder
 #[derive(Debug, Clone)]
 pub struct EmbedderConfig {
     /// Model repository on HuggingFace
@@ -134,8 +134,8 @@ impl EmbedderConfig {
 /// Item in the embedding work queue
 #[derive(Debug)]
 pub enum WorkItem {
-    /// Embed a text value and store at the given TextIdx
-    TextValue { text: String, idx: TextIdx },
+    /// Embed a text value and store at the given EmbeddingIdx
+    TextValue { text: String, idx: EmbeddingIdx },
     /// Embed a column description and store on the column
     ColumnDescription { text: String, col_idx: ColumnIdx },
     /// Shutdown signal
@@ -480,7 +480,7 @@ impl Embedder {
         database: Arc<Mutex<Database>>,
         batch_size: usize,
     ) {
-        let mut text_batch: Vec<(String, TextIdx)> = Vec::with_capacity(batch_size);
+        let mut text_batch: Vec<(String, EmbeddingIdx)> = Vec::with_capacity(batch_size);
         let mut col_batch: Vec<(String, ColumnIdx)> = Vec::with_capacity(batch_size);
 
         loop {
@@ -557,7 +557,7 @@ impl Embedder {
     fn process_text_batch(
         inner: &Arc<RwLock<Option<EmbeddingModel>>>,
         database: &Arc<Mutex<Database>>,
-        batch: &mut Vec<(String, TextIdx)>,
+        batch: &mut Vec<(String, EmbeddingIdx)>,
     ) {
         if batch.is_empty() {
             return;
@@ -574,8 +574,8 @@ impl Embedder {
                     for ((_, idx), embedding) in batch.drain(..).zip(embeddings) {
                         let f16_embedding: Vec<f16> =
                             embedding.into_iter().map(f16::from_f32).collect();
-                        if (idx.0 as usize) < db.text_value_embeddings.len() {
-                            db.text_value_embeddings[idx.0 as usize] = f16_embedding;
+                        if idx.0 < db.text_embeddings.len() {
+                            db.text_embeddings[idx.0] = f16_embedding;
                         }
                     }
                     debug!("Processed {} text embeddings", batch_len);
@@ -611,9 +611,8 @@ impl Embedder {
                     for ((_, col_idx), embedding) in batch.drain(..).zip(embeddings) {
                         let f16_embedding: Vec<f16> =
                             embedding.into_iter().map(f16::from_f32).collect();
-                        if (col_idx.0 as usize) < db.columns.len() {
-                            db.columns[col_idx.0 as usize].column_description_embedding =
-                                Some(f16_embedding);
+                        if col_idx.0 < db.columns.len() {
+                            db.columns[col_idx.0].description_embedding = f16_embedding;
                         }
                     }
                     debug!("Processed {} column embeddings", batch_len);
@@ -629,7 +628,7 @@ impl Embedder {
     }
 
     /// Submit a text value for background embedding
-    pub fn submit_text(&self, text: String, idx: TextIdx) -> Result<()> {
+    pub fn submit_text(&self, text: String, idx: EmbeddingIdx) -> Result<()> {
         if let Some(ref tx) = self.work_tx {
             tx.send(WorkItem::TextValue { text, idx })
                 .map_err(|e| EmbedderError::QueueError(e.to_string()))
@@ -699,7 +698,7 @@ pub fn embed_all_column_descriptions(embedder: &Embedder, db: &mut Database) -> 
 
     // Store embeddings on columns
     for (col, embedding) in db.columns.iter_mut().zip(embeddings) {
-        col.column_description_embedding = Some(embedding);
+        col.description_embedding = embedding;
     }
 
     info!("Embedded {} column descriptions", db.columns.len());
@@ -719,8 +718,8 @@ pub fn placeholder_embedding(dim: usize) -> Vec<f16> {
 /// Accumulates text values and embeds them in batches for efficiency.
 struct EmbeddingContext<'a> {
     embedder: &'a Embedder,
-    /// Pending texts to embed: (text, TextIdx)
-    pending_texts: Vec<(String, TextIdx)>,
+    /// Pending texts to embed: (text, EmbeddingIdx)
+    pending_texts: Vec<(String, EmbeddingIdx)>,
     /// Batch size for embedding
     batch_size: usize,
 }
@@ -736,15 +735,15 @@ impl<'a> EmbeddingContext<'a> {
     }
 
     /// Intern a text value, queueing it for batch embedding.
-    fn intern_text(&mut self, db: &mut Database, text: &str) -> TextIdx {
-        if let Some(&idx) = db.text_value_lookup.get(text) {
+    fn intern_text(&mut self, db: &mut Database, text: &str) -> EmbeddingIdx {
+        if let Some(&idx) = db.text_lookup.get(text) {
             return idx;
         }
 
-        let idx = TextIdx(db.text_value_lookup.len());
-        db.text_value_lookup.insert(text.to_string(), idx);
+        let idx = EmbeddingIdx(db.text_lookup.len());
+        db.text_lookup.insert(text.to_string(), idx);
         // Push empty placeholder - will be filled when batch is flushed
-        db.text_value_embeddings.push(Vec::new());
+        db.text_embeddings.push(Vec::new());
 
         self.pending_texts.push((text.to_string(), idx));
 
@@ -768,8 +767,8 @@ impl<'a> EmbeddingContext<'a> {
         match self.embedder.embed_batch_f16(&texts) {
             Ok(embeddings) => {
                 for ((_, idx), embedding) in self.pending_texts.drain(..).zip(embeddings) {
-                    if (idx.0 as usize) < db.text_value_embeddings.len() {
-                        db.text_value_embeddings[idx.0 as usize] = embedding;
+                    if idx.0 < db.text_embeddings.len() {
+                        db.text_embeddings[idx.0] = embedding;
                     }
                 }
                 debug!("Embedded {} text values", count);

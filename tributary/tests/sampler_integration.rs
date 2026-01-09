@@ -3,7 +3,7 @@
 //! This test loads the sample F1 database and generates a batch to verify
 //! the full pipeline works end-to-end.
 
-use batcher::{Database, TableIdx};
+use tributary::{Database, TableIdx};
 use std::path::Path;
 use std::time::Instant;
 
@@ -69,7 +69,7 @@ fn find_task_table(db: &Database, min_rows: u32) -> Option<(TableIdx, u32, u32)>
             // Find a numeric column to use as target
             for col_idx in table.column_range.0.0..table.column_range.1.0 {
                 let col = &db.columns[col_idx as usize];
-                if matches!(col.dtype, batcher::SemanticType::Number)
+                if matches!(col.dtype, tributary::SemanticType::Number)
                     && !col.is_primary_key
                     && col.fk_target_column.is_none()
                 {
@@ -104,7 +104,7 @@ fn test_sampler_batch_generation() {
         .expect("No suitable task table found with enough rows");
 
     let table = db.get_table(task_table);
-    let col = db.get_column(batcher::ColumnIdx(target_col));
+    let col = db.get_column(tributary::ColumnIdx(target_col));
     println!(
         "\n=== Test Configuration ===\n\
          Task table: {} (idx {})\n\
