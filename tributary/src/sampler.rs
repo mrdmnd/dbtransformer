@@ -1,18 +1,70 @@
-// Batch sampler for relational data.
-// Performs BFS traversal of the FK graph starting from seed rows,
-// producing flat vectors that get reshaped in Python for the model.
+//! Batch sampler for relational data.
+//!
+//! Performs BFS traversal of the FK graph starting from seed rows,
+//! producing flat vectors that get reshaped in Python for the model.
+//!
+//! Key design decisions:
+//! - Single database per sampler (load multiple samplers for multi-DB training)
+//! - Configurable masking strategies (random, balanced, targeted)
+//! - Pre-computed attention masks on CPU to offload work from GPU
+//! - Thread-local buffers to avoid allocations in hot path
 
-use crate::types::{ColumnIdx, Database, NormalizedCellValue, RowIdx, SemanticType, TableIdx};
+use std::cell::RefCell;
+use std::path::Path;
+
 use fixedbitset::FixedBitSet;
 use half::f16;
 use numpy::PyArray1;
-use pyo3::exceptions::{PyIOError, PyKeyError};
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
-use pyo3::{IntoPyObjectExt, Py, PyAny};
 use rand::prelude::*;
 use rayon::prelude::*;
-use std::cell::RefCell;
-use std::path::Path;
+
+use crate::types::{ColumnIdx, Database, EmbeddingIdx, RowIdx, SemanticType};
+use crate::utility::{TIMESTAMP_DIM, expand_timestamp};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum number of foreign-to-primary neighbors tracked per cell.
+/// Used for computing feature attention masks.
+const MAX_F2P_NEIGHBORS: usize = 5;
+
+/// Default mask rate for random masking (15% like BERT).
+const DEFAULT_MASK_RATE: f32 = 0.15;
+
+// ============================================================================
+// Masking Strategy
+// ============================================================================
+
+/// Strategy for selecting which cells to mask during training.
+#[derive(Debug, Clone)]
+pub enum MaskingStrategy {
+    /// Mask cells randomly with given probability.
+    /// Good for pre-training.
+    Random { mask_rate: f32 },
+
+    /// Mask specific columns on the seed row.
+    /// Good for fine-tuning on a specific prediction task.
+    TargetColumns { columns: Vec<ColumnIdx> },
+
+    /// Random masking, but ensure each semantic type is represented.
+    /// Useful when data is imbalanced (e.g., 90% numerical cells).
+    BalancedRandom { mask_rate: f32 },
+}
+
+impl Default for MaskingStrategy {
+    fn default() -> Self {
+        MaskingStrategy::Random {
+            mask_rate: DEFAULT_MASK_RATE,
+        }
+    }
+}
+
+// ============================================================================
+// Raw Pointer Wrapper for Parallel Access
+// ============================================================================
 
 /// Raw pointer wrapper that implements Send+Sync for parallel mutable access.
 /// SAFETY: Only use when guaranteeing non-overlapping access from different threads.
@@ -31,31 +83,37 @@ impl<T> SyncPtr<T> {
     }
 }
 
-/// Maximum number of foreign-to-primary neighbors tracked per cell.
-/// Must match MAX_F2P_NEIGHBORS in model.py
-const MAX_F2P_NEIGHBORS: usize = 5;
+// ============================================================================
+// Sequence Buffers (per-sequence working memory)
+// ============================================================================
 
-/// Mutable slices into one sequence's portion of BatchVecs (outputs only).
+/// Mutable slices into one sequence's portion of BatchVecs.
 struct SequenceSlice<'a> {
-    number_values: &'a mut [f16],
-    datetime_values: &'a mut [f16],
-    boolean_values: &'a mut [f16],
+    numerical_values: &'a mut [f32],
+    categorical_values: &'a mut [f16],
     text_values: &'a mut [f16],
+    timestamp_values: &'a mut [f32],
     column_name_values: &'a mut [f16],
     semantic_types: &'a mut [i32],
     masks: &'a mut [bool],
-    is_task_node: &'a mut [bool],
     is_padding: &'a mut [bool],
-    column_attn_mask: &'a mut [bool],
-    feature_attn_mask: &'a mut [bool],
-    neighbor_attn_mask: &'a mut [bool],
+    /// Bitpacked attention masks: each row of seq_len bits packed into u64s.
+    /// Layout: [row0_word0, row0_word1, ..., row1_word0, ...]
+    /// Words per row: ceil(seq_len / 64)
+    column_attn_mask: &'a mut [u64],
+    feature_attn_mask: &'a mut [u64],
+    neighbor_attn_mask: &'a mut [u64],
 }
 
-/// Intermediate indices for attention mask computation (local to each sequence).
+/// Intermediate indices for attention mask computation.
 struct SequenceIndices {
+    /// Node (row) index for each cell position, -1 if padding.
     node: Vec<i32>,
+    /// F2P neighbor indices for each cell (flattened: seq_len * MAX_F2P_NEIGHBORS).
     f2p_neighbors: Vec<i32>,
+    /// Table index for each cell position.
     table: Vec<i32>,
+    /// Column index for each cell position.
     column: Vec<i32>,
 }
 
@@ -70,18 +128,21 @@ impl SequenceIndices {
     }
 }
 
+// ============================================================================
+// Traversal Buffers (reused across sequences via thread-local storage)
+// ============================================================================
+
 /// Reusable buffers for BFS traversal, avoiding per-sequence allocations.
-/// These are pooled per-thread and reused across sequences.
 struct TraversalBuffers {
-    /// Visited bitset - 8x smaller than Vec<bool>
+    /// Visited bitset - 8x smaller than Vec<bool>.
     visited: FixedBitSet,
-    /// Foreign-to-primary frontier: (depth, row_idx)
+    /// Foreign-to-primary frontier: (depth, row_idx).
     f2p_frontier: Vec<(usize, RowIdx)>,
-    /// Primary-to-foreign frontier by depth level
+    /// Primary-to-foreign frontier by depth level.
     p2f_frontier: Vec<Vec<RowIdx>>,
-    /// Temporary buffer for f2p neighbors
+    /// Temporary buffer for f2p neighbors of current node.
     f2p_neighbors: Vec<RowIdx>,
-    /// Temporary buffer for children
+    /// Temporary buffer for children (p2f neighbors).
     children: Vec<RowIdx>,
 }
 
@@ -96,15 +157,11 @@ impl TraversalBuffers {
         }
     }
 
-    /// Reset all buffers for reuse without deallocating.
     fn reset(&mut self, num_rows: usize) {
-        // Grow visited if needed, then clear
         if self.visited.len() < num_rows {
             self.visited.grow(num_rows);
         }
         self.visited.clear();
-
-        // Clear vectors but keep capacity
         self.f2p_frontier.clear();
         for level in &mut self.p2f_frontier {
             level.clear();
@@ -112,14 +169,31 @@ impl TraversalBuffers {
         self.f2p_neighbors.clear();
         self.children.clear();
     }
+
+    /// Pop next node from frontiers: prioritize f2p (parent) edges, then p2f (child) edges.
+    /// Returns None when both frontiers are exhausted.
+    fn pop_next(&mut self, rng: &mut StdRng) -> Option<(usize, RowIdx)> {
+        // Prefer f2p frontier (direct parent traversal)
+        if let Some(item) = self.f2p_frontier.pop() {
+            return Some(item);
+        }
+        // Fall back to p2f frontier (random child from earliest depth level)
+        for depth in 0..self.p2f_frontier.len() {
+            let level = &mut self.p2f_frontier[depth];
+            if !level.is_empty() {
+                let idx = rng.random_range(0..level.len());
+                let row = level.swap_remove(idx);
+                return Some((depth, row));
+            }
+        }
+        None
+    }
 }
 
-// Thread-local storage for traversal buffers to avoid repeated allocations
 thread_local! {
     static TRAVERSAL_BUFFERS: RefCell<Option<TraversalBuffers>> = const { RefCell::new(None) };
 }
 
-/// Get or create thread-local traversal buffers, resizing if needed.
 fn get_traversal_buffers(num_rows: usize) -> TraversalBuffers {
     TRAVERSAL_BUFFERS.with(|cell| {
         let mut opt = cell.borrow_mut();
@@ -133,322 +207,128 @@ fn get_traversal_buffers(num_rows: usize) -> TraversalBuffers {
     })
 }
 
-/// Return traversal buffers to thread-local storage for reuse.
 fn return_traversal_buffers(buffers: TraversalBuffers) {
     TRAVERSAL_BUFFERS.with(|cell| {
         *cell.borrow_mut() = Some(buffers);
     });
 }
 
+// ============================================================================
+// Batch Vectors (output format)
+// ============================================================================
+
+/// Number of u64 words needed to pack `n` bits.
+#[inline]
+const fn words_for_bits(n: usize) -> usize {
+    (n + 63) / 64
+}
+
 /// Flat vectors for batch data. Python reshapes these to (batch_size, seq_len, ...).
-struct BatchVecs {
-    number_values: Vec<f16>,
-    datetime_values: Vec<f16>,
-    boolean_values: Vec<f16>,
+pub struct BatchVecs {
+    /// Z-score normalized numerical values. Shape: (B * S, 1).
+    numerical_values: Vec<f32>,
+    /// Pre-computed categorical embeddings. Shape: (B * S, d_text).
+    categorical_values: Vec<f16>,
+    /// Pre-computed text embeddings. Shape: (B * S, d_text).
     text_values: Vec<f16>,
+    /// Expanded timestamp features. Shape: (B * S, TIMESTAMP_DIM).
+    timestamp_values: Vec<f32>,
+    /// Column name embeddings. Shape: (B * S, d_text).
     column_name_values: Vec<f16>,
+    /// Semantic type per cell (0=num, 1=cat, 2=ts, 3=text). Shape: (B * S).
     semantic_types: Vec<i32>,
+    /// Mask indicating cells to predict. Shape: (B * S).
     masks: Vec<bool>,
-    is_task_node: Vec<bool>,
+    /// Padding indicator. Shape: (B * S).
     is_padding: Vec<bool>,
-    column_attn_mask: Vec<bool>,
-    feature_attn_mask: Vec<bool>,
-    neighbor_attn_mask: Vec<bool>,
-    true_batch_size: usize,
+    /// Bitpacked column attention mask. Shape: (B * S * words_per_row) where words_per_row = ceil(S/64).
+    column_attn_mask: Vec<u64>,
+    /// Bitpacked feature attention mask. Shape: (B * S * words_per_row).
+    feature_attn_mask: Vec<u64>,
+    /// Bitpacked neighbor attention mask. Shape: (B * S * words_per_row).
+    neighbor_attn_mask: Vec<u64>,
+    /// Sequence length (needed for unpacking).
+    seq_len: usize,
 }
 
 impl BatchVecs {
-    /// Create with uninitialized memory. Caller MUST fill all positions.
-    unsafe fn new(batch_size: usize, seq_len: usize, d_text: usize) -> Self {
+    /// Create with zeroed memory.
+    fn new(batch_size: usize, seq_len: usize, d_text: usize) -> Self {
         let l = batch_size * seq_len;
-        let l_sq = batch_size * seq_len * seq_len;
-
-        fn uninit_vec<T>(len: usize) -> Vec<T> {
-            let mut v = Vec::with_capacity(len);
-            unsafe { v.set_len(len) };
-            v
-        }
+        // Bitpacked: each row needs ceil(seq_len/64) u64 words
+        let words_per_row = words_for_bits(seq_len);
+        let packed_size = batch_size * seq_len * words_per_row;
 
         Self {
-            number_values: uninit_vec(l),
-            datetime_values: uninit_vec(l),
-            boolean_values: uninit_vec(l),
-            text_values: uninit_vec(l * d_text),
-            column_name_values: uninit_vec(l * d_text),
-            semantic_types: uninit_vec(l),
-            masks: uninit_vec(l),
-            is_task_node: uninit_vec(l),
-            is_padding: uninit_vec(l),
-            column_attn_mask: uninit_vec(l_sq),
-            feature_attn_mask: uninit_vec(l_sq),
-            neighbor_attn_mask: uninit_vec(l_sq),
-            true_batch_size: batch_size,
+            numerical_values: vec![0.0; l],
+            categorical_values: vec![f16::ZERO; l * d_text],
+            text_values: vec![f16::ZERO; l * d_text],
+            timestamp_values: vec![0.0; l * TIMESTAMP_DIM],
+            column_name_values: vec![f16::ZERO; l * d_text],
+            semantic_types: vec![0; l],
+            masks: vec![false; l],
+            is_padding: vec![true; l], // Default to padding
+            column_attn_mask: vec![0u64; packed_size],
+            feature_attn_mask: vec![0u64; packed_size],
+            neighbor_attn_mask: vec![0u64; packed_size],
+            seq_len,
         }
     }
 
-    /// Debug dump of the batch contents
-    #[allow(dead_code)]
-    pub fn dump_debug(&self, seq_len: usize, d_text: usize) {
-        println!(
-            "╔══════════════════════════════════════════════════════════════════════════════╗"
-        );
-        println!(
-            "║                           BATCH DEBUG DUMP                                   ║"
-        );
-        println!(
-            "╚══════════════════════════════════════════════════════════════════════════════╝"
-        );
-        println!();
-
-        let batch_size = self.number_values.len() / seq_len;
-        let non_padding_count: usize = self.is_padding.iter().filter(|&&p| !p).count();
-        let masked_count: usize = self.masks.iter().filter(|&&m| m).count();
-        let task_node_count: usize = self.is_task_node.iter().filter(|&&t| t).count();
-
-        println!("┌─────────────────────────────────────────────────────────────────────────────┐");
-        println!("│ SUMMARY                                                                     │");
-        println!("├─────────────────────────────────────────────────────────────────────────────┤");
-        println!(
-            "│ Batch size:          {:>10}                                            │",
-            batch_size
-        );
-        println!(
-            "│ True batch size:     {:>10}                                            │",
-            self.true_batch_size
-        );
-        println!(
-            "│ Seq len:             {:>10}                                            │",
-            seq_len
-        );
-        println!(
-            "│ d_text:              {:>10}                                            │",
-            d_text
-        );
-        println!(
-            "│ Non-padding cells:   {:>10}                                            │",
-            non_padding_count
-        );
-        println!(
-            "│ Masked (target):     {:>10}                                            │",
-            masked_count
-        );
-        println!(
-            "│ Task node cells:     {:>10}                                            │",
-            task_node_count
-        );
-        println!("└─────────────────────────────────────────────────────────────────────────────┘");
-        println!();
-
-        // For each sequence in the batch
-        for seq_idx in 0..batch_size {
-            let seq_start = seq_idx * seq_len;
-            let seq_end = seq_start + seq_len;
-            let seq_non_padding: usize = self.is_padding[seq_start..seq_end]
-                .iter()
-                .filter(|&&p| !p)
-                .count();
-
-            println!(
-                "┌─────────────────────────────────────────────────────────────────────────────┐"
-            );
-            println!(
-                "│ SEQUENCE {} ({} non-padding cells)                               │",
-                seq_idx, seq_non_padding
-            );
-            println!(
-                "└─────────────────────────────────────────────────────────────────────────────┘"
-            );
-
-            // Print each non-padding cell
-            let mut printed = 0;
-            for i in 0..seq_len {
-                let idx = seq_start + i;
-                if self.is_padding[idx] {
-                    continue;
-                }
-
-                let sem_type = match self.semantic_types[idx] {
-                    0 => "Number",
-                    1 => "Text",
-                    2 => "Datetime",
-                    3 => "Boolean",
-                    _ => "Unknown",
-                };
-
-                let value_str = match self.semantic_types[idx] {
-                    0 => format!("{:.4}", self.number_values[idx]),
-                    1 => {
-                        // Show first few embedding dims
-                        let text_start = idx * d_text;
-                        let text_end = (text_start + 4).min(text_start + d_text);
-                        let dims: Vec<String> = self.text_values[text_start..text_end]
-                            .iter()
-                            .map(|v| format!("{:.2}", v))
-                            .collect();
-                        format!("[{}...]", dims.join(", "))
-                    }
-                    2 => format!("{:.4}", self.datetime_values[idx]),
-                    3 => format!("{:.4}", self.boolean_values[idx]),
-                    _ => "?".to_string(),
-                };
-
-                let flags = format!(
-                    "{}{}",
-                    if self.masks[idx] { "MASKED " } else { "" },
-                    if self.is_task_node[idx] { "TASK" } else { "" }
-                );
-
-                println!("  [{:4}] {:10} = {:30} {}", i, sem_type, value_str, flags);
-
-                printed += 1;
-                if printed >= 50 {
-                    println!("  ... and {} more cells", seq_non_padding - printed);
-                    break;
-                }
-            }
-
-            // Show attention mask summary for first sequence
-            if seq_idx == 0 {
-                println!();
-                println!("  Attention Mask Summary (first 20x20):");
-                let mask_start = seq_idx * seq_len * seq_len;
-
-                // Column attention
-                print!("    Column attn (1s): ");
-                let col_ones: usize = self.column_attn_mask
-                    [mask_start..mask_start + seq_len * seq_len]
-                    .iter()
-                    .filter(|&&v| v)
-                    .count();
-                println!(
-                    "{} / {} = {:.2}%",
-                    col_ones,
-                    seq_len * seq_len,
-                    100.0 * col_ones as f64 / (seq_len * seq_len) as f64
-                );
-
-                // Feature attention
-                print!("    Feature attn (1s): ");
-                let feat_ones: usize = self.feature_attn_mask
-                    [mask_start..mask_start + seq_len * seq_len]
-                    .iter()
-                    .filter(|&&v| v)
-                    .count();
-                println!(
-                    "{} / {} = {:.2}%",
-                    feat_ones,
-                    seq_len * seq_len,
-                    100.0 * feat_ones as f64 / (seq_len * seq_len) as f64
-                );
-
-                // Neighbor attention
-                print!("    Neighbor attn (1s): ");
-                let nbr_ones: usize = self.neighbor_attn_mask
-                    [mask_start..mask_start + seq_len * seq_len]
-                    .iter()
-                    .filter(|&&v| v)
-                    .count();
-                println!(
-                    "{} / {} = {:.2}%",
-                    nbr_ones,
-                    seq_len * seq_len,
-                    100.0 * nbr_ones as f64 / (seq_len * seq_len) as f64
-                );
-
-                // Print first 128x128 of each attention mask
-                let mask_size = 128.min(seq_len);
-
-                println!();
-                println!(
-                    "    Column attention mask ({}x{}, . = 0, # = 1):",
-                    mask_size, mask_size
-                );
-                for q in 0..mask_size {
-                    print!("      ");
-                    for kv in 0..mask_size {
-                        let midx = mask_start + q * seq_len + kv;
-                        print!(
-                            "{}",
-                            if self.column_attn_mask[midx] {
-                                '#'
-                            } else {
-                                '.'
-                            }
-                        );
-                    }
-                    println!();
-                }
-
-                println!();
-                println!(
-                    "    Feature attention mask ({}x{}, . = 0, # = 1):",
-                    mask_size, mask_size
-                );
-                for q in 0..mask_size {
-                    print!("      ");
-                    for kv in 0..mask_size {
-                        let midx = mask_start + q * seq_len + kv;
-                        print!(
-                            "{}",
-                            if self.feature_attn_mask[midx] {
-                                '#'
-                            } else {
-                                '.'
-                            }
-                        );
-                    }
-                    println!();
-                }
-
-                println!();
-                println!(
-                    "    Neighbor attention mask ({}x{}, . = 0, # = 1):",
-                    mask_size, mask_size
-                );
-                for q in 0..mask_size {
-                    print!("      ");
-                    for kv in 0..mask_size {
-                        let midx = mask_start + q * seq_len + kv;
-                        print!(
-                            "{}",
-                            if self.neighbor_attn_mask[midx] {
-                                '#'
-                            } else {
-                                '.'
-                            }
-                        );
-                    }
-                    println!();
-                }
-            }
-            println!();
-        }
-
-        println!(
-            "╔══════════════════════════════════════════════════════════════════════════════╗"
-        );
-        println!(
-            "║                           END OF BATCH DEBUG DUMP                            ║"
-        );
-        println!(
-            "╚══════════════════════════════════════════════════════════════════════════════╝"
-        );
+    /// Reset all fields to their default state for reuse.
+    /// This avoids reallocation - just memsets existing memory.
+    /// Note: Attention masks are zeroed per-sample in parallel during fill_batch_vecs.
+    fn reset(&mut self) {
+        // Only is_padding and masks need serial reset
+        // Attention masks are handled per-sample in compute_attention_masks
+        self.is_padding.fill(true);
+        self.masks.fill(false);
     }
 
     fn into_pyobject(self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        // Unpack bitpacked masks to bool for Python compatibility
+        let batch_size = self.is_padding.len() / self.seq_len;
+        let unpacked_size = batch_size * self.seq_len * self.seq_len;
+
+        let unpack_mask = |packed: &[u64]| -> Vec<bool> {
+            let words_per_row = words_for_bits(self.seq_len);
+            let mut unpacked = vec![false; unpacked_size];
+            for sample in 0..batch_size {
+                for row in 0..self.seq_len {
+                    let row_start = (sample * self.seq_len + row) * words_per_row;
+                    let out_start = (sample * self.seq_len + row) * self.seq_len;
+                    for col in 0..self.seq_len {
+                        let word_idx = col / 64;
+                        let bit_idx = col % 64;
+                        unpacked[out_start + col] =
+                            (packed[row_start + word_idx] >> bit_idx) & 1 != 0;
+                    }
+                }
+            }
+            unpacked
+        };
+
+        let col_mask = unpack_mask(&self.column_attn_mask);
+        let feat_mask = unpack_mask(&self.feature_attn_mask);
+        let nbr_mask = unpack_mask(&self.neighbor_attn_mask);
+
         Ok(vec![
-            ("number_values", PyArray1::from_vec(py, self.number_values)).into_py_any(py)?,
             (
-                "datetime_values",
-                PyArray1::from_vec(py, self.datetime_values),
+                "numerical_values",
+                PyArray1::from_vec(py, self.numerical_values),
             )
                 .into_py_any(py)?,
             (
-                "boolean_values",
-                PyArray1::from_vec(py, self.boolean_values),
+                "categorical_values",
+                PyArray1::from_vec(py, self.categorical_values),
             )
                 .into_py_any(py)?,
             ("text_values", PyArray1::from_vec(py, self.text_values)).into_py_any(py)?,
+            (
+                "timestamp_values",
+                PyArray1::from_vec(py, self.timestamp_values),
+            )
+                .into_py_any(py)?,
             (
                 "column_name_values",
                 PyArray1::from_vec(py, self.column_name_values),
@@ -460,245 +340,194 @@ impl BatchVecs {
             )
                 .into_py_any(py)?,
             ("masks", PyArray1::from_vec(py, self.masks)).into_py_any(py)?,
-            ("is_task_node", PyArray1::from_vec(py, self.is_task_node)).into_py_any(py)?,
             ("is_padding", PyArray1::from_vec(py, self.is_padding)).into_py_any(py)?,
-            (
-                "column_attn_mask",
-                PyArray1::from_vec(py, self.column_attn_mask),
-            )
-                .into_py_any(py)?,
-            (
-                "feature_attn_mask",
-                PyArray1::from_vec(py, self.feature_attn_mask),
-            )
-                .into_py_any(py)?,
-            (
-                "neighbor_attn_mask",
-                PyArray1::from_vec(py, self.neighbor_attn_mask),
-            )
-                .into_py_any(py)?,
-            ("true_batch_size", self.true_batch_size).into_py_any(py)?,
+            ("column_attn_mask", PyArray1::from_vec(py, col_mask)).into_py_any(py)?,
+            ("feature_attn_mask", PyArray1::from_vec(py, feat_mask)).into_py_any(py)?,
+            ("neighbor_attn_mask", PyArray1::from_vec(py, nbr_mask)).into_py_any(py)?,
         ])
     }
 }
 
-/// A seed row for BFS sampling.
-struct SamplerItem {
-    database_idx: usize,
-    row_idx: RowIdx,
-    target_column: ColumnIdx,
+// ============================================================================
+// Sampler Configuration
+// ============================================================================
+
+/// Configuration for the sampler.
+#[derive(Debug, Clone)]
+pub struct SamplerConfig {
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub max_bfs_width: usize,
+    pub masking_strategy: MaskingStrategy,
+    pub seed: u64,
 }
 
-/// (db_path, task_table_idx, target_column_idx, columns_to_drop)
-type DbConfig = (String, u32, u32, Vec<u32>);
-
-fn build_databases_and_items(
-    db_configs: Vec<DbConfig>,
-) -> Result<(Vec<Database>, Vec<SamplerItem>), String> {
-    let mut databases = Vec::new();
-    let mut items = Vec::new();
-
-    for (db_idx, (db_path, task_table_idx, target_column_idx, cols_to_drop)) in
-        db_configs.into_iter().enumerate()
-    {
-        let mut database = Database::load(Path::new(&db_path))
-            .map_err(|e| format!("Failed to load database '{}': {}", db_path, e))?;
-        database.ensure_adjacency();
-
-        let task_table = TableIdx(task_table_idx);
-        let target_column = ColumnIdx(target_column_idx);
-        let columns_to_drop: Vec<ColumnIdx> = cols_to_drop.into_iter().map(ColumnIdx).collect();
-
-        let table = database.get_table(task_table);
-        for row_idx in table.row_range.0.0..table.row_range.1.0 {
-            items.push(SamplerItem {
-                database_idx: db_idx,
-                row_idx: RowIdx(row_idx),
-                target_column,
-                columns_to_drop: columns_to_drop.clone(),
-                is_task_table: true,
-            });
+impl Default for SamplerConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 32,
+            seq_len: 1024,
+            max_bfs_width: 256,
+            masking_strategy: MaskingStrategy::default(),
+            seed: 42,
         }
-
-        databases.push(database);
     }
-
-    Ok((databases, items))
 }
 
+// ============================================================================
+// Sampler
+// ============================================================================
+
+/// Graph sampler for relational databases.
+///
+/// Loads a preprocessed database and samples BFS neighborhoods for training.
 #[pyclass]
 pub struct Sampler {
-    databases: Vec<Database>,
-    items: Vec<SamplerItem>,
-    batch_size: usize,
-    seq_len: usize,
-    rank: usize,
-    world_size: usize,
-    max_bfs_width: usize,
+    database: Database,
+    /// Seed rows for BFS traversal (shuffled each epoch).
+    seeds: Vec<RowIdx>,
+    config: SamplerConfig,
     d_text: usize,
-    seed: u64,
     epoch: u64,
 }
 
 #[pymethods]
 impl Sampler {
-    /// Create a new Sampler for multi-database training.
+    /// Create a new Sampler from a preprocessed database file.
     ///
     /// Args:
-    ///     db_configs: List of (db_path, task_table_idx, target_column_idx, columns_to_drop)
+    ///     db_path: Path to the .rkyv database file
     ///     batch_size: Number of sequences per batch
     ///     seq_len: Maximum sequence length (cells per sequence)
-    ///     rank: Distributed training rank (0 for single GPU)
-    ///     world_size: Number of distributed workers (1 for single GPU)
     ///     max_bfs_width: Max neighbors sampled per BFS step
-    ///     d_text: Text embedding dimension
+    ///     mask_rate: Probability of masking each cell (for random masking)
     ///     seed: Random seed for reproducibility
     #[new]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (db_path, batch_size=32, seq_len=1024, max_bfs_width=256, mask_rate=0.15, seed=42))]
     fn new(
-        db_configs: Vec<DbConfig>,
+        db_path: String,
         batch_size: usize,
         seq_len: usize,
-        rank: usize,
-        world_size: usize,
         max_bfs_width: usize,
-        d_text: usize,
+        mask_rate: f32,
         seed: u64,
     ) -> PyResult<Self> {
-        let (databases, items) =
-            build_databases_and_items(db_configs).map_err(pyo3::exceptions::PyIOError::new_err)?;
+        let database = Database::load(Path::new(&db_path)).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("Failed to load database: {}", e))
+        })?;
 
-        Ok(Self {
-            databases,
-            items,
+        let config = SamplerConfig {
             batch_size,
             seq_len,
-            rank,
-            world_size,
             max_bfs_width,
-            d_text,
+            masking_strategy: MaskingStrategy::Random { mask_rate },
             seed,
-            epoch: 0,
-        })
+        };
+
+        Ok(Self::init(database, config))
     }
 
+    /// Number of batches in one epoch.
     fn len_py(&self) -> usize {
-        self.items.len().div_ceil(self.batch_size * self.world_size)
+        self.seeds.len().div_ceil(self.config.batch_size)
     }
 
+    /// Get a batch by index.
     fn batch_py(&self, py: Python<'_>, batch_idx: usize) -> PyResult<Vec<Py<PyAny>>> {
         self.batch(batch_idx).into_pyobject(py)
     }
 
+    /// Shuffle seeds for a new epoch.
     fn shuffle_py(&mut self, epoch: u64) {
         self.epoch = epoch;
-        let mut rng = StdRng::seed_from_u64(epoch.wrapping_add(self.seed));
-        self.items.shuffle(&mut rng);
+        let mut rng = StdRng::seed_from_u64(epoch.wrapping_add(self.config.seed));
+        self.seeds.shuffle(&mut rng);
     }
-}
 
-#[pyfunction]
-pub fn resolve_db_config(
-    db_path: String,
-    task_table: String,
-    target_column: String,
-    columns_to_drop: Vec<String>,
-) -> PyResult<(u32, u32, Vec<u32>)> {
-    let database = Database::load(Path::new(&db_path))
-        .map_err(|e| PyIOError::new_err(format!("Failed to load database '{}': {}", db_path, e)))?;
+    /// Number of rows in the database.
+    fn num_rows(&self) -> usize {
+        self.database.num_rows()
+    }
 
-    let table = database
-        .tables
-        .iter()
-        .find(|t| t.name == task_table)
-        .ok_or_else(|| PyKeyError::new_err(format!("Table '{}' not found", task_table)))?;
-    let table_idx = table.idx;
+    /// Number of tables in the database.
+    fn num_tables(&self) -> usize {
+        self.database.num_tables()
+    }
 
-    let find_column = |name: &str| -> PyResult<ColumnIdx> {
-        database
-            .columns
-            .iter()
-            .find(|c| c.name == name && c.table_idx == table_idx)
-            .map(|c| c.idx)
-            .ok_or_else(|| {
-                PyKeyError::new_err(format!(
-                    "Column '{}' not found on table '{}'",
-                    name, task_table
-                ))
-            })
-    };
-
-    let target_column_idx = find_column(&target_column)?;
-    let drop_idxs: Vec<u32> = columns_to_drop
-        .iter()
-        .map(|c| find_column(c).map(|idx| idx.0))
-        .collect::<PyResult<Vec<u32>>>()?;
-
-    Ok((table_idx.0, target_column_idx.0, drop_idxs))
+    /// Embedding dimension.
+    fn embed_dim(&self) -> usize {
+        self.d_text
+    }
 }
 
 impl Sampler {
+    /// Generate a batch of sequences.
     fn batch(&self, batch_idx: usize) -> BatchVecs {
-        let start_idx = batch_idx * self.batch_size * self.world_size + self.rank * self.batch_size;
-        let true_batch_size = self
+        let start_idx = batch_idx * self.config.batch_size;
+        let actual_batch_size = self
+            .config
             .batch_size
-            .min(self.items.len().saturating_sub(start_idx));
+            .min(self.seeds.len().saturating_sub(start_idx));
 
-        let mut vecs = unsafe { BatchVecs::new(self.batch_size, self.seq_len, self.d_text) };
-        vecs.true_batch_size = true_batch_size;
-        vecs.is_padding.fill(true);
+        let mut vecs = BatchVecs::new(self.config.batch_size, self.config.seq_len, self.d_text);
 
-        self.fill_batch_vecs(&mut vecs, start_idx);
+        if actual_batch_size == 0 {
+            return vecs;
+        }
+
+        self.fill_batch_vecs(&mut vecs, start_idx, actual_batch_size);
         vecs
     }
 
-    fn fill_batch_vecs(&self, vecs: &mut BatchVecs, start_idx: usize) {
-        let num_ptr = SyncPtr::new(vecs.number_values.as_mut_ptr());
-        let dt_ptr = SyncPtr::new(vecs.datetime_values.as_mut_ptr());
-        let bool_ptr = SyncPtr::new(vecs.boolean_values.as_mut_ptr());
+    /// Fill batch vectors in parallel.
+    fn fill_batch_vecs(&self, vecs: &mut BatchVecs, start_idx: usize, actual_batch_size: usize) {
+        let seq_len = self.config.seq_len;
+        let d_text = self.d_text;
+        let words_per_row = words_for_bits(seq_len);
+
+        // Create sync pointers for parallel access
+        let num_ptr = SyncPtr::new(vecs.numerical_values.as_mut_ptr());
+        let cat_ptr = SyncPtr::new(vecs.categorical_values.as_mut_ptr());
         let text_ptr = SyncPtr::new(vecs.text_values.as_mut_ptr());
+        let ts_ptr = SyncPtr::new(vecs.timestamp_values.as_mut_ptr());
         let colname_ptr = SyncPtr::new(vecs.column_name_values.as_mut_ptr());
         let sem_ptr = SyncPtr::new(vecs.semantic_types.as_mut_ptr());
         let mask_ptr = SyncPtr::new(vecs.masks.as_mut_ptr());
-        let task_ptr = SyncPtr::new(vecs.is_task_node.as_mut_ptr());
         let pad_ptr = SyncPtr::new(vecs.is_padding.as_mut_ptr());
         let col_attn_ptr = SyncPtr::new(vecs.column_attn_mask.as_mut_ptr());
         let feat_attn_ptr = SyncPtr::new(vecs.feature_attn_mask.as_mut_ptr());
         let nbr_attn_ptr = SyncPtr::new(vecs.neighbor_attn_mask.as_mut_ptr());
 
-        let seq_len = self.seq_len;
-        let d_text = self.d_text;
-        let items_len = self.items.len();
-
-        (0..self.batch_size).into_par_iter().for_each(|i| {
-            let j = (start_idx + i) % items_len;
-            let item = &self.items[j];
-            let db = &self.databases[item.database_idx];
+        (0..actual_batch_size).into_par_iter().for_each(|i| {
+            let seed_row = self.seeds[start_idx + i];
 
             let seq_offset = i * seq_len;
             let text_offset = i * seq_len * d_text;
-            let mask_offset = i * seq_len * seq_len;
+            let ts_offset = i * seq_len * TIMESTAMP_DIM;
+            // Packed mask offset: each sequence has seq_len rows, each row has words_per_row u64s
+            let packed_mask_offset = i * seq_len * words_per_row;
+            let packed_mask_size = seq_len * words_per_row;
 
-            // Each thread gets its own index buffers for attention mask computation
             let mut indices = SequenceIndices::new(seq_len);
-
-            // Get thread-local traversal buffers (reused across sequences)
-            let mut trav = get_traversal_buffers(db.num_rows());
+            let mut trav = get_traversal_buffers(self.database.num_rows());
 
             unsafe {
                 let slice = SequenceSlice {
-                    number_values: std::slice::from_raw_parts_mut(num_ptr.add(seq_offset), seq_len),
-                    datetime_values: std::slice::from_raw_parts_mut(
-                        dt_ptr.add(seq_offset),
+                    numerical_values: std::slice::from_raw_parts_mut(
+                        num_ptr.add(seq_offset),
                         seq_len,
                     ),
-                    boolean_values: std::slice::from_raw_parts_mut(
-                        bool_ptr.add(seq_offset),
-                        seq_len,
+                    categorical_values: std::slice::from_raw_parts_mut(
+                        cat_ptr.add(text_offset),
+                        seq_len * d_text,
                     ),
                     text_values: std::slice::from_raw_parts_mut(
                         text_ptr.add(text_offset),
                         seq_len * d_text,
+                    ),
+                    timestamp_values: std::slice::from_raw_parts_mut(
+                        ts_ptr.add(ts_offset),
+                        seq_len * TIMESTAMP_DIM,
                     ),
                     column_name_values: std::slice::from_raw_parts_mut(
                         colname_ptr.add(text_offset),
@@ -709,116 +538,101 @@ impl Sampler {
                         seq_len,
                     ),
                     masks: std::slice::from_raw_parts_mut(mask_ptr.add(seq_offset), seq_len),
-                    is_task_node: std::slice::from_raw_parts_mut(task_ptr.add(seq_offset), seq_len),
                     is_padding: std::slice::from_raw_parts_mut(pad_ptr.add(seq_offset), seq_len),
                     column_attn_mask: std::slice::from_raw_parts_mut(
-                        col_attn_ptr.add(mask_offset),
-                        seq_len * seq_len,
+                        col_attn_ptr.add(packed_mask_offset),
+                        packed_mask_size,
                     ),
                     feature_attn_mask: std::slice::from_raw_parts_mut(
-                        feat_attn_ptr.add(mask_offset),
-                        seq_len * seq_len,
+                        feat_attn_ptr.add(packed_mask_offset),
+                        packed_mask_size,
                     ),
                     neighbor_attn_mask: std::slice::from_raw_parts_mut(
-                        nbr_attn_ptr.add(mask_offset),
-                        seq_len * seq_len,
+                        nbr_attn_ptr.add(packed_mask_offset),
+                        packed_mask_size,
                     ),
                 };
 
-                self.fill_sequence(item, slice, &mut indices, &mut trav);
+                self.fill_sequence(seed_row, slice, &mut indices, &mut trav);
             }
 
-            // Return buffers to thread-local pool for reuse
             return_traversal_buffers(trav);
         });
     }
 
+    /// Fill a single sequence via BFS traversal.
     fn fill_sequence(
         &self,
-        item: &SamplerItem,
+        seed_row: RowIdx,
         mut seq: SequenceSlice<'_>,
         idx: &mut SequenceIndices,
         trav: &mut TraversalBuffers,
     ) {
-        let db = &self.databases[item.database_idx];
-        let edges_from = &db.edges_from;
-        let edges_to = &db.edges_to;
-        let seed_row = db.get_row(item.row_idx);
-        let seed_table = db.get_table(seed_row.table_idx);
-        let seed_timestamp = self.get_row_timestamp(db, item.row_idx);
+        // Zero attention masks upfront (done in parallel per-sample)
+        // This is faster than iterating through padding rows later
+        seq.column_attn_mask.fill(0);
+        seq.feature_attn_mask.fill(0);
+        seq.neighbor_attn_mask.fill(0);
 
-        // Use pre-allocated buffers from trav (already reset)
-        trav.f2p_frontier.push((0, item.row_idx));
+        let db = &self.database;
+        let seed_table_idx = db.row_table(seed_row);
+        let seed_table = db.table(seed_table_idx);
+        let seed_timestamp = self.get_row_timestamp(seed_row);
+
+        // Initialize BFS with seed row
+        trav.f2p_frontier.push((0, seed_row));
 
         let mut seq_i = 0;
         let mut rng = StdRng::seed_from_u64(
             self.epoch
-                .wrapping_add(item.row_idx.0 as u64)
-                .wrapping_add(self.seed),
+                .wrapping_add(seed_row.0 as u64)
+                .wrapping_add(self.config.seed),
         );
 
-        loop {
-            // Select next node: prioritize f2p (parent) edges
-            let (depth, row_idx) = if let Some(frontier_item) = trav.f2p_frontier.pop() {
-                frontier_item
-            } else {
-                let mut found = None;
-                for (d, nodes) in trav.p2f_frontier.iter().enumerate() {
-                    if !nodes.is_empty() {
-                        found = Some(d);
-                        break;
-                    }
-                }
-                if let Some(d) = found {
-                    let r = rng.random_range(0..trav.p2f_frontier[d].len());
-                    let len = trav.p2f_frontier[d].len();
-                    trav.p2f_frontier[d].swap(r, len - 1);
-                    (d, trav.p2f_frontier[d].pop().unwrap())
-                } else {
-                    break;
-                }
-            };
-
+        // BFS traversal
+        while let Some((depth, row_idx)) = trav.pop_next(&mut rng) {
             if trav.visited.contains(row_idx.0 as usize) {
                 continue;
             }
             trav.visited.insert(row_idx.0 as usize);
 
-            let row = db.get_row(row_idx);
-            let table = db.get_table(row.table_idx);
+            let table_idx = db.row_table(row_idx);
 
             // Collect f2p neighbors (rows this row points TO via FK)
             trav.f2p_neighbors.clear();
-            for &edge_idx in &edges_from[row_idx.0 as usize] {
-                let edge = &db.fk_edges[edge_idx];
-                trav.f2p_neighbors.push(edge.to_row);
-                trav.f2p_frontier.push((depth + 1, edge.to_row));
+            for &neighbor in db.outgoing_neighbors(row_idx) {
+                let neighbor_row = RowIdx(neighbor);
+                trav.f2p_neighbors.push(neighbor_row);
+                trav.f2p_frontier.push((depth + 1, neighbor_row));
             }
 
-            // Follow reverse edges (p2f: child rows -> this row)
+            // Collect p2f neighbors (rows that point TO this row via FK)
             trav.children.clear();
-            for &edge_idx in &edges_to[row_idx.0 as usize] {
-                let edge = &db.fk_edges[edge_idx];
+            for &neighbor in db.incoming_neighbors(row_idx) {
+                let child_row = RowIdx(neighbor);
 
                 // Temporal constraint: don't include future rows
-                if let Some(cutoff) = seed_timestamp
-                    && !db.row_is_before(edge.from_row, cutoff)
-                {
-                    continue;
+                if let Some(cutoff) = seed_timestamp {
+                    if let Some(child_ts) = self.get_row_timestamp(child_row) {
+                        if child_ts > cutoff {
+                            continue;
+                        }
+                    }
                 }
 
-                let child_table = db.get_table(db.get_row(edge.from_row).table_idx);
-                if child_table.idx == seed_table.idx || item.is_task_table {
-                    trav.children.push(edge.from_row);
+                // Only include children from the seed table (for task-focused sampling)
+                // or all children (for broader exploration)
+                let child_table_idx = db.row_table(child_row);
+                if child_table_idx == seed_table.idx {
+                    trav.children.push(child_row);
                 }
             }
 
             // Subsample if too many children
             let num_children = trav.children.len();
-            let sample_count = num_children.min(self.max_bfs_width);
+            let sample_count = num_children.min(self.config.max_bfs_width);
 
-            if num_children > self.max_bfs_width {
-                // Shuffle first sample_count elements using Fisher-Yates partial shuffle
+            if num_children > self.config.max_bfs_width {
                 for i in 0..sample_count {
                     let j = rng.random_range(i..num_children);
                     trav.children.swap(i, j);
@@ -835,23 +649,22 @@ impl Sampler {
             }
 
             // Fill cells from this row
-            let col_start = table.column_range.0.0;
-            let is_seed_row = row_idx == item.row_idx;
+            let row_cells = db.row_cells(row_idx);
+            let table_columns = db.table_columns(table_idx);
+            let is_seed_row = row_idx == seed_row;
 
-            for (local_idx, normalized_cell) in row.normalized.iter().enumerate() {
-                let global_col_idx = ColumnIdx(col_start + local_idx as u32);
-                let column = db.get_column(global_col_idx);
-
-                if is_seed_row && item.columns_to_drop.contains(&global_col_idx) {
-                    continue;
-                }
-                if matches!(normalized_cell, NormalizedCellValue::Null) {
+            for (local_idx, &packed_cell) in row_cells.iter().enumerate() {
+                // Skip null cells
+                if crate::types::is_packed_null(packed_cell) {
                     continue;
                 }
 
-                // Fill indices (for attention mask computation)
+                let column = &table_columns[local_idx];
+                let global_col_idx = column.idx;
+
+                // Fill indices for attention mask computation
                 idx.node[seq_i] = row_idx.0 as i32;
-                idx.table[seq_i] = row.table_idx.0 as i32;
+                idx.table[seq_i] = table_idx.0 as i32;
                 idx.column[seq_i] = global_col_idx.0 as i32;
 
                 for (j, &neighbor_row) in trav
@@ -863,64 +676,132 @@ impl Sampler {
                     idx.f2p_neighbors[seq_i * MAX_F2P_NEIGHBORS + j] = neighbor_row.0 as i32;
                 }
 
-                // Fill values
-                seq.semantic_types[seq_i] = column.dtype as i32;
+                // Fill semantic type
+                seq.semantic_types[seq_i] = column.stype as i32;
 
-                match (normalized_cell, column.dtype) {
-                    (NormalizedCellValue::Scalar(v), SemanticType::Number) => {
-                        seq.number_values[seq_i] = f16::from_f32(*v);
-                    }
-                    (NormalizedCellValue::Scalar(v), SemanticType::Datetime) => {
-                        seq.datetime_values[seq_i] = f16::from_f32(*v);
-                    }
-                    (NormalizedCellValue::Scalar(v), SemanticType::Boolean) => {
-                        seq.boolean_values[seq_i] = f16::from_f32(*v);
-                    }
-                    (NormalizedCellValue::Text(text_idx), SemanticType::Text) => {
-                        if let Some(embedding) = db.string_embeddings.get(text_idx.0 as usize) {
-                            let start = seq_i * self.d_text;
-                            let end = start + self.d_text.min(embedding.len());
-                            seq.text_values[start..end].copy_from_slice(&embedding[..end - start]);
-                        }
-                    }
-                    _ => {}
-                }
+                // Fill cell value based on semantic type
+                self.fill_cell_value(&mut seq, seq_i, packed_cell, column.stype);
 
-                if let Some(ref embedding) = column.column_description_embedding {
-                    let start = seq_i * self.d_text;
-                    let end = start + self.d_text.min(embedding.len());
-                    seq.column_name_values[start..end].copy_from_slice(&embedding[..end - start]);
-                }
+                // Fill column embedding
+                let col_embedding = db.get_column_embedding(global_col_idx);
+                let start = seq_i * self.d_text;
+                let end = start + self.d_text;
+                seq.column_name_values[start..end].copy_from_slice(col_embedding);
 
-                seq.masks[seq_i] = is_seed_row && global_col_idx == item.target_column;
-                seq.is_task_node[seq_i] =
-                    item.is_task_table && (row.table_idx == db.get_row(item.row_idx).table_idx);
+                // Apply masking strategy
+                seq.masks[seq_i] = self.should_mask(&mut rng, is_seed_row, global_col_idx);
                 seq.is_padding[seq_i] = false;
 
                 seq_i += 1;
-                if seq_i >= self.seq_len {
+                if seq_i >= self.config.seq_len {
                     break;
                 }
             }
 
-            if seq_i >= self.seq_len {
+            if seq_i >= self.config.seq_len {
                 break;
             }
         }
 
+        // Compute attention masks
         self.compute_attention_masks(&mut seq, idx);
     }
 
+    /// Fill cell value into the appropriate buffer based on semantic type.
+    fn fill_cell_value(
+        &self,
+        seq: &mut SequenceSlice<'_>,
+        seq_i: usize,
+        packed_cell: u32,
+        stype: SemanticType,
+    ) {
+        let db = &self.database;
+
+        match stype {
+            SemanticType::Numerical => {
+                // Packed cell is f32 bits (already z-scored)
+                let value = f32::from_bits(packed_cell);
+                seq.numerical_values[seq_i] = value;
+            }
+            SemanticType::Categorical => {
+                // Packed cell is embedding index
+                let emb_idx = EmbeddingIdx(packed_cell);
+                let embedding = db.get_embedding(emb_idx);
+                let start = seq_i * self.d_text;
+                let end = start + self.d_text;
+                seq.categorical_values[start..end].copy_from_slice(embedding);
+            }
+            SemanticType::Timestamp => {
+                // Packed cell is epoch seconds as f32 bits
+                let epoch_secs = f32::from_bits(packed_cell);
+                let mean = db.timestamp_mean.unwrap_or(0.0);
+                let std = db.timestamp_std.unwrap_or(1.0);
+                let expanded = expand_timestamp(epoch_secs, mean, std);
+                let start = seq_i * TIMESTAMP_DIM;
+                seq.timestamp_values[start..start + TIMESTAMP_DIM].copy_from_slice(&expanded);
+            }
+            SemanticType::Text => {
+                // Packed cell is embedding index
+                let emb_idx = EmbeddingIdx(packed_cell);
+                let embedding = db.get_embedding(emb_idx);
+                let start = seq_i * self.d_text;
+                let end = start + self.d_text;
+                seq.text_values[start..end].copy_from_slice(embedding);
+            }
+        }
+    }
+
+    /// Determine if a cell should be masked based on the masking strategy.
+    fn should_mask(&self, rng: &mut StdRng, is_seed_row: bool, col_idx: ColumnIdx) -> bool {
+        match &self.config.masking_strategy {
+            MaskingStrategy::Random { mask_rate } => rng.random::<f32>() < *mask_rate,
+            MaskingStrategy::TargetColumns { columns } => is_seed_row && columns.contains(&col_idx),
+            MaskingStrategy::BalancedRandom { mask_rate } => {
+                // TODO: Track type counts and balance masking
+                // For now, fall back to random
+                rng.random::<f32>() < *mask_rate
+            }
+        }
+    }
+
+    /// Get the timestamp of a row (if it has a time column).
+    fn get_row_timestamp(&self, row_idx: RowIdx) -> Option<f32> {
+        let db = &self.database;
+        let table_idx = db.row_table(row_idx);
+        let table = db.table(table_idx);
+
+        let time_col_idx = table.time_column?;
+
+        // Get the local index of the time column within this row
+        let local_idx = (time_col_idx.0 - table.column_range.0.0) as usize;
+
+        let row_cells = db.row_cells(row_idx);
+        if local_idx >= row_cells.len() {
+            return None;
+        }
+
+        let packed_cell = row_cells[local_idx];
+        if crate::types::is_packed_null(packed_cell) {
+            return None;
+        }
+
+        // Timestamps are stored as epoch seconds (f32 bits)
+        Some(f32::from_bits(packed_cell))
+    }
+
+    /// Compute attention masks for the sequence with bitpacking (SIMD-optimized for x86_64).
     #[cfg(target_arch = "x86_64")]
     fn compute_attention_masks(&self, seq: &mut SequenceSlice<'_>, idx: &SequenceIndices) {
         use std::arch::x86_64::*;
 
-        let seq_len = self.seq_len;
+        let seq_len = self.config.seq_len;
+        let words_per_row = words_for_bits(seq_len);
 
         unsafe {
             let minus_one = _mm256_set1_epi32(-1);
 
             for q in 0..seq_len {
+                // Skip padding rows (already zeroed in fill_sequence)
                 if seq.is_padding[q] {
                     continue;
                 }
@@ -928,110 +809,159 @@ impl Sampler {
                 let q_node = idx.node[q];
                 let q_table = idx.table[q];
                 let q_col = idx.column[q];
+                let q_f2p_start = q * MAX_F2P_NEIGHBORS;
 
                 let q_node_v = _mm256_set1_epi32(q_node);
                 let q_table_v = _mm256_set1_epi32(q_table);
                 let q_col_v = _mm256_set1_epi32(q_col);
 
-                let q_f2p_start = q * MAX_F2P_NEIGHBORS;
+                // Pre-broadcast q's f2p neighbors
                 let q_f2p: [__m256i; MAX_F2P_NEIGHBORS] =
                     std::array::from_fn(|i| _mm256_set1_epi32(idx.f2p_neighbors[q_f2p_start + i]));
 
-                let mask_row_start = q * seq_len;
-                let mut kv = 0;
-                let simd_len = seq_len / 8 * 8;
+                // Get mutable slices for this row of each mask
+                let row_start = q * words_per_row;
+                let col_row = &mut seq.column_attn_mask[row_start..row_start + words_per_row];
+                let feat_row = &mut seq.feature_attn_mask[row_start..row_start + words_per_row];
+                let nbr_row = &mut seq.neighbor_attn_mask[row_start..row_start + words_per_row];
 
-                while kv < simd_len {
-                    let kv_nodes = _mm256_loadu_si256(idx.node.as_ptr().add(kv) as *const __m256i);
-                    let kv_tables =
-                        _mm256_loadu_si256(idx.table.as_ptr().add(kv) as *const __m256i);
-                    let kv_cols = _mm256_loadu_si256(idx.column.as_ptr().add(kv) as *const __m256i);
+                // Process each u64 word (64 bits = 8 SIMD iterations of 8 elements each)
+                for word_idx in 0..words_per_row {
+                    let kv_base = word_idx * 64;
+                    let mut col_word = 0u64;
+                    let mut feat_word = 0u64;
+                    let mut nbr_word = 0u64;
 
-                    // Column attention: same col AND same table
-                    let col_eq = _mm256_cmpeq_epi32(q_col_v, kv_cols);
-                    let table_eq = _mm256_cmpeq_epi32(q_table_v, kv_tables);
-                    let col_result = _mm256_and_si256(col_eq, table_eq);
+                    // Process 8 kv positions at a time with AVX2
+                    let mut kv = 0usize;
+                    while kv < 64 && kv_base + kv < seq_len {
+                        let kv_abs = kv_base + kv;
+                        let remaining = (seq_len - kv_abs).min(8);
 
-                    // Feature attention: same node OR kv in q's f2p
-                    let same_node = _mm256_cmpeq_epi32(q_node_v, kv_nodes);
-                    let mut in_f2p = _mm256_setzero_si256();
-                    for i in 0..MAX_F2P_NEIGHBORS {
-                        let valid = _mm256_cmpgt_epi32(q_f2p[i], minus_one);
-                        let matches = _mm256_cmpeq_epi32(q_f2p[i], kv_nodes);
-                        in_f2p = _mm256_or_si256(in_f2p, _mm256_and_si256(valid, matches));
-                    }
-                    let feat_result = _mm256_or_si256(same_node, in_f2p);
+                        if remaining == 8 {
+                            // Full SIMD path: process 8 positions
+                            let kv_nodes =
+                                _mm256_loadu_si256(idx.node.as_ptr().add(kv_abs) as *const __m256i);
+                            let kv_tables = _mm256_loadu_si256(
+                                idx.table.as_ptr().add(kv_abs) as *const __m256i
+                            );
+                            let kv_cols = _mm256_loadu_si256(
+                                idx.column.as_ptr().add(kv_abs) as *const __m256i
+                            );
 
-                    // Neighbor attention: q_node in kv's f2p
-                    let indices = _mm256_set_epi32(
-                        ((kv + 7) * MAX_F2P_NEIGHBORS) as i32,
-                        ((kv + 6) * MAX_F2P_NEIGHBORS) as i32,
-                        ((kv + 5) * MAX_F2P_NEIGHBORS) as i32,
-                        ((kv + 4) * MAX_F2P_NEIGHBORS) as i32,
-                        ((kv + 3) * MAX_F2P_NEIGHBORS) as i32,
-                        ((kv + 2) * MAX_F2P_NEIGHBORS) as i32,
-                        ((kv + 1) * MAX_F2P_NEIGHBORS) as i32,
-                        (kv * MAX_F2P_NEIGHBORS) as i32,
-                    );
-                    let mut nbr_result = _mm256_setzero_si256();
-                    for i in 0..MAX_F2P_NEIGHBORS {
-                        let offset_indices = _mm256_add_epi32(indices, _mm256_set1_epi32(i as i32));
-                        let kv_neighbors =
-                            _mm256_i32gather_epi32::<4>(idx.f2p_neighbors.as_ptr(), offset_indices);
-                        let matches = _mm256_cmpeq_epi32(kv_neighbors, q_node_v);
-                        nbr_result = _mm256_or_si256(nbr_result, matches);
-                    }
+                            // Column attention: same col AND same table
+                            let col_eq = _mm256_cmpeq_epi32(q_col_v, kv_cols);
+                            let table_eq = _mm256_cmpeq_epi32(q_table_v, kv_tables);
+                            let col_result = _mm256_and_si256(col_eq, table_eq);
 
-                    let col_bits = _mm256_movemask_epi8(col_result) as u32;
-                    let feat_bits = _mm256_movemask_epi8(feat_result) as u32;
-                    let nbr_bits = _mm256_movemask_epi8(nbr_result) as u32;
+                            // Feature attention: same node OR kv in q's f2p
+                            let same_node = _mm256_cmpeq_epi32(q_node_v, kv_nodes);
+                            let mut in_f2p = _mm256_setzero_si256();
+                            for i in 0..MAX_F2P_NEIGHBORS {
+                                let valid = _mm256_cmpgt_epi32(q_f2p[i], minus_one);
+                                let matches = _mm256_cmpeq_epi32(q_f2p[i], kv_nodes);
+                                in_f2p = _mm256_or_si256(in_f2p, _mm256_and_si256(valid, matches));
+                            }
+                            let feat_result = _mm256_or_si256(same_node, in_f2p);
 
-                    for lane in 0..8 {
-                        if !seq.is_padding[kv + lane] {
-                            let mask_idx = mask_row_start + kv + lane;
-                            let bit_pos = lane * 4;
-                            seq.column_attn_mask[mask_idx] = (col_bits >> bit_pos) & 0xF != 0;
-                            seq.feature_attn_mask[mask_idx] = (feat_bits >> bit_pos) & 0xF != 0;
-                            seq.neighbor_attn_mask[mask_idx] = (nbr_bits >> bit_pos) & 0xF != 0;
+                            // Neighbor attention: q_node in kv's f2p neighbors
+                            let kv_f2p_indices = _mm256_set_epi32(
+                                ((kv_abs + 7) * MAX_F2P_NEIGHBORS) as i32,
+                                ((kv_abs + 6) * MAX_F2P_NEIGHBORS) as i32,
+                                ((kv_abs + 5) * MAX_F2P_NEIGHBORS) as i32,
+                                ((kv_abs + 4) * MAX_F2P_NEIGHBORS) as i32,
+                                ((kv_abs + 3) * MAX_F2P_NEIGHBORS) as i32,
+                                ((kv_abs + 2) * MAX_F2P_NEIGHBORS) as i32,
+                                ((kv_abs + 1) * MAX_F2P_NEIGHBORS) as i32,
+                                (kv_abs * MAX_F2P_NEIGHBORS) as i32,
+                            );
+                            let mut nbr_result = _mm256_setzero_si256();
+                            for i in 0..MAX_F2P_NEIGHBORS {
+                                let offset_indices =
+                                    _mm256_add_epi32(kv_f2p_indices, _mm256_set1_epi32(i as i32));
+                                let kv_neighbors = _mm256_i32gather_epi32::<4>(
+                                    idx.f2p_neighbors.as_ptr(),
+                                    offset_indices,
+                                );
+                                let matches = _mm256_cmpeq_epi32(kv_neighbors, q_node_v);
+                                nbr_result = _mm256_or_si256(nbr_result, matches);
+                            }
+
+                            // Extract 8 bits from each result
+                            // movemask gives us 32 bits (4 bits per lane), we need 1 bit per lane
+                            let col_mask =
+                                _mm256_movemask_ps(_mm256_castsi256_ps(col_result)) as u8;
+                            let feat_mask =
+                                _mm256_movemask_ps(_mm256_castsi256_ps(feat_result)) as u8;
+                            let nbr_mask =
+                                _mm256_movemask_ps(_mm256_castsi256_ps(nbr_result)) as u8;
+
+                            // Apply padding mask
+                            let mut pad_mask = 0xFFu8;
+                            for lane in 0..8 {
+                                if seq.is_padding[kv_abs + lane] {
+                                    pad_mask &= !(1u8 << lane);
+                                }
+                            }
+
+                            col_word |= ((col_mask & pad_mask) as u64) << kv;
+                            feat_word |= ((feat_mask & pad_mask) as u64) << kv;
+                            nbr_word |= ((nbr_mask & pad_mask) as u64) << kv;
+
+                            kv += 8;
+                        } else {
+                            // Scalar fallback for remainder
+                            for lane in 0..remaining {
+                                let kv_pos = kv_abs + lane;
+                                if seq.is_padding[kv_pos] {
+                                    continue;
+                                }
+
+                                let kv_node = idx.node[kv_pos];
+                                let kv_table = idx.table[kv_pos];
+                                let kv_col = idx.column[kv_pos];
+                                let bit_pos = kv + lane;
+
+                                if q_col == kv_col && q_table == kv_table {
+                                    col_word |= 1u64 << bit_pos;
+                                }
+
+                                let same_node = q_node == kv_node;
+                                let kv_in_q_f2p = (0..MAX_F2P_NEIGHBORS).any(|i| {
+                                    let n = idx.f2p_neighbors[q_f2p_start + i];
+                                    n >= 0 && n == kv_node
+                                });
+                                if same_node || kv_in_q_f2p {
+                                    feat_word |= 1u64 << bit_pos;
+                                }
+
+                                let kv_f2p_start = kv_pos * MAX_F2P_NEIGHBORS;
+                                let q_in_kv_f2p = (0..MAX_F2P_NEIGHBORS)
+                                    .any(|i| idx.f2p_neighbors[kv_f2p_start + i] == q_node);
+                                if q_in_kv_f2p {
+                                    nbr_word |= 1u64 << bit_pos;
+                                }
+                            }
+                            kv += remaining;
                         }
                     }
 
-                    kv += 8;
-                }
-
-                // Scalar fallback for remainder
-                while kv < seq_len {
-                    if !seq.is_padding[kv] {
-                        let kv_node = idx.node[kv];
-                        let kv_table = idx.table[kv];
-                        let kv_col = idx.column[kv];
-                        let mask_idx = mask_row_start + kv;
-
-                        seq.column_attn_mask[mask_idx] = (q_col == kv_col) && (q_table == kv_table);
-
-                        let same_node = q_node == kv_node;
-                        let kv_in_q_f2p = (0..MAX_F2P_NEIGHBORS).any(|i| {
-                            let n = idx.f2p_neighbors[q_f2p_start + i];
-                            n >= 0 && n == kv_node
-                        });
-                        seq.feature_attn_mask[mask_idx] = same_node || kv_in_q_f2p;
-
-                        let kv_f2p_start = kv * MAX_F2P_NEIGHBORS;
-                        let q_in_kv_f2p = (0..MAX_F2P_NEIGHBORS)
-                            .any(|i| idx.f2p_neighbors[kv_f2p_start + i] == q_node);
-                        seq.neighbor_attn_mask[mask_idx] = q_in_kv_f2p;
-                    }
-                    kv += 1;
+                    col_row[word_idx] = col_word;
+                    feat_row[word_idx] = feat_word;
+                    nbr_row[word_idx] = nbr_word;
                 }
             }
         }
     }
 
+    /// Compute attention masks for the sequence with bitpacking (scalar fallback).
     #[cfg(not(target_arch = "x86_64"))]
     fn compute_attention_masks(&self, seq: &mut SequenceSlice<'_>, idx: &SequenceIndices) {
-        let seq_len = self.seq_len;
+        let seq_len = self.config.seq_len;
+        let words_per_row = words_for_bits(seq_len);
 
         for q in 0..seq_len {
+            // Skip padding rows (already zeroed in fill_sequence)
             if seq.is_padding[q] {
                 continue;
             }
@@ -1041,50 +971,174 @@ impl Sampler {
             let q_col = idx.column[q];
             let q_f2p_start = q * MAX_F2P_NEIGHBORS;
 
-            for kv in 0..seq_len {
-                if seq.is_padding[kv] {
-                    continue;
+            let row_start = q * words_per_row;
+            let col_row = &mut seq.column_attn_mask[row_start..row_start + words_per_row];
+            let feat_row = &mut seq.feature_attn_mask[row_start..row_start + words_per_row];
+            let nbr_row = &mut seq.neighbor_attn_mask[row_start..row_start + words_per_row];
+
+            for word_idx in 0..words_per_row {
+                let kv_start = word_idx * 64;
+                let kv_end = (kv_start + 64).min(seq_len);
+
+                let mut col_word = 0u64;
+                let mut feat_word = 0u64;
+                let mut nbr_word = 0u64;
+
+                for kv in kv_start..kv_end {
+                    if seq.is_padding[kv] {
+                        continue;
+                    }
+
+                    let kv_node = idx.node[kv];
+                    let kv_table = idx.table[kv];
+                    let kv_col = idx.column[kv];
+                    let bit_pos = kv - kv_start;
+
+                    if q_col == kv_col && q_table == kv_table {
+                        col_word |= 1u64 << bit_pos;
+                    }
+
+                    let same_node = q_node == kv_node;
+                    let kv_in_q_f2p = (0..MAX_F2P_NEIGHBORS).any(|i| {
+                        let n = idx.f2p_neighbors[q_f2p_start + i];
+                        n >= 0 && n == kv_node
+                    });
+                    if same_node || kv_in_q_f2p {
+                        feat_word |= 1u64 << bit_pos;
+                    }
+
+                    let kv_f2p_start = kv * MAX_F2P_NEIGHBORS;
+                    let q_in_kv_f2p = (0..MAX_F2P_NEIGHBORS)
+                        .any(|i| idx.f2p_neighbors[kv_f2p_start + i] == q_node);
+                    if q_in_kv_f2p {
+                        nbr_word |= 1u64 << bit_pos;
+                    }
                 }
 
-                let kv_node = idx.node[kv];
-                let kv_table = idx.table[kv];
-                let kv_col = idx.column[kv];
-                let mask_idx = q * seq_len + kv;
-
-                seq.column_attn_mask[mask_idx] = (q_col == kv_col) && (q_table == kv_table);
-
-                let same_node = q_node == kv_node;
-                let kv_in_q_f2p = (0..MAX_F2P_NEIGHBORS).any(|i| {
-                    let n = idx.f2p_neighbors[q_f2p_start + i];
-                    n >= 0 && n == kv_node
-                });
-                seq.feature_attn_mask[mask_idx] = same_node || kv_in_q_f2p;
-
-                let kv_f2p_start = kv * MAX_F2P_NEIGHBORS;
-                let q_in_kv_f2p =
-                    (0..MAX_F2P_NEIGHBORS).any(|i| idx.f2p_neighbors[kv_f2p_start + i] == q_node);
-                seq.neighbor_attn_mask[mask_idx] = q_in_kv_f2p;
+                col_row[word_idx] = col_word;
+                feat_row[word_idx] = feat_word;
+                nbr_row[word_idx] = nbr_word;
             }
         }
     }
+}
 
-    fn get_row_timestamp(&self, db: &Database, row_idx: RowIdx) -> Option<f32> {
-        let row = db.get_row(row_idx);
-        let table = db.get_table(row.table_idx);
-        let time_col = table.time_col?;
-        let local_idx = (time_col.0 - table.column_range.0.0) as usize;
+// ============================================================================
+// Non-PyO3 Constructor (for testing)
+// ============================================================================
 
-        if let Some(ts) = row.raw_timestamp {
-            return Some(ts);
+impl Sampler {
+    /// Common initialization logic for both PyO3 and Rust-native constructors.
+    fn init(database: Database, config: SamplerConfig) -> Self {
+        let d_text = database.embed_dim as usize;
+        let seeds: Vec<RowIdx> = (0..database.num_rows()).map(|i| RowIdx(i as u32)).collect();
+        Self {
+            database,
+            seeds,
+            config,
+            d_text,
+            epoch: 0,
         }
+    }
 
-        if let Some(NormalizedCellValue::Scalar(z)) = row.normalized.get(local_idx) {
-            // Reconstruct from normalized datetime if raw values were stripped.
-            let mean = db.datetime_norm_mean.unwrap_or(0.0);
-            let std = db.datetime_norm_std.unwrap_or(1.0).max(1e-8);
-            return Some(*z * std + mean);
+    /// Create a new Sampler from a path, without requiring PyO3.
+    /// This is the Rust-native version for use in tests and internal code.
+    pub fn from_path(db_path: &Path, config: SamplerConfig) -> std::io::Result<Self> {
+        let database = Database::load(db_path)?;
+        Ok(Self::init(database, config))
+    }
+
+    /// Get the database reference for inspection.
+    pub fn database(&self) -> &Database {
+        &self.database
+    }
+
+    /// Get the configuration.
+    pub fn config(&self) -> &SamplerConfig {
+        &self.config
+    }
+
+    /// Number of batches.
+    pub fn num_batches(&self) -> usize {
+        self.seeds.len().div_ceil(self.config.batch_size)
+    }
+
+    /// Generate a batch (public accessor for testing).
+    /// NOTE: This allocates a new BatchVecs each call. For better performance,
+    /// use `get_batch_reuse` which reuses an internal buffer.
+    pub fn get_batch(&self, batch_idx: usize) -> BatchVecs {
+        self.batch(batch_idx)
+    }
+
+    /// Generate a batch into the provided buffer, reusing memory.
+    /// This avoids allocation overhead by reusing the same BatchVecs.
+    pub fn fill_batch_into(&self, batch_idx: usize, vecs: &mut BatchVecs) {
+        vecs.reset();
+
+        let start_idx = batch_idx * self.config.batch_size;
+        let actual_batch_size = self
+            .config
+            .batch_size
+            .min(self.seeds.len().saturating_sub(start_idx));
+
+        if actual_batch_size > 0 {
+            self.fill_batch_vecs(vecs, start_idx, actual_batch_size);
         }
+    }
 
-        None
+    /// Create a reusable BatchVecs buffer sized for this sampler's config.
+    pub fn create_batch_buffer(&self) -> BatchVecs {
+        BatchVecs::new(self.config.batch_size, self.config.seq_len, self.d_text)
+    }
+
+    /// Shuffle seeds for a new epoch (Rust-native version).
+    pub fn shuffle(&mut self, epoch: u64) {
+        self.epoch = epoch;
+        let mut rng = StdRng::seed_from_u64(epoch.wrapping_add(self.config.seed));
+        self.seeds.shuffle(&mut rng);
+    }
+}
+
+/// Generate slice accessor methods for BatchVecs fields.
+macro_rules! batch_vec_accessors {
+    ($($name:ident: $ty:ty),* $(,)?) => {
+        impl BatchVecs {
+            $(
+                pub fn $name(&self) -> &[$ty] { &self.$name }
+            )*
+
+            pub fn seq_len(&self) -> usize { self.semantic_types.len() }
+        }
+    };
+}
+
+batch_vec_accessors! {
+    semantic_types: i32,
+    numerical_values: f32,
+    masks: bool,
+    is_padding: bool,
+    categorical_values: f16,
+    text_values: f16,
+    timestamp_values: f32,
+    column_name_values: f16,
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_masking_strategy_default() {
+        let strategy = MaskingStrategy::default();
+        match strategy {
+            MaskingStrategy::Random { mask_rate } => {
+                assert!((mask_rate - 0.15).abs() < 0.001);
+            }
+            _ => panic!("Expected Random masking strategy"),
+        }
     }
 }

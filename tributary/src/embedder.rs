@@ -1,4 +1,4 @@
-//! Text embedding module using Qwen3-Embedding-0.6B via candle.
+//! Text embedding module.
 //!
 //! Provides CUDA-accelerated text embeddings with:
 //! - Batch embedding API for efficient processing
@@ -330,7 +330,7 @@ impl EmbeddingModel {
 // Embedder
 // ============================================================================
 
-/// Text embedder using Qwen3-Embedding with CUDA support
+/// Text embedder using BERT with CUDA support
 pub struct Embedder {
     /// The loaded model
     inner: Arc<RwLock<Option<EmbeddingModel>>>,
@@ -464,9 +464,10 @@ impl Embedder {
 
         let inner = Arc::clone(&self.inner);
         let batch_size = self.config.batch_size;
+        let embed_dim = self.embedding_dim();
 
         let handle = thread::spawn(move || {
-            Self::worker_loop(inner, rx, database, batch_size);
+            Self::worker_loop(inner, rx, database, batch_size, embed_dim);
         });
 
         self.worker_handle = Some(handle);
@@ -479,6 +480,7 @@ impl Embedder {
         rx: Receiver<WorkItem>,
         database: Arc<Mutex<Database>>,
         batch_size: usize,
+        embed_dim: usize,
     ) {
         let mut text_batch: Vec<(String, EmbeddingIdx)> = Vec::with_capacity(batch_size);
         let mut col_batch: Vec<(String, ColumnIdx)> = Vec::with_capacity(batch_size);
@@ -488,23 +490,23 @@ impl Embedder {
                 Ok(WorkItem::Shutdown) => {
                     debug!("Worker received shutdown signal");
                     if !text_batch.is_empty() {
-                        Self::process_text_batch(&inner, &database, &mut text_batch);
+                        Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
                     }
                     if !col_batch.is_empty() {
-                        Self::process_column_batch(&inner, &database, &mut col_batch);
+                        Self::process_column_batch(&inner, &database, &mut col_batch, embed_dim);
                     }
                     break;
                 }
                 Ok(WorkItem::TextValue { text, idx }) => {
                     text_batch.push((text, idx));
                     if text_batch.len() >= batch_size {
-                        Self::process_text_batch(&inner, &database, &mut text_batch);
+                        Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
                     }
                 }
                 Ok(WorkItem::ColumnDescription { text, col_idx }) => {
                     col_batch.push((text, col_idx));
                     if col_batch.len() >= batch_size {
-                        Self::process_column_batch(&inner, &database, &mut col_batch);
+                        Self::process_column_batch(&inner, &database, &mut col_batch, embed_dim);
                     }
                 }
                 Err(_) => {
@@ -518,10 +520,15 @@ impl Embedder {
                 match item {
                     WorkItem::Shutdown => {
                         if !text_batch.is_empty() {
-                            Self::process_text_batch(&inner, &database, &mut text_batch);
+                            Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
                         }
                         if !col_batch.is_empty() {
-                            Self::process_column_batch(&inner, &database, &mut col_batch);
+                            Self::process_column_batch(
+                                &inner,
+                                &database,
+                                &mut col_batch,
+                                embed_dim,
+                            );
                         }
                         return;
                     }
@@ -534,19 +541,19 @@ impl Embedder {
                 }
 
                 if text_batch.len() >= batch_size {
-                    Self::process_text_batch(&inner, &database, &mut text_batch);
+                    Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
                 }
                 if col_batch.len() >= batch_size {
-                    Self::process_column_batch(&inner, &database, &mut col_batch);
+                    Self::process_column_batch(&inner, &database, &mut col_batch, embed_dim);
                 }
             }
 
             // Process partial batches
             if !text_batch.is_empty() {
-                Self::process_text_batch(&inner, &database, &mut text_batch);
+                Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
             }
             if !col_batch.is_empty() {
-                Self::process_column_batch(&inner, &database, &mut col_batch);
+                Self::process_column_batch(&inner, &database, &mut col_batch, embed_dim);
             }
         }
 
@@ -558,6 +565,7 @@ impl Embedder {
         inner: &Arc<RwLock<Option<EmbeddingModel>>>,
         database: &Arc<Mutex<Database>>,
         batch: &mut Vec<(String, EmbeddingIdx)>,
+        _embed_dim: usize,
     ) {
         if batch.is_empty() {
             return;
@@ -574,8 +582,8 @@ impl Embedder {
                     for ((_, idx), embedding) in batch.drain(..).zip(embeddings) {
                         let f16_embedding: Vec<f16> =
                             embedding.into_iter().map(f16::from_f32).collect();
-                        if idx.0 < db.text_embeddings.len() {
-                            db.text_embeddings[idx.0] = f16_embedding;
+                        if (idx.0 as usize) < db.vocab_size() {
+                            db.set_embedding(idx, &f16_embedding);
                         }
                     }
                     debug!("Processed {} text embeddings", batch_len);
@@ -595,6 +603,7 @@ impl Embedder {
         inner: &Arc<RwLock<Option<EmbeddingModel>>>,
         database: &Arc<Mutex<Database>>,
         batch: &mut Vec<(String, ColumnIdx)>,
+        _embed_dim: usize,
     ) {
         if batch.is_empty() {
             return;
@@ -611,8 +620,8 @@ impl Embedder {
                     for ((_, col_idx), embedding) in batch.drain(..).zip(embeddings) {
                         let f16_embedding: Vec<f16> =
                             embedding.into_iter().map(f16::from_f32).collect();
-                        if col_idx.0 < db.columns.len() {
-                            db.columns[col_idx.0].description_embedding = f16_embedding;
+                        if (col_idx.0 as usize) < db.columns.len() {
+                            db.set_column_embedding(col_idx, &f16_embedding);
                         }
                     }
                     debug!("Processed {} column embeddings", batch_len);
@@ -681,6 +690,9 @@ impl Drop for Embedder {
 pub fn embed_all_column_descriptions(embedder: &Embedder, db: &mut Database) -> Result<()> {
     info!("Embedding {} column descriptions...", db.columns.len());
 
+    // Initialize column embeddings storage
+    db.init_column_embeddings(embedder.embedding_dim() as u32);
+
     // Collect all "<column_name> of <table_name>" strings
     let descriptions: Vec<String> = db
         .columns
@@ -696,9 +708,9 @@ pub fn embed_all_column_descriptions(embedder: &Embedder, db: &mut Database) -> 
     // Embed in chunks
     let embeddings = embedder.embed_batch_chunked_f16(&refs, embedder.config.batch_size)?;
 
-    // Store embeddings on columns
-    for (col, embedding) in db.columns.iter_mut().zip(embeddings) {
-        col.description_embedding = embedding;
+    // Store embeddings
+    for (col_idx, embedding) in embeddings.into_iter().enumerate() {
+        db.set_column_embedding(ColumnIdx(col_idx as u32), &embedding);
     }
 
     info!("Embedded {} column descriptions", db.columns.len());
@@ -708,90 +720,6 @@ pub fn embed_all_column_descriptions(embedder: &Embedder, db: &mut Database) -> 
 /// Create a placeholder embedding (zeros) for lazy initialization
 pub fn placeholder_embedding(dim: usize) -> Vec<f16> {
     vec![f16::ZERO; dim]
-}
-
-// ==============================================================================
-// Embedding Context - manages streaming text embedding during loading a database
-// ==============================================================================
-
-/// Context for managing embeddings during database loading.
-/// Accumulates text values and embeds them in batches for efficiency.
-struct EmbeddingContext<'a> {
-    embedder: &'a Embedder,
-    /// Pending texts to embed: (text, EmbeddingIdx)
-    pending_texts: Vec<(String, EmbeddingIdx)>,
-    /// Batch size for embedding
-    batch_size: usize,
-}
-
-impl<'a> EmbeddingContext<'a> {
-    fn new(embedder: &'a Embedder) -> Self {
-        let batch_size = embedder.config.batch_size;
-        Self {
-            embedder,
-            pending_texts: Vec::with_capacity(batch_size),
-            batch_size,
-        }
-    }
-
-    /// Intern a text value, queueing it for batch embedding.
-    fn intern_text(&mut self, db: &mut Database, text: &str) -> EmbeddingIdx {
-        if let Some(&idx) = db.text_lookup.get(text) {
-            return idx;
-        }
-
-        let idx = EmbeddingIdx(db.text_lookup.len());
-        db.text_lookup.insert(text.to_string(), idx);
-        // Push empty placeholder - will be filled when batch is flushed
-        db.text_embeddings.push(Vec::new());
-
-        self.pending_texts.push((text.to_string(), idx));
-
-        // Flush batch if full
-        if self.pending_texts.len() >= self.batch_size {
-            self.flush_text_batch(db);
-        }
-
-        idx
-    }
-
-    /// Flush any pending text embeddings
-    fn flush_text_batch(&mut self, db: &mut Database) {
-        if self.pending_texts.is_empty() {
-            return;
-        }
-
-        let texts: Vec<&str> = self.pending_texts.iter().map(|(s, _)| s.as_str()).collect();
-        let count = texts.len();
-
-        match self.embedder.embed_batch_f16(&texts) {
-            Ok(embeddings) => {
-                for ((_, idx), embedding) in self.pending_texts.drain(..).zip(embeddings) {
-                    if idx.0 < db.text_embeddings.len() {
-                        db.text_embeddings[idx.0] = embedding;
-                    }
-                }
-                debug!("Embedded {} text values", count);
-            }
-            Err(e) => {
-                warn!("Failed to embed text batch: {}", e);
-                self.pending_texts.clear();
-            }
-        }
-    }
-
-    /// Embed a column description synchronously
-    fn embed_column_description(&self, table_name: &str, col_name: &str) -> Vec<f16> {
-        let description = format!("{} of {}", col_name, table_name);
-        self.embedder
-            .embed_one_f16(&description)
-            .expect("Failed to embed column description")
-    }
-
-    /// Finalize: flush any remaining pending texts
-    fn finalize(&mut self, db: &mut Database) {
-        self.flush_text_batch(db);
-    }
 }
 
 // ============================================================================

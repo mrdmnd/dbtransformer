@@ -7,7 +7,8 @@ This rust crate is designed to do two things:
 
 ## Preprocessing
 
-Each input database (for pre-training, or fine-tuning) is expected to be represented as a directory with the following (example) structure:
+Each input database (for pre-training, or fine-tuning) is expected to be represented as a directory with the following (example) structure.
+These live in cloud storage, in a bucket: `gs://dbtransformer/databases_raw`
 
 ```bash
 (database_name)
@@ -37,7 +38,7 @@ There should be one parquet file for each table in the database, and a metadata.
         "ignored_columns": [],
     },
     "rating": {
-        "primary_key_column": "id",
+        "primary_key_column": null,
         "foreign_key_column_to_primary_key_table": {
             "user_id": "user",
             "movie_id": "movie"

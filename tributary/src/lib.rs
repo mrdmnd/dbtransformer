@@ -14,15 +14,19 @@ static GLOBAL: MiMalloc = MiMalloc;
 pub mod embedder;
 pub mod sampler;
 pub mod types;
+pub mod utility;
 
 // Re-export common types at crate root
 pub use types::{
-    CellValue, Column, ColumnIdx, Database, DatabaseMetadata, EmbeddingIdx, ForeignKeyEdge,
-    Row, RowIdx, SemanticType, Table, TableIdx, TableMetadata, TIMESTAMP_DIM,
-    load_metadata,
+    Column, ColumnIdx, CsrGraph, Database, DatabaseMetadata, EmbeddingIdx, PACKED_NULL, PackedCell,
+    PreprocessingContext, RowIdx, SemanticType, Table, TableIdx, TableMetadata, is_packed_null,
+    load_metadata, pack_embedding_idx, pack_null, pack_numerical, pack_timestamp,
 };
+pub use utility::{TIMESTAMP_DIM, expand_timestamp};
 
-pub use embedder::{Embedder, EmbedderConfig, EmbedderError, EMBEDDING_DIM};
+pub use embedder::{EMBEDDING_DIM, Embedder, EmbedderConfig, EmbedderError};
+
+pub use sampler::{BatchVecs, MaskingStrategy, Sampler, SamplerConfig};
 
 #[pymodule]
 fn tributary(m: &Bound<'_, PyModule>) -> PyResult<()> {
