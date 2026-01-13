@@ -2,9 +2,9 @@
 PyTorch Distributed Training Script
 ====================================
 Always run with uv run torchrun:
-    Single process:   uv run torchrun --nproc_per_node=1 dbtransformer/bin/train.py --num-workers 1
-    2 GPUs:           uv run torchrun --nproc_per_node=2 dbtransformer/bin/train.py --num-workers 2
-    8 GPUs:           uv run torchrun --nproc_per_node=8 dbtransformer/bin/train.py --num-workers 8
+    Single process:   uv run torchrun --nproc_per_node=1 dbtransformer/train.py --num-workers 1
+    2 GPUs:           uv run torchrun --nproc_per_node=2 dbtransformer/train.py --num-workers 2
+    8 GPUs:           uv run torchrun --nproc_per_node=8 dbtransformer/train.py --num-workers 8
 """
 
 import os
@@ -12,6 +12,7 @@ import random
 import time
 from collections.abc import Iterator
 from dataclasses import asdict
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -26,6 +27,8 @@ from wandb.sdk.wandb_run import Run as WandbRun
 
 import wandb
 from dbtransformer.configurations import (
+    DEFAULT_OVERALL_CONFIG,
+    DataConfig,
     DDPParameters,
     OverallConfig,
 )
@@ -104,14 +107,16 @@ class Trainer:
 
         # Rust sampler dataset yields full Batch objects (no collation needed).
         self.dataset = SamplerBatchDataset(
-            config.data,
-            config.model,
-            config.training,
-            self.ddp_parameters,
+            data_config=config.data,
+            model_config=config.model,
+            training_config=config.training,
+            sampler_config=config.sampler,
+            ddp_parameters=self.ddp_parameters,
         )
 
         # Rust sampler already partitions by rank/world_size internally so we DO NOT
         # need to wrap it with a DistributedSampler.
+        self.dist_sampler = None  # Not needed; sharding handled in SamplerBatchDataset
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=None,
@@ -123,6 +128,25 @@ class Trainer:
             persistent_workers=config.training.num_workers > 0,
             prefetch_factor=2 if config.training.num_workers > 0 else None,
         )
+
+        # Eval dataset/dataloader (optional, uses separate db dir if configured)
+        self.eval_dataset: SamplerBatchDataset | None = None
+        self.eval_dataloader: DataLoader[Batch] | None = None
+        if config.data.eval_db_dir is not None:
+            eval_data_config = DataConfig(db_dir=config.data.eval_db_dir)
+            self.eval_dataset = SamplerBatchDataset(
+                data_config=eval_data_config,
+                model_config=config.model,
+                training_config=config.training,
+                sampler_config=config.sampler,
+                ddp_parameters=self.ddp_parameters,
+            )
+            self.eval_dataloader = DataLoader(
+                self.eval_dataset,
+                batch_size=None,
+                num_workers=0,
+                pin_memory=True,
+            )
 
         self.optimizer = optim.AdamW(
             self.model.parameters(),
@@ -547,7 +571,7 @@ def main(config: OverallConfig) -> None:
     seed_everything(config.random_seed)
     ddp_parameters: DDPParameters = ddp_setup(config.training.ddp_backend)
     if ddp_parameters.global_rank == 0:
-        logger.success(f"Starting training with config:\n{overall_config!r}")
+        logger.success(f"Starting training with config:\n{config!r}")
     profiler_ctx = get_profiler_context(config.profiling)
 
     with profiler_ctx as prof:

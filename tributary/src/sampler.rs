@@ -5,7 +5,7 @@
 //!
 //! Key design decisions:
 //! - Single database per sampler (load multiple samplers for multi-DB training)
-//! - Configurable masking strategies (random, balanced, targeted)
+//! - Single-label masking: exactly one randomly-selected cell from seed row
 //! - Pre-computed attention masks on CPU to offload work from GPU
 //! - Thread-local buffers to avoid allocations in hot path
 
@@ -20,47 +20,15 @@ use pyo3::prelude::*;
 use rand::prelude::*;
 use rayon::prelude::*;
 
-use crate::types::{ColumnIdx, Database, EmbeddingIdx, RowIdx, SemanticType};
+use crate::types::{
+    ArchivedColumnExt, ArchivedTableExt, ColumnIdx, EmbeddingIdx, MappedDatabase, RowIdx,
+    SemanticType,
+};
 use crate::utility::{TIMESTAMP_DIM, expand_timestamp};
-
-// ============================================================================
-// Constants
-// ============================================================================
 
 /// Maximum number of foreign-to-primary neighbors tracked per cell.
 /// Used for computing feature attention masks.
 const MAX_F2P_NEIGHBORS: usize = 5;
-
-/// Default mask rate for random masking (15% like BERT).
-const DEFAULT_MASK_RATE: f32 = 0.15;
-
-// ============================================================================
-// Masking Strategy
-// ============================================================================
-
-/// Strategy for selecting which cells to mask during training.
-#[derive(Debug, Clone)]
-pub enum MaskingStrategy {
-    /// Mask cells randomly with given probability.
-    /// Good for pre-training.
-    Random { mask_rate: f32 },
-
-    /// Mask specific columns on the seed row.
-    /// Good for fine-tuning on a specific prediction task.
-    TargetColumns { columns: Vec<ColumnIdx> },
-
-    /// Random masking, but ensure each semantic type is represented.
-    /// Useful when data is imbalanced (e.g., 90% numerical cells).
-    BalancedRandom { mask_rate: f32 },
-}
-
-impl Default for MaskingStrategy {
-    fn default() -> Self {
-        MaskingStrategy::Random {
-            mask_rate: DEFAULT_MASK_RATE,
-        }
-    }
-}
 
 // ============================================================================
 // Raw Pointer Wrapper for Parallel Access
@@ -358,8 +326,12 @@ pub struct SamplerConfig {
     pub batch_size: usize,
     pub seq_len: usize,
     pub max_bfs_width: usize,
-    pub masking_strategy: MaskingStrategy,
     pub seed: u64,
+    /// Number of threads for parallel batch generation.
+    /// If None, uses rayon's default (number of logical CPUs).
+    /// For multi-process training (e.g., torchrun), set this to
+    /// num_cpus / world_size to avoid oversubscription.
+    pub num_threads: Option<usize>,
 }
 
 impl Default for SamplerConfig {
@@ -368,8 +340,8 @@ impl Default for SamplerConfig {
             batch_size: 32,
             seq_len: 1024,
             max_bfs_width: 256,
-            masking_strategy: MaskingStrategy::default(),
             seed: 42,
+            num_threads: None,
         }
     }
 }
@@ -381,38 +353,55 @@ impl Default for SamplerConfig {
 /// Graph sampler for relational databases.
 ///
 /// Loads a preprocessed database and samples BFS neighborhoods for training.
+/// Uses memory-mapped file access for efficient multi-process sharing.
 #[pyclass]
 pub struct Sampler {
-    database: Database,
+    /// Memory-mapped database - shared across all processes via OS page cache.
+    database: MappedDatabase,
     /// Seed rows for BFS traversal (shuffled each epoch).
     seeds: Vec<RowIdx>,
     config: SamplerConfig,
     d_text: usize,
     epoch: u64,
+    /// Thread pool for parallel batch generation.
+    /// Using a dedicated pool avoids conflicts with rayon's global pool
+    /// and allows per-sampler thread count configuration.
+    thread_pool: rayon::ThreadPool,
 }
 
 #[pymethods]
 impl Sampler {
     /// Create a new Sampler from a preprocessed database file.
     ///
+    /// The database is memory-mapped for efficient multi-process sharing.
+    /// When multiple torchrun workers load the same file, the OS shares
+    /// physical memory pages across processes.
+    ///
+    /// Masking: Exactly one randomly-selected cell from the seed row is masked
+    /// per sequence. This single-label strategy was shown to be more effective
+    /// than multi-mask approaches in ablation studies.
+    ///
     /// Args:
     ///     db_path: Path to the .rkyv database file
     ///     batch_size: Number of sequences per batch
     ///     seq_len: Maximum sequence length (cells per sequence)
     ///     max_bfs_width: Max neighbors sampled per BFS step
-    ///     mask_rate: Probability of masking each cell (for random masking)
     ///     seed: Random seed for reproducibility
+    ///     num_threads: Number of threads per process for parallel batch generation.
+    ///                  For multi-process training, set to num_cpus / world_size.
+    ///                  If None, defaults to 1 thread (safe for multi-process).
     #[new]
-    #[pyo3(signature = (db_path, batch_size=32, seq_len=1024, max_bfs_width=256, mask_rate=0.15, seed=42))]
+    #[pyo3(signature = (db_path, batch_size=32, seq_len=1024, max_bfs_width=256, seed=42, num_threads=None))]
     fn new(
         db_path: String,
         batch_size: usize,
         seq_len: usize,
         max_bfs_width: usize,
-        mask_rate: f32,
         seed: u64,
+        num_threads: Option<usize>,
     ) -> PyResult<Self> {
-        let database = Database::load(Path::new(&db_path)).map_err(|e| {
+        // Use memory-mapped loading for multi-process sharing
+        let database = MappedDatabase::load(Path::new(&db_path)).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("Failed to load database: {}", e))
         })?;
 
@@ -420,11 +409,14 @@ impl Sampler {
             batch_size,
             seq_len,
             max_bfs_width,
-            masking_strategy: MaskingStrategy::Random { mask_rate },
             seed,
+            // Default to 1 thread when called from Python (safe for multi-process)
+            num_threads: Some(num_threads.unwrap_or(1)),
         };
 
-        Ok(Self::init(database, config))
+        Self::try_init(database, config).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to create sampler: {}", e))
+        })
     }
 
     /// Number of batches in one epoch.
@@ -479,7 +471,7 @@ impl Sampler {
         vecs
     }
 
-    /// Fill batch vectors in parallel.
+    /// Fill batch vectors in parallel using the sampler's dedicated thread pool.
     fn fill_batch_vecs(&self, vecs: &mut BatchVecs, start_idx: usize, actual_batch_size: usize) {
         let seq_len = self.config.seq_len;
         let d_text = self.d_text;
@@ -498,66 +490,72 @@ impl Sampler {
         let feat_attn_ptr = SyncPtr::new(vecs.feature_attn_mask.as_mut_ptr());
         let nbr_attn_ptr = SyncPtr::new(vecs.neighbor_attn_mask.as_mut_ptr());
 
-        (0..actual_batch_size).into_par_iter().for_each(|i| {
-            let seed_row = self.seeds[start_idx + i];
+        // Use our dedicated thread pool instead of rayon's global pool
+        self.thread_pool.install(|| {
+            (0..actual_batch_size).into_par_iter().for_each(|i| {
+                let seed_row = self.seeds[start_idx + i];
 
-            let seq_offset = i * seq_len;
-            let text_offset = i * seq_len * d_text;
-            let ts_offset = i * seq_len * TIMESTAMP_DIM;
-            // Packed mask offset: each sequence has seq_len rows, each row has words_per_row u64s
-            let packed_mask_offset = i * seq_len * words_per_row;
-            let packed_mask_size = seq_len * words_per_row;
+                let seq_offset = i * seq_len;
+                let text_offset = i * seq_len * d_text;
+                let ts_offset = i * seq_len * TIMESTAMP_DIM;
+                // Packed mask offset: each sequence has seq_len rows, each row has words_per_row u64s
+                let packed_mask_offset = i * seq_len * words_per_row;
+                let packed_mask_size = seq_len * words_per_row;
 
-            let mut indices = SequenceIndices::new(seq_len);
-            let mut trav = get_traversal_buffers(self.database.num_rows());
+                let mut indices = SequenceIndices::new(seq_len);
+                let mut trav = get_traversal_buffers(self.database.num_rows());
 
-            unsafe {
-                let slice = SequenceSlice {
-                    numerical_values: std::slice::from_raw_parts_mut(
-                        num_ptr.add(seq_offset),
-                        seq_len,
-                    ),
-                    categorical_values: std::slice::from_raw_parts_mut(
-                        cat_ptr.add(text_offset),
-                        seq_len * d_text,
-                    ),
-                    text_values: std::slice::from_raw_parts_mut(
-                        text_ptr.add(text_offset),
-                        seq_len * d_text,
-                    ),
-                    timestamp_values: std::slice::from_raw_parts_mut(
-                        ts_ptr.add(ts_offset),
-                        seq_len * TIMESTAMP_DIM,
-                    ),
-                    column_name_values: std::slice::from_raw_parts_mut(
-                        colname_ptr.add(text_offset),
-                        seq_len * d_text,
-                    ),
-                    semantic_types: std::slice::from_raw_parts_mut(
-                        sem_ptr.add(seq_offset),
-                        seq_len,
-                    ),
-                    masks: std::slice::from_raw_parts_mut(mask_ptr.add(seq_offset), seq_len),
-                    is_padding: std::slice::from_raw_parts_mut(pad_ptr.add(seq_offset), seq_len),
-                    column_attn_mask: std::slice::from_raw_parts_mut(
-                        col_attn_ptr.add(packed_mask_offset),
-                        packed_mask_size,
-                    ),
-                    feature_attn_mask: std::slice::from_raw_parts_mut(
-                        feat_attn_ptr.add(packed_mask_offset),
-                        packed_mask_size,
-                    ),
-                    neighbor_attn_mask: std::slice::from_raw_parts_mut(
-                        nbr_attn_ptr.add(packed_mask_offset),
-                        packed_mask_size,
-                    ),
-                };
+                unsafe {
+                    let slice = SequenceSlice {
+                        numerical_values: std::slice::from_raw_parts_mut(
+                            num_ptr.add(seq_offset),
+                            seq_len,
+                        ),
+                        categorical_values: std::slice::from_raw_parts_mut(
+                            cat_ptr.add(text_offset),
+                            seq_len * d_text,
+                        ),
+                        text_values: std::slice::from_raw_parts_mut(
+                            text_ptr.add(text_offset),
+                            seq_len * d_text,
+                        ),
+                        timestamp_values: std::slice::from_raw_parts_mut(
+                            ts_ptr.add(ts_offset),
+                            seq_len * TIMESTAMP_DIM,
+                        ),
+                        column_name_values: std::slice::from_raw_parts_mut(
+                            colname_ptr.add(text_offset),
+                            seq_len * d_text,
+                        ),
+                        semantic_types: std::slice::from_raw_parts_mut(
+                            sem_ptr.add(seq_offset),
+                            seq_len,
+                        ),
+                        masks: std::slice::from_raw_parts_mut(mask_ptr.add(seq_offset), seq_len),
+                        is_padding: std::slice::from_raw_parts_mut(
+                            pad_ptr.add(seq_offset),
+                            seq_len,
+                        ),
+                        column_attn_mask: std::slice::from_raw_parts_mut(
+                            col_attn_ptr.add(packed_mask_offset),
+                            packed_mask_size,
+                        ),
+                        feature_attn_mask: std::slice::from_raw_parts_mut(
+                            feat_attn_ptr.add(packed_mask_offset),
+                            packed_mask_size,
+                        ),
+                        neighbor_attn_mask: std::slice::from_raw_parts_mut(
+                            nbr_attn_ptr.add(packed_mask_offset),
+                            packed_mask_size,
+                        ),
+                    };
 
-                self.fill_sequence(seed_row, slice, &mut indices, &mut trav);
-            }
+                    self.fill_sequence(seed_row, slice, &mut indices, &mut trav);
+                }
 
-            return_traversal_buffers(trav);
-        });
+                return_traversal_buffers(trav);
+            });
+        }); // end thread_pool.install
     }
 
     /// Fill a single sequence via BFS traversal.
@@ -588,6 +586,23 @@ impl Sampler {
                 .wrapping_add(seed_row.0 as u64)
                 .wrapping_add(self.config.seed),
         );
+
+        // Select which cell from the seed row to mask (the "label").
+        // Any non-NULL feature column cell is eligible for masking.
+        let seed_cells = db.row_cells(seed_row);
+
+        // Count eligible non-NULL cells for masking
+        let eligible_count = seed_cells
+            .iter()
+            .filter(|&&c| !crate::types::is_packed_null(c))
+            .count();
+
+        let label_cell_idx = if eligible_count > 0 {
+            rng.random_range(0..eligible_count)
+        } else {
+            0 // Edge case: no eligible cells
+        };
+        let mut seed_eligible_counter = 0usize;
 
         // BFS traversal
         while let Some((depth, row_idx)) = trav.pop_next(&mut rng) {
@@ -623,7 +638,7 @@ impl Sampler {
                 // Only include children from the seed table (for task-focused sampling)
                 // or all children (for broader exploration)
                 let child_table_idx = db.row_table(child_row);
-                if child_table_idx == seed_table.idx {
+                if child_table_idx == seed_table.idx_native() {
                     trav.children.push(child_row);
                 }
             }
@@ -648,19 +663,21 @@ impl Sampler {
                 trav.p2f_frontier[depth + 1].push(child_row);
             }
 
-            // Fill cells from this row
+            // Fill cells from this row (node)
+            // PK/FK columns were excluded at preprocessing time
             let row_cells = db.row_cells(row_idx);
-            let table_columns = db.table_columns(table_idx);
+            let table = db.table(table_idx);
             let is_seed_row = row_idx == seed_row;
 
-            for (local_idx, &packed_cell) in row_cells.iter().enumerate() {
-                // Skip null cells
+            for (cell_pos, &packed_cell) in row_cells.iter().enumerate() {
+                // Skip NULL cells (stored as PACKED_NULL sentinel)
                 if crate::types::is_packed_null(packed_cell) {
                     continue;
                 }
 
-                let column = &table_columns[local_idx];
-                let global_col_idx = column.idx;
+                // Get the column for this cell position
+                let global_col_idx = table.cell_column(cell_pos);
+                let column = db.column(global_col_idx);
 
                 // Fill indices for attention mask computation
                 idx.node[seq_i] = row_idx.0 as i32;
@@ -677,10 +694,11 @@ impl Sampler {
                 }
 
                 // Fill semantic type
-                seq.semantic_types[seq_i] = column.stype as i32;
+                let stype = column.stype_native();
+                seq.semantic_types[seq_i] = stype as i32;
 
                 // Fill cell value based on semantic type
-                self.fill_cell_value(&mut seq, seq_i, packed_cell, column.stype);
+                self.fill_cell_value(&mut seq, seq_i, packed_cell, stype);
 
                 // Fill column embedding
                 let col_embedding = db.get_column_embedding(global_col_idx);
@@ -688,8 +706,14 @@ impl Sampler {
                 let end = start + self.d_text;
                 seq.column_name_values[start..end].copy_from_slice(col_embedding);
 
-                // Apply masking strategy
-                seq.masks[seq_i] = self.should_mask(&mut rng, is_seed_row, global_col_idx);
+                // Apply masking: only the selected cell from seed row is masked
+                if is_seed_row {
+                    // All non-NULL cells are eligible (we already skip NULLs above)
+                    seq.masks[seq_i] = seed_eligible_counter == label_cell_idx;
+                    seed_eligible_counter += 1;
+                } else {
+                    seq.masks[seq_i] = false;
+                }
                 seq.is_padding[seq_i] = false;
 
                 seq_i += 1;
@@ -734,8 +758,8 @@ impl Sampler {
             SemanticType::Timestamp => {
                 // Packed cell is epoch seconds as f32 bits
                 let epoch_secs = f32::from_bits(packed_cell);
-                let mean = db.timestamp_mean.unwrap_or(0.0);
-                let std = db.timestamp_std.unwrap_or(1.0);
+                let mean = db.timestamp_mean().unwrap_or(0.0);
+                let std = db.timestamp_std().unwrap_or(1.0);
                 let expanded = expand_timestamp(epoch_secs, mean, std);
                 let start = seq_i * TIMESTAMP_DIM;
                 seq.timestamp_values[start..start + TIMESTAMP_DIM].copy_from_slice(&expanded);
@@ -751,36 +775,22 @@ impl Sampler {
         }
     }
 
-    /// Determine if a cell should be masked based on the masking strategy.
-    fn should_mask(&self, rng: &mut StdRng, is_seed_row: bool, col_idx: ColumnIdx) -> bool {
-        match &self.config.masking_strategy {
-            MaskingStrategy::Random { mask_rate } => rng.random::<f32>() < *mask_rate,
-            MaskingStrategy::TargetColumns { columns } => is_seed_row && columns.contains(&col_idx),
-            MaskingStrategy::BalancedRandom { mask_rate } => {
-                // TODO: Track type counts and balance masking
-                // For now, fall back to random
-                rng.random::<f32>() < *mask_rate
-            }
-        }
-    }
-
     /// Get the timestamp of a row (if it has a time column).
     fn get_row_timestamp(&self, row_idx: RowIdx) -> Option<f32> {
         let db = &self.database;
         let table_idx = db.row_table(row_idx);
         let table = db.table(table_idx);
 
-        let time_col_idx = table.time_column?;
+        let time_col_idx = table.time_column_native()?;
 
-        // Get the local index of the time column within this row
-        let local_idx = (time_col_idx.0 - table.column_range.0.0) as usize;
+        // Find the position of the time column in the feature_columns list
+        let cell_pos = table
+            .feature_columns_slice()
+            .iter()
+            .position(|col| ColumnIdx(col.0.into()) == time_col_idx)?;
 
         let row_cells = db.row_cells(row_idx);
-        if local_idx >= row_cells.len() {
-            return None;
-        }
-
-        let packed_cell = row_cells[local_idx];
+        let packed_cell = row_cells[cell_pos];
         if crate::types::is_packed_null(packed_cell) {
             return None;
         }
@@ -1028,28 +1038,51 @@ impl Sampler {
 // ============================================================================
 
 impl Sampler {
-    /// Common initialization logic for both PyO3 and Rust-native constructors.
-    fn init(database: Database, config: SamplerConfig) -> Self {
-        let d_text = database.embed_dim as usize;
+    /// Common initialization logic - can fail if thread pool creation fails.
+    fn try_init(
+        database: MappedDatabase,
+        config: SamplerConfig,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        let d_text = database.embed_dim();
+
+        // All rows are potential seeds - any feature column can be masked during training.
         let seeds: Vec<RowIdx> = (0..database.num_rows()).map(|i| RowIdx(i as u32)).collect();
-        Self {
+
+        // Build thread pool with configured number of threads
+        let num_threads = config.num_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()?;
+
+        Ok(Self {
             database,
             seeds,
             config,
             d_text,
             epoch: 0,
-        }
+            thread_pool,
+        })
     }
 
     /// Create a new Sampler from a path, without requiring PyO3.
     /// This is the Rust-native version for use in tests and internal code.
+    /// Uses memory-mapped file access for efficient multi-process sharing.
     pub fn from_path(db_path: &Path, config: SamplerConfig) -> std::io::Result<Self> {
-        let database = Database::load(db_path)?;
-        Ok(Self::init(database, config))
+        let database = MappedDatabase::load(db_path)?;
+        Self::try_init(database, config).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Thread pool error: {}", e),
+            )
+        })
     }
 
     /// Get the database reference for inspection.
-    pub fn database(&self) -> &Database {
+    pub fn database(&self) -> &MappedDatabase {
         &self.database
     }
 
@@ -1121,24 +1154,4 @@ batch_vec_accessors! {
     text_values: f16,
     timestamp_values: f32,
     column_name_values: f16,
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_masking_strategy_default() {
-        let strategy = MaskingStrategy::default();
-        match strategy {
-            MaskingStrategy::Random { mask_rate } => {
-                assert!((mask_rate - 0.15).abs() < 0.001);
-            }
-            _ => panic!("Expected Random masking strategy"),
-        }
-    }
 }

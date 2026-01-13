@@ -3,7 +3,6 @@
 //! Optimized for speed and memory efficiency:
 //! - Columnar processing using Polars vectorized operations
 //! - Pre-allocation of all vectors
-//! - Parallel row building with rayon
 //! - Streaming table processing (one table in memory at a time)
 //!
 //! Usage:
@@ -15,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use polars::prelude::*;
@@ -24,8 +23,9 @@ use tracing_subscriber::FmtSubscriber;
 
 use tributary::{
     Column as SchemaColumn, ColumnIdx, Database, DatabaseMetadata, Embedder, EmbedderConfig,
-    EmbeddingIdx, PackedCell, PreprocessingContext, RowIdx, SemanticType, Table, TableIdx,
-    TableMetadata, load_metadata, pack_embedding_idx, pack_null, pack_numerical, pack_timestamp,
+    EmbeddingIdx, NO_TIMESTAMP, PackedCell, PreprocessingContext, RowIdx, SemanticType, Table,
+    TableIdx, TableMetadata, load_metadata, pack_embedding_idx, pack_null, pack_numerical,
+    pack_timestamp,
 };
 
 // ============================================================================
@@ -44,12 +44,19 @@ struct Args {
 
     #[arg(short, long, default_value = "false")]
     verbose: bool,
+
+    /// Number of rows to process at a time (controls memory usage).
+    /// Smaller values use less memory but are slower.
+    /// Default: 100000 rows per chunk.
+    #[arg(long, default_value = "100000")]
+    chunk_size: usize,
 }
 
 // ============================================================================
 // Polars Dtype -> SemanticType
 // ============================================================================
 
+/// Maps Polars data types to our semantic types.
 fn dtype_to_stype(dtype: &DataType) -> Option<SemanticType> {
     match dtype {
         DataType::Boolean => Some(SemanticType::Categorical),
@@ -73,7 +80,9 @@ fn dtype_to_stype(dtype: &DataType) -> Option<SemanticType> {
     }
 }
 
+/// Determines the semantic type for a column, respecting metadata overrides.
 fn determine_stype(col: &Column, col_name: &str, metadata: Option<&TableMetadata>) -> SemanticType {
+    // Check for metadata override first
     if let Some(meta) = metadata {
         if let Some(override_str) = meta.stype_overrides.get(col_name) {
             if let Some(stype) = SemanticType::from_str(override_str) {
@@ -81,6 +90,7 @@ fn determine_stype(col: &Column, col_name: &str, metadata: Option<&TableMetadata
             }
         }
     }
+    // Fall back to dtype inference
     match dtype_to_stype(col.dtype()) {
         Some(stype) => stype,
         None => {
@@ -98,6 +108,7 @@ fn determine_stype(col: &Column, col_name: &str, metadata: Option<&TableMetadata
 // Running Statistics (Welford's online algorithm)
 // ============================================================================
 
+/// Computes mean and std incrementally without storing all values.
 #[derive(Default, Clone, Copy)]
 struct RunningStats {
     count: u64,
@@ -128,7 +139,20 @@ impl RunningStats {
 }
 
 // ============================================================================
-// Table Info (lightweight metadata)
+// Column Statistics
+// ============================================================================
+
+/// Statistics collected for a single column during schema discovery.
+struct ColumnStats {
+    name: String,
+    dtype: DataType,
+    stype: SemanticType,
+    mean: Option<f32>,
+    std: Option<f32>,
+}
+
+// ============================================================================
+// Table Info (lightweight metadata for each table)
 // ============================================================================
 
 struct TableInfo {
@@ -136,148 +160,169 @@ struct TableInfo {
     path: PathBuf,
     num_rows: usize,
     metadata: Option<TableMetadata>,
-    /// (col_name, dtype, stype, mean, std)
-    column_stats: Vec<(String, DataType, SemanticType, Option<f32>, Option<f32>)>,
+    column_stats: Vec<ColumnStats>,
 }
 
 // ============================================================================
-// Column Data Extraction (vectorized)
+// Path Utilities
 // ============================================================================
 
-/// Extract all cell values for a column using vectorized Polars operations.
-/// Returns packed cells (u32) for memory efficiency.
-fn extract_column_vectorized(
+/// Converts a PathBuf to a string, returning an error if the path is invalid UTF-8.
+fn path_to_str(path: &PathBuf) -> Result<&str> {
+    path.to_str()
+        .with_context(|| format!("Path contains invalid UTF-8: {:?}", path))
+}
+
+// ============================================================================
+// Column Filtering
+// ============================================================================
+
+/// Returns true if the column should be ignored.
+/// Ignores:
+/// - Columns explicitly listed in metadata's ignored_columns
+/// - Pandas index columns (pattern: "Unnamed: N" where N is a number)
+fn should_ignore_column(col_name: &str, ignored_cols: &[&str]) -> bool {
+    if ignored_cols.contains(&col_name) {
+        return true;
+    }
+    // Skip pandas-style unnamed index columns: "Unnamed: 0", "Unnamed: 1", etc.
+    if col_name.starts_with("Unnamed: ") {
+        if col_name[9..].parse::<u32>().is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+// ============================================================================
+// Timestamp Conversion
+// ============================================================================
+
+/// Iterates over a datetime column, calling the callback with epoch seconds for each value.
+fn iter_datetime_as_epoch_secs<F: FnMut(Option<i64>)>(col: &Column, mut f: F) {
+    match col.dtype() {
+        DataType::Datetime(unit, _tz) => {
+            if let Ok(ca) = col.datetime() {
+                for opt_val in ca.phys.into_iter() {
+                    let epoch = opt_val.map(|v| match unit {
+                        TimeUnit::Nanoseconds => v / 1_000_000_000,
+                        TimeUnit::Microseconds => v / 1_000_000,
+                        TimeUnit::Milliseconds => v / 1_000,
+                    });
+                    f(epoch);
+                }
+            }
+        }
+        DataType::Date => {
+            if let Ok(ca) = col.date() {
+                for opt_val in ca.phys.into_iter() {
+                    f(opt_val.map(|days| days as i64 * 86400));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
+// Column Data Extraction (per semantic type)
+// ============================================================================
+
+/// Extracts numerical column values, normalizing by mean/std.
+fn extract_numerical(col: &Column, mean: f64, std: f64) -> Vec<PackedCell> {
+    let n = col.len();
+    let mut values = Vec::with_capacity(n);
+
+    if let Ok(f64_col) = col.cast(&DataType::Float64) {
+        if let Ok(ca) = f64_col.f64() {
+            for opt_val in ca.into_iter() {
+                match opt_val {
+                    Some(v) if v.is_finite() => {
+                        let normalized = ((v - mean) / std.max(1e-8)) as f32;
+                        values.push(pack_numerical(normalized));
+                    }
+                    _ => values.push(pack_null()),
+                }
+            }
+            return values;
+        }
+    }
+
+    // Fallback: all nulls
+    values.resize(n, pack_null());
+    values
+}
+
+/// Extracts categorical column values as "column_name is value" text embeddings.
+fn extract_categorical(
     col: &Column,
-    schema_col: &SchemaColumn,
+    col_name: &str,
     ctx: &mut PreprocessingContext,
 ) -> Vec<PackedCell> {
     let n = col.len();
     let mut values = Vec::with_capacity(n);
 
-    match schema_col.stype {
-        SemanticType::Numerical => {
-            let mean = schema_col.norm_mean.unwrap_or(0.0) as f64;
-            let std = schema_col.norm_std.unwrap_or(1.0) as f64;
+    for row_idx in 0..n {
+        if let Ok(AnyValue::Null) = col.get(row_idx) {
+            values.push(pack_null());
+            continue;
+        }
+        let val_str = get_string_value(col, row_idx).unwrap_or_else(|| "unknown".into());
+        let text = format!("{} is {}", col_name, val_str);
+        let idx = ctx.intern_text(&text);
+        values.push(pack_embedding_idx(idx));
+    }
 
-            // Try to cast to f64 for vectorized processing
-            if let Ok(f64_col) = col.cast(&DataType::Float64) {
-                if let Ok(ca) = f64_col.f64() {
-                    for opt_val in ca.into_iter() {
-                        match opt_val {
-                            Some(v) if v.is_finite() => {
-                                let normalized = ((v - mean) / std.max(1e-8)) as f32;
-                                values.push(pack_numerical(normalized));
-                            }
-                            _ => values.push(pack_null()),
-                        }
-                    }
-                    return values;
+    values
+}
+
+/// Extracts timestamp column values as epoch seconds (stored as f32).
+fn extract_timestamp(col: &Column) -> Vec<PackedCell> {
+    let n = col.len();
+    let mut values = Vec::with_capacity(n);
+
+    iter_datetime_as_epoch_secs(col, |opt_epoch| match opt_epoch {
+        Some(epoch_secs) => values.push(pack_timestamp(epoch_secs as f32)),
+        None => values.push(pack_null()),
+    });
+
+    // If iter didn't produce values (unsupported dtype), fill with nulls
+    if values.is_empty() {
+        values.resize(n, pack_null());
+    }
+
+    values
+}
+
+/// Extracts text column values as embedding indices.
+fn extract_text(col: &Column, ctx: &mut PreprocessingContext) -> Vec<PackedCell> {
+    let n = col.len();
+    let mut values = Vec::with_capacity(n);
+
+    if let Ok(str_col) = col.str() {
+        for opt_val in str_col.into_iter() {
+            match opt_val {
+                Some(s) if !s.is_empty() => {
+                    let idx = ctx.intern_text(s);
+                    values.push(pack_embedding_idx(idx));
                 }
-            }
-            // Fallback
-            for _ in 0..n {
-                values.push(pack_null());
+                _ => values.push(pack_null()),
             }
         }
-
-        SemanticType::Categorical => {
-            // Format as "column_name is value" to give embedding model context
-            let col_name = &schema_col.name;
-            for row_idx in 0..n {
-                if let Ok(AnyValue::Null) = col.get(row_idx) {
+    } else {
+        // Fallback: convert each value to string
+        for row_idx in 0..n {
+            if let Ok(AnyValue::Null) = col.get(row_idx) {
+                values.push(pack_null());
+            } else if let Some(s) = get_string_value(col, row_idx) {
+                if s.is_empty() {
                     values.push(pack_null());
-                    continue;
-                }
-                let val_str = get_string_value(col, row_idx).unwrap_or_else(|| "unknown".into());
-                let text = format!("{} is {}", col_name, val_str);
-                let idx = ctx.intern_text(&text);
-                values.push(pack_embedding_idx(idx));
-            }
-        }
-
-        SemanticType::Timestamp => {
-            match col.dtype() {
-                DataType::Datetime(_, _) => {
-                    if let Ok(ca) = col.datetime() {
-                        for opt_val in ca.phys.into_iter() {
-                            match opt_val {
-                                Some(v) => {
-                                    let epoch_secs = (v as f64 / 1_000_000.0) as f32;
-                                    values.push(pack_timestamp(epoch_secs));
-                                }
-                                None => values.push(pack_null()),
-                            }
-                        }
-                        return values;
-                    }
-                }
-                DataType::Date => {
-                    if let Ok(ca) = col.date() {
-                        for opt_val in ca.phys.into_iter() {
-                            match opt_val {
-                                Some(v) => {
-                                    let epoch_secs = (v as f64 * 86400.0) as f32;
-                                    values.push(pack_timestamp(epoch_secs));
-                                }
-                                None => values.push(pack_null()),
-                            }
-                        }
-                        return values;
-                    }
-                }
-                DataType::Int64 | DataType::UInt64 => {
-                    if let Ok(ca) = col.i64() {
-                        for opt_val in ca.into_iter() {
-                            match opt_val {
-                                Some(v) => {
-                                    let epoch_secs = if v > 1_000_000_000_000 {
-                                        (v as f64 / 1000.0) as f32
-                                    } else {
-                                        v as f32
-                                    };
-                                    values.push(pack_timestamp(epoch_secs));
-                                }
-                                None => values.push(pack_null()),
-                            }
-                        }
-                        return values;
-                    }
-                }
-                _ => {}
-            }
-            // Fallback
-            for _ in 0..n {
-                values.push(pack_null());
-            }
-        }
-
-        SemanticType::Text => {
-            if let Ok(str_col) = col.str() {
-                for opt_val in str_col.into_iter() {
-                    match opt_val {
-                        Some(s) if !s.is_empty() => {
-                            let idx = ctx.intern_text(s);
-                            values.push(pack_embedding_idx(idx));
-                        }
-                        _ => values.push(pack_null()),
-                    }
+                } else {
+                    let idx = ctx.intern_text(&s);
+                    values.push(pack_embedding_idx(idx));
                 }
             } else {
-                // Fallback for non-string columns
-                for row_idx in 0..n {
-                    if let Ok(AnyValue::Null) = col.get(row_idx) {
-                        values.push(pack_null());
-                    } else if let Some(s) = get_string_value(col, row_idx) {
-                        if s.is_empty() {
-                            values.push(pack_null());
-                        } else {
-                            let idx = ctx.intern_text(&s);
-                            values.push(pack_embedding_idx(idx));
-                        }
-                    } else {
-                        values.push(pack_null());
-                    }
-                }
+                values.push(pack_null());
             }
         }
     }
@@ -285,6 +330,25 @@ fn extract_column_vectorized(
     values
 }
 
+/// Extracts all cell values for a column, dispatching to the appropriate type handler.
+fn extract_column(
+    col: &Column,
+    schema_col: &SchemaColumn,
+    ctx: &mut PreprocessingContext,
+) -> Vec<PackedCell> {
+    match schema_col.stype {
+        SemanticType::Numerical => {
+            let mean = schema_col.norm_mean.unwrap_or(0.0) as f64;
+            let std = schema_col.norm_std.unwrap_or(1.0) as f64;
+            extract_numerical(col, mean, std)
+        }
+        SemanticType::Categorical => extract_categorical(col, &schema_col.name, ctx),
+        SemanticType::Timestamp => extract_timestamp(col),
+        SemanticType::Text => extract_text(col, ctx),
+    }
+}
+
+/// Converts a cell value to string representation.
 fn get_string_value(col: &Column, row_idx: usize) -> Option<String> {
     match col.get(row_idx) {
         Ok(AnyValue::Null) => None,
@@ -296,12 +360,127 @@ fn get_string_value(col: &Column, row_idx: usize) -> Option<String> {
 }
 
 // ============================================================================
-// Phase 1: Schema and Statistics
+// Integer Column Iteration (for PK/FK handling)
 // ============================================================================
 
+/// Iterates over an integer column, calling the callback with (row_idx, value) for non-null values.
+/// Handles Int32, Int64, UInt32, UInt64, and String columns.
+/// Returns the number of null/unhandled values for diagnostics.
+fn iter_integer_column<F: FnMut(usize, i64)>(
+    col: &Column,
+    col_name: &str,
+    mut f: F,
+) -> (usize, usize) {
+    let mut handled = 0usize;
+    let mut skipped = 0usize;
+
+    match col.dtype() {
+        DataType::Int64 => {
+            if let Ok(ca) = col.i64() {
+                for (row_idx, opt_val) in ca.into_iter().enumerate() {
+                    match opt_val {
+                        Some(v) => {
+                            f(row_idx, v);
+                            handled += 1;
+                        }
+                        None => skipped += 1,
+                    }
+                }
+            }
+        }
+        DataType::Int32 => {
+            if let Ok(ca) = col.i32() {
+                for (row_idx, opt_val) in ca.into_iter().enumerate() {
+                    match opt_val {
+                        Some(v) => {
+                            f(row_idx, v as i64);
+                            handled += 1;
+                        }
+                        None => skipped += 1,
+                    }
+                }
+            }
+        }
+        DataType::UInt64 => {
+            if let Ok(ca) = col.u64() {
+                for (row_idx, opt_val) in ca.into_iter().enumerate() {
+                    match opt_val {
+                        Some(v) => {
+                            f(row_idx, v as i64);
+                            handled += 1;
+                        }
+                        None => skipped += 1,
+                    }
+                }
+            }
+        }
+        DataType::UInt32 => {
+            if let Ok(ca) = col.u32() {
+                for (row_idx, opt_val) in ca.into_iter().enumerate() {
+                    match opt_val {
+                        Some(v) => {
+                            f(row_idx, v as i64);
+                            handled += 1;
+                        }
+                        None => skipped += 1,
+                    }
+                }
+            }
+        }
+        DataType::String => {
+            // Try to parse string values as integers
+            if let Ok(ca) = col.str() {
+                for (row_idx, opt_val) in ca.into_iter().enumerate() {
+                    match opt_val {
+                        Some(s) => {
+                            if let Ok(v) = s.parse::<i64>() {
+                                f(row_idx, v);
+                                handled += 1;
+                            } else {
+                                skipped += 1;
+                            }
+                        }
+                        None => skipped += 1,
+                    }
+                }
+            }
+        }
+        dtype => {
+            warn!(
+                "Column '{}' has unsupported dtype {:?} for PK/FK - skipping",
+                col_name, dtype
+            );
+            skipped = col.len();
+        }
+    }
+
+    (handled, skipped)
+}
+
+// ============================================================================
+// Phase 1: Schema and Statistics (Chunked)
+// ============================================================================
+
+/// Gets the total row count from a parquet file without loading data.
+fn get_parquet_row_count(path: &PathBuf) -> Result<usize> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open parquet file: {:?}", path))?;
+    let reader = SerializedFileReader::new(file)
+        .with_context(|| format!("Failed to read parquet metadata: {:?}", path))?;
+    let metadata = reader.metadata();
+    let num_rows: i64 = (0..metadata.num_row_groups())
+        .map(|i| metadata.row_group(i).num_rows())
+        .sum();
+    Ok(num_rows as usize)
+}
+
+/// Scans all parquet files to collect schema information and statistics.
+/// Uses chunked processing to avoid loading entire files into memory.
 fn collect_schema_and_stats(
     input_dir: &PathBuf,
     metadata: &DatabaseMetadata,
+    chunk_size: usize,
 ) -> Result<(Vec<TableInfo>, RunningStats)> {
     let db_dir = input_dir.join("db");
     let mut tables = Vec::new();
@@ -319,6 +498,10 @@ fn collect_schema_and_stats(
         })
         .collect();
 
+    if entries.is_empty() {
+        bail!("No parquet files found in {:?}", db_dir);
+    }
+
     let pb = ProgressBar::new(entries.len() as u64);
     pb.set_style(
         ProgressStyle::with_template("{spinner:.green} Scanning: {pos}/{len} tables").unwrap(),
@@ -326,65 +509,114 @@ fn collect_schema_and_stats(
 
     for entry in entries {
         let path = entry.path();
+        let path_str = path_to_str(&path)?;
         let table_name = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let df = LazyFrame::scan_parquet(
-            PlPath::new(path.to_str().unwrap()),
-            ScanArgsParquet::default(),
-        )?
-        .collect()
-        .with_context(|| format!("Failed to read parquet: {:?}", path))?;
-
-        let num_rows = df.height();
         let table_metadata = metadata.get(&table_name).cloned();
         let ignored_cols: Vec<&str> = table_metadata
             .as_ref()
             .map(|m| m.ignored_columns.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();
 
-        let mut column_stats = Vec::new();
+        // Get row count from parquet metadata (no data loading)
+        let num_rows = get_parquet_row_count(&path)?;
 
-        for col in df.get_columns() {
+        // Get schema from first few rows
+        let schema_df = LazyFrame::scan_parquet(PlPath::new(path_str), ScanArgsParquet::default())?
+            .slice(0, 1)
+            .collect()
+            .with_context(|| format!("Failed to read schema from: {:?}", path))?;
+
+        // Initialize running stats per column
+        let mut column_running_stats: HashMap<String, (DataType, SemanticType, RunningStats)> =
+            HashMap::new();
+
+        // Initialize from schema
+        for col in schema_df.get_columns() {
             let col_name = col.name().to_string();
-            if ignored_cols.contains(&col_name.as_str()) {
+            if should_ignore_column(&col_name, &ignored_cols) {
                 continue;
             }
-            // Skip "Unnamed" columns (imputed primary keys from pandas/CSV imports)
-            if col_name.starts_with("Unnamed") {
-                continue;
-            }
-
             let stype = determine_stype(col, &col_name, table_metadata.as_ref());
-
             let dtype = col.dtype().clone();
+            column_running_stats.insert(col_name, (dtype, stype, RunningStats::default()));
+        }
 
-            let (mean, std) = if stype == SemanticType::Numerical {
-                let mut stats = RunningStats::default();
-                if let Ok(f64_col) = col.cast(&DataType::Float64) {
-                    if let Ok(ca) = f64_col.f64() {
-                        for opt_val in ca.into_iter() {
-                            if let Some(val) = opt_val {
-                                if val.is_finite() {
-                                    stats.update(val);
+        // Process file in chunks to collect stats
+        let mut offset: i64 = 0;
+        let chunk_size_i64 = chunk_size as i64;
+
+        while (offset as usize) < num_rows {
+            let df = LazyFrame::scan_parquet(PlPath::new(path_str), ScanArgsParquet::default())?
+                .slice(offset, chunk_size_i64 as u32)
+                .collect()
+                .with_context(|| format!("Failed to read chunk at offset {} from: {:?}", offset, path))?;
+
+            if df.height() == 0 {
+                break;
+            }
+
+            for col in df.get_columns() {
+                let col_name = col.name().to_string();
+                let Some(entry) = column_running_stats.get_mut(&col_name) else {
+                    continue;
+                };
+
+                // Update running stats for numerical columns
+                if entry.1 == SemanticType::Numerical {
+                    if let Ok(f64_col) = col.cast(&DataType::Float64) {
+                        if let Ok(ca) = f64_col.f64() {
+                            for opt_val in ca.into_iter() {
+                                if let Some(val) = opt_val {
+                                    if val.is_finite() {
+                                        entry.2.update(val);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                (Some(stats.mean() as f32), Some(stats.std() as f32))
-            } else {
-                (None, None)
-            };
 
-            if stype == SemanticType::Timestamp {
-                collect_timestamp_stats(col, &mut global_ts_stats);
+                // Collect timestamp stats for global normalization
+                if entry.1 == SemanticType::Timestamp {
+                    iter_datetime_as_epoch_secs(col, |opt_epoch| {
+                        if let Some(epoch_secs) = opt_epoch {
+                            global_ts_stats.update(epoch_secs as f64);
+                        }
+                    });
+                }
             }
 
-            column_stats.push((col_name, dtype, stype, mean, std));
+            offset += df.height() as i64;
+        }
+
+        // Convert running stats to ColumnStats (preserve column order from schema)
+        let mut column_stats = Vec::new();
+        for col in schema_df.get_columns() {
+            let col_name = col.name().to_string();
+            if should_ignore_column(&col_name, &ignored_cols) {
+                continue;
+            }
+
+            if let Some((dtype, stype, stats)) = column_running_stats.remove(&col_name) {
+                let (mean, std) = if stype == SemanticType::Numerical {
+                    (Some(stats.mean() as f32), Some(stats.std() as f32))
+                } else {
+                    (None, None)
+                };
+
+                column_stats.push(ColumnStats {
+                    name: col_name,
+                    dtype,
+                    stype,
+                    mean,
+                    std,
+                });
+            }
         }
 
         tables.push(TableInfo {
@@ -403,48 +635,11 @@ fn collect_schema_and_stats(
     Ok((tables, global_ts_stats))
 }
 
-fn collect_timestamp_stats(col: &Column, stats: &mut RunningStats) {
-    match col.dtype() {
-        DataType::Datetime(_, _) => {
-            if let Ok(ca) = col.datetime() {
-                for opt_val in ca.phys.into_iter() {
-                    if let Some(val) = opt_val {
-                        stats.update(val as f64 / 1_000_000.0);
-                    }
-                }
-            }
-        }
-        DataType::Date => {
-            if let Ok(ca) = col.date() {
-                for opt_val in ca.phys.into_iter() {
-                    if let Some(val) = opt_val {
-                        stats.update(val as f64 * 86400.0);
-                    }
-                }
-            }
-        }
-        DataType::Int64 | DataType::UInt64 => {
-            if let Ok(ca) = col.i64() {
-                for opt_val in ca.into_iter() {
-                    if let Some(val) = opt_val {
-                        let epoch_secs = if val > 1_000_000_000_000 {
-                            val as f64 / 1000.0
-                        } else {
-                            val as f64
-                        };
-                        stats.update(epoch_secs);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 // ============================================================================
 // Phase 2: Build Schema
 // ============================================================================
 
+/// Builds the database schema from collected table info.
 fn build_schema(
     table_infos: &[TableInfo],
     embedder: &Embedder,
@@ -474,6 +669,7 @@ fn build_schema(
         let col_start = ColumnIdx(global_col_idx);
         let row_start = RowIdx(global_row_idx);
 
+        // Find PK and time columns from metadata
         let pk_col_name = info
             .metadata
             .as_ref()
@@ -482,30 +678,48 @@ fn build_schema(
         let mut pk_column_idx: Option<ColumnIdx> = None;
         let mut time_column_idx: Option<ColumnIdx> = None;
 
-        for (col_name, _dtype, stype, mean, std) in &info.column_stats {
-            let col_idx = ColumnIdx(global_col_idx);
-            column_name_to_idx.insert((table_idx, col_name.clone()), col_idx);
+        // Validate metadata references
+        if let Some(pk_name) = pk_col_name {
+            if !info.column_stats.iter().any(|c| &c.name == pk_name) {
+                warn!(
+                    "Table '{}': primary_key_column '{}' not found in schema",
+                    info.name, pk_name
+                );
+            }
+        }
+        if let Some(time_name) = time_col_name {
+            if !info.column_stats.iter().any(|c| &c.name == time_name) {
+                warn!(
+                    "Table '{}': time_column '{}' not found in schema",
+                    info.name, time_name
+                );
+            }
+        }
 
-            let is_pk = pk_col_name.map(|s| s == col_name).unwrap_or(false);
+        for col_stats in &info.column_stats {
+            let col_idx = ColumnIdx(global_col_idx);
+            column_name_to_idx.insert((table_idx, col_stats.name.clone()), col_idx);
+
+            let is_pk = pk_col_name.map(|s| s == &col_stats.name).unwrap_or(false);
             if is_pk {
                 pk_column_idx = Some(col_idx);
             }
-            if time_col_name.map(|s| s == col_name).unwrap_or(false) {
+            if time_col_name.map(|s| s == &col_stats.name).unwrap_or(false) {
                 time_column_idx = Some(col_idx);
             }
 
-            let description = format!("{}.{}", info.name, col_name);
+            let description = format!("{}.{}", info.name, col_stats.name);
             column_descriptions.push((col_idx, description));
 
             db.columns.push(SchemaColumn {
-                name: col_name.clone(),
+                name: col_stats.name.clone(),
                 idx: col_idx,
                 table_idx,
-                stype: *stype,
+                stype: col_stats.stype,
                 is_primary_key: is_pk,
                 fk_target_column: None,
-                norm_mean: *mean,
-                norm_std: *std,
+                norm_mean: col_stats.mean,
+                norm_std: col_stats.std,
             });
 
             global_col_idx += 1;
@@ -518,6 +732,7 @@ fn build_schema(
             name: info.name.clone(),
             idx: table_idx,
             column_range: (col_start, col_end),
+            feature_columns: Vec::new(), // Populated after FK resolution
             row_range: (row_start, row_end),
             primary_key_column: pk_column_idx,
             time_column: time_column_idx,
@@ -547,32 +762,93 @@ fn build_schema(
             }
             Err(e) => {
                 warn!("Failed to embed column descriptions: {}", e);
-                // Leave as zeros
             }
         }
     }
 
     // Resolve FK references
-    for info in table_infos {
-        if let Some(ref meta) = info.metadata {
-            let table_idx = table_name_to_idx[&info.name];
-            for (fk_col_name, target_table_name) in &meta.foreign_key_column_to_primary_key_table {
-                if let Some(&fk_col_idx) = column_name_to_idx.get(&(table_idx, fk_col_name.clone()))
-                {
-                    if let Some(&target_table_idx) = table_name_to_idx.get(target_table_name) {
-                        if let Some(pk_col_idx) =
-                            db.tables[target_table_idx.0 as usize].primary_key_column
-                        {
-                            db.columns[fk_col_idx.0 as usize].fk_target_column = Some(pk_col_idx);
-                            debug!("FK: {}.{} -> {}", info.name, fk_col_name, target_table_name);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    resolve_foreign_keys(
+        table_infos,
+        &mut db,
+        &table_name_to_idx,
+        &column_name_to_idx,
+    );
+
+    // Compute feature_columns for each table (excludes PK and FK columns)
+    // Also computes target_columns from metadata
+    compute_feature_columns(&mut db, table_infos);
 
     (db, table_name_to_idx, column_name_to_idx)
+}
+
+/// Resolves foreign key references from metadata.
+fn resolve_foreign_keys(
+    table_infos: &[TableInfo],
+    db: &mut Database,
+    table_name_to_idx: &HashMap<String, TableIdx>,
+    column_name_to_idx: &HashMap<(TableIdx, String), ColumnIdx>,
+) {
+    for info in table_infos {
+        let Some(ref meta) = info.metadata else {
+            continue;
+        };
+        let table_idx = table_name_to_idx[&info.name];
+
+        for (fk_col_name, target_table_name) in &meta.foreign_key_column_to_primary_key_table {
+            // Validate FK column exists
+            let Some(&fk_col_idx) = column_name_to_idx.get(&(table_idx, fk_col_name.clone()))
+            else {
+                warn!(
+                    "Table '{}': FK column '{}' not found in schema",
+                    info.name, fk_col_name
+                );
+                continue;
+            };
+
+            // Validate target table exists
+            let Some(&target_table_idx) = table_name_to_idx.get(target_table_name) else {
+                warn!(
+                    "Table '{}': FK target table '{}' not found",
+                    info.name, target_table_name
+                );
+                continue;
+            };
+
+            // Validate target table has a PK
+            let Some(pk_col_idx) = db.tables[target_table_idx.0 as usize].primary_key_column else {
+                warn!(
+                    "Table '{}': FK target table '{}' has no primary key",
+                    info.name, target_table_name
+                );
+                continue;
+            };
+
+            db.columns[fk_col_idx.0 as usize].fk_target_column = Some(pk_col_idx);
+            debug!("FK: {}.{} -> {}", info.name, fk_col_name, target_table_name);
+        }
+    }
+}
+
+/// Computes which columns are features (not PK or FK) for each table.
+fn compute_feature_columns(db: &mut Database, _table_infos: &[TableInfo]) {
+    for table in db.tables.iter_mut() {
+        let mut feature_cols = Vec::new();
+        for col_idx in table.column_range.0.0..table.column_range.1.0 {
+            let col = &db.columns[col_idx as usize];
+            if !col.is_primary_key && col.fk_target_column.is_none() {
+                feature_cols.push(ColumnIdx(col_idx));
+            }
+        }
+
+        debug!(
+            "Table {}: {} feature columns (of {} total)",
+            table.name,
+            feature_cols.len(),
+            table.num_columns()
+        );
+
+        table.feature_columns = feature_cols;
+    }
 }
 
 // ============================================================================
@@ -583,26 +859,28 @@ fn print_schema_summary(table_infos: &[TableInfo]) {
     info!("Schema Summary:");
     for info in table_infos {
         info!("  Table: {} ({} rows)", info.name, info.num_rows);
-        for (col_name, dtype, stype, _mean, _std) in &info.column_stats {
+        for col_stats in &info.column_stats {
             info!(
                 "    {:30} | {:20} -> {:?}",
-                col_name,
-                format!("{:?}", dtype),
-                stype
+                col_stats.name,
+                format!("{:?}", col_stats.dtype),
+                col_stats.stype
             );
         }
     }
 }
 
 // ============================================================================
-// Phase 3: Process Tables (vectorized, parallel row building)
+// Phase 3: Process Tables (Chunked)
 // ============================================================================
 
+/// Processes all tables, extracting cell data and building PK indices.
+/// Uses chunked processing to avoid loading entire files into memory.
 fn process_tables(
     table_infos: &[TableInfo],
     db: &mut Database,
-    column_name_to_idx: &HashMap<(TableIdx, String), ColumnIdx>,
     ctx: &mut PreprocessingContext,
+    chunk_size: usize,
 ) -> Result<()> {
     let total_rows: usize = table_infos.iter().map(|t| t.num_rows).sum();
     let total_cells: usize = table_infos
@@ -632,13 +910,7 @@ fn process_tables(
         let table_idx = TableIdx(table_idx as u32);
         pb.set_message(format!("{}", info.name));
 
-        let df = LazyFrame::scan_parquet(
-            PlPath::new(info.path.to_str().unwrap()),
-            ScanArgsParquet::default(),
-        )?
-        .collect()
-        .with_context(|| format!("Failed to read parquet: {:?}", info.path))?;
-
+        let path_str = path_to_str(&info.path)?;
         let row_start = db.tables[table_idx.0 as usize].row_range.0.0;
 
         let ignored_cols: Vec<&str> = info
@@ -647,114 +919,158 @@ fn process_tables(
             .map(|m| m.ignored_columns.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();
 
-        let table_columns: Vec<_> = df
-            .get_columns()
-            .iter()
-            .filter(|c| !ignored_cols.contains(&c.name().as_str()))
-            .filter(|c| !c.name().starts_with("Unnamed"))
-            .collect();
+        // Get the feature columns for this table
+        let feature_columns = db.tables[table_idx.0 as usize].feature_columns.clone();
+        let num_feature_cols = feature_columns.len();
 
-        // Get schema info for each column
-        let schema_cols: Vec<SchemaColumn> = table_columns
-            .iter()
-            .map(|col| {
-                let col_name = col.name().to_string();
-                let schema_col_idx = column_name_to_idx[&(table_idx, col_name)];
-                db.columns[schema_col_idx.0 as usize].clone()
-            })
-            .collect();
+        // Get PK column name if present
+        let pk_col_name = db.tables[table_idx.0 as usize]
+            .primary_key_column
+            .map(|idx| db.columns[idx.0 as usize].name.clone());
 
-        // Extract all column data vectorized (as packed cells)
-        let mut column_data: Vec<Vec<PackedCell>> = Vec::with_capacity(table_columns.len());
-        for (col, schema_col) in table_columns.iter().zip(schema_cols.iter()) {
-            let values = extract_column_vectorized(col, schema_col, ctx);
-            column_data.push(values);
-        }
+        // Get time column name if present
+        let time_col_name = db.tables[table_idx.0 as usize]
+            .time_column
+            .map(|idx| db.columns[idx.0 as usize].name.clone());
 
-        // Build cells row by row from columnar data
-        let num_cols = column_data.len();
-        let mut row_buffer = Vec::with_capacity(num_cols);
-        for row_idx in 0..info.num_rows {
-            row_buffer.clear();
-            for col_data in &column_data {
-                row_buffer.push(col_data[row_idx]);
+        // Process file in chunks
+        let mut offset: i64 = 0;
+        let chunk_size_u32 = chunk_size as u32;
+        let mut rows_processed_in_table: u32 = 0;
+
+        while (offset as usize) < info.num_rows {
+            let df = LazyFrame::scan_parquet(PlPath::new(path_str), ScanArgsParquet::default())?
+                .slice(offset, chunk_size_u32)
+                .collect()
+                .with_context(|| format!("Failed to read chunk at offset {} from: {:?}", offset, info.path))?;
+
+            let batch_rows = df.height();
+            if batch_rows == 0 {
+                break;
             }
-            db.push_row(&row_buffer);
-        }
 
-        // Build PK index
-        if let Some(pk_col_idx) = db.tables[table_idx.0 as usize].primary_key_column {
-            let pk_col_name = &db.columns[pk_col_idx.0 as usize].name;
-            if let Ok(col) = df.column(pk_col_name) {
-                build_pk_index_vectorized(col, table_idx, row_start, ctx);
+            // Build column name -> polars column mapping (filtered)
+            let polars_columns: HashMap<&str, &Column> = df
+                .get_columns()
+                .iter()
+                .filter(|c| !should_ignore_column(c.name(), &ignored_cols))
+                .map(|c| (c.name().as_str(), c))
+                .collect();
+
+            // Extract feature column data as packed cells for this batch
+            let mut column_data: Vec<Vec<PackedCell>> = Vec::with_capacity(num_feature_cols);
+            for &col_idx in &feature_columns {
+                let schema_col = &db.columns[col_idx.0 as usize];
+                if let Some(polars_col) = polars_columns.get(schema_col.name.as_str()) {
+                    let values = extract_column(polars_col, schema_col, ctx);
+                    column_data.push(values);
+                } else {
+                    warn!("Feature column '{}' not found in parquet", schema_col.name);
+                    column_data.push(vec![pack_null(); batch_rows]);
+                }
             }
-        }
 
-        pb.set_position((row_start + info.num_rows as u32) as u64);
+            // Extract raw timestamps for this batch
+            let row_timestamps = extract_row_timestamps_batch(
+                &df,
+                time_col_name.as_deref(),
+                batch_rows,
+            );
+
+            // Build cells row by row from columnar data
+            let mut row_buffer = Vec::with_capacity(num_feature_cols);
+            for row_idx in 0..batch_rows {
+                row_buffer.clear();
+                for col_data in &column_data {
+                    row_buffer.push(col_data[row_idx]);
+                }
+                db.push_row(&row_buffer, row_timestamps[row_idx]);
+            }
+
+            // Build PK index for this batch
+            if let Some(ref pk_name) = pk_col_name {
+                if let Some(col) = polars_columns.get(pk_name.as_str()) {
+                    let batch_row_start = row_start + rows_processed_in_table;
+                    build_pk_index(col, pk_name, table_idx, batch_row_start, ctx);
+                }
+            }
+
+            rows_processed_in_table += batch_rows as u32;
+            offset += batch_rows as i64;
+            pb.set_position((row_start + rows_processed_in_table) as u64);
+        }
     }
 
     pb.finish_with_message("Done");
-
     Ok(())
 }
 
-fn build_pk_index_vectorized(
+/// Extracts raw i64 timestamps for each row in a batch from the time_column.
+/// Returns NO_TIMESTAMP for rows without a time_column or with null values.
+fn extract_row_timestamps_batch(
+    df: &DataFrame,
+    time_col_name: Option<&str>,
+    num_rows: usize,
+) -> Vec<i64> {
+    let Some(time_col_name) = time_col_name else {
+        return vec![NO_TIMESTAMP; num_rows];
+    };
+
+    let Ok(col) = df.column(time_col_name) else {
+        warn!("Time column '{}' not found in dataframe", time_col_name);
+        return vec![NO_TIMESTAMP; num_rows];
+    };
+
+    let mut timestamps = Vec::with_capacity(num_rows);
+    iter_datetime_as_epoch_secs(col, |opt_epoch| {
+        timestamps.push(opt_epoch.unwrap_or(NO_TIMESTAMP));
+    });
+
+    // If iteration didn't produce values (unsupported dtype), fill with NO_TIMESTAMP
+    if timestamps.is_empty() {
+        warn!(
+            "Time column '{}' has unsupported dtype {:?}",
+            time_col_name,
+            col.dtype()
+        );
+        timestamps.resize(num_rows, NO_TIMESTAMP);
+    }
+
+    timestamps
+}
+
+/// Builds the primary key index for a table.
+fn build_pk_index(
     col: &Column,
+    col_name: &str,
     table_idx: TableIdx,
     row_start: u32,
     ctx: &mut PreprocessingContext,
 ) {
-    match col.dtype() {
-        DataType::Int64 => {
-            if let Ok(ca) = col.i64() {
-                for (row_idx, opt_val) in ca.into_iter().enumerate() {
-                    if let Some(pk) = opt_val {
-                        ctx.register_pk(table_idx, pk, RowIdx(row_start + row_idx as u32));
-                    }
-                }
-            }
-        }
-        DataType::Int32 => {
-            if let Ok(ca) = col.i32() {
-                for (row_idx, opt_val) in ca.into_iter().enumerate() {
-                    if let Some(pk) = opt_val {
-                        ctx.register_pk(table_idx, pk as i64, RowIdx(row_start + row_idx as u32));
-                    }
-                }
-            }
-        }
-        DataType::UInt64 => {
-            if let Ok(ca) = col.u64() {
-                for (row_idx, opt_val) in ca.into_iter().enumerate() {
-                    if let Some(pk) = opt_val {
-                        ctx.register_pk(table_idx, pk as i64, RowIdx(row_start + row_idx as u32));
-                    }
-                }
-            }
-        }
-        DataType::UInt32 => {
-            if let Ok(ca) = col.u32() {
-                for (row_idx, opt_val) in ca.into_iter().enumerate() {
-                    if let Some(pk) = opt_val {
-                        ctx.register_pk(table_idx, pk as i64, RowIdx(row_start + row_idx as u32));
-                    }
-                }
-            }
-        }
-        _ => {}
+    let (handled, skipped) = iter_integer_column(col, col_name, |row_idx, pk| {
+        ctx.register_pk(table_idx, pk, RowIdx(row_start + row_idx as u32));
+    });
+
+    if skipped > 0 {
+        debug!(
+            "PK column '{}': indexed {} values, skipped {} nulls/invalid",
+            col_name, handled, skipped
+        );
     }
 }
 
 // ============================================================================
-// Phase 4: Build FK Edges
+// Phase 4: Build FK Edges (Chunked)
 // ============================================================================
 
+/// Builds foreign key edges between tables.
+/// Uses chunked processing to avoid loading entire files into memory.
 fn build_fk_edges(
     table_infos: &[TableInfo],
     db: &mut Database,
-    _column_name_to_idx: &HashMap<(TableIdx, String), ColumnIdx>,
     table_name_to_idx: &HashMap<String, TableIdx>,
     ctx: &PreprocessingContext,
+    chunk_size: usize,
 ) -> Result<()> {
     // Count FK columns for progress
     let total_fk_cols: usize = table_infos
@@ -765,7 +1081,6 @@ fn build_fk_edges(
 
     if total_fk_cols == 0 {
         info!("No foreign key edges to build");
-        // Initialize empty CSR
         db.build_csr_from_edges(Vec::new());
         return Ok(());
     }
@@ -776,118 +1091,123 @@ fn build_fk_edges(
             .unwrap(),
     );
 
-    // Collect all edges: (from_row, to_row)
     let mut all_edges: Vec<(u32, u32)> = Vec::new();
+    let mut total_orphaned = 0usize;
 
     for (table_idx, info) in table_infos.iter().enumerate() {
         let table_idx = TableIdx(table_idx as u32);
+        let Some(ref meta) = info.metadata else {
+            continue;
+        };
+        if meta.foreign_key_column_to_primary_key_table.is_empty() {
+            continue;
+        }
 
-        if let Some(ref meta) = info.metadata {
-            if meta.foreign_key_column_to_primary_key_table.is_empty() {
-                continue;
+        let fk_col_names: Vec<String> = meta
+            .foreign_key_column_to_primary_key_table
+            .keys()
+            .cloned()
+            .collect();
+
+        let path_str = path_to_str(&info.path)?;
+        let row_start = db.tables[table_idx.0 as usize].row_range.0.0;
+
+        // Process file in chunks, selecting only FK columns
+        let mut offset: i64 = 0;
+        let chunk_size_u32 = chunk_size as u32;
+        let mut rows_processed: u32 = 0;
+
+        while (offset as usize) < info.num_rows {
+            // Select only the FK columns to minimize memory usage
+            let select_cols: Vec<Expr> = fk_col_names.iter().map(|s| col(s.as_str())).collect();
+
+            let df = LazyFrame::scan_parquet(PlPath::new(path_str), ScanArgsParquet::default())?
+                .select(select_cols)
+                .slice(offset, chunk_size_u32)
+                .collect()
+                .with_context(|| format!("Failed to read FK chunk at offset {} from: {:?}", offset, info.path))?;
+
+            let batch_rows = df.height();
+            if batch_rows == 0 {
+                break;
             }
 
-            let fk_col_names: Vec<&str> = meta
-                .foreign_key_column_to_primary_key_table
-                .keys()
-                .map(|s| s.as_str())
-                .collect();
-
-            let df = LazyFrame::scan_parquet(
-                PlPath::new(info.path.to_str().unwrap()),
-                ScanArgsParquet::default(),
-            )?
-            .select(fk_col_names.iter().map(|s| col(*s)).collect::<Vec<_>>())
-            .collect()
-            .with_context(|| format!("Failed to read FK columns from: {:?}", info.path))?;
-
-            let row_start = db.tables[table_idx.0 as usize].row_range.0.0;
+            let batch_row_start = row_start + rows_processed;
 
             for (fk_col_name, target_table_name) in &meta.foreign_key_column_to_primary_key_table {
-                if let Some(&target_table_idx) = table_name_to_idx.get(target_table_name) {
-                    if let Ok(fk_col) = df.column(fk_col_name) {
-                        collect_fk_edges_vectorized(
-                            fk_col,
-                            target_table_idx,
-                            row_start,
-                            ctx,
-                            &mut all_edges,
-                        );
-                    }
+                let Some(&target_table_idx) = table_name_to_idx.get(target_table_name) else {
+                    continue;
+                };
+
+                if let Ok(fk_col) = df.column(fk_col_name) {
+                    let orphaned = collect_fk_edges(
+                        fk_col,
+                        fk_col_name,
+                        target_table_idx,
+                        batch_row_start,
+                        ctx,
+                        &mut all_edges,
+                    );
+                    total_orphaned += orphaned;
                 }
-                pb.inc(1);
             }
+
+            rows_processed += batch_rows as u32;
+            offset += batch_rows as i64;
         }
+
+        // Increment progress by number of FK columns in this table
+        pb.inc(meta.foreign_key_column_to_primary_key_table.len() as u64);
     }
 
     pb.finish_and_clear();
-    info!("Created {} FK edges", all_edges.len());
 
-    // Build CSR from edges
+    if total_orphaned > 0 {
+        warn!(
+            "{} FK values had no matching PK (orphaned references)",
+            total_orphaned
+        );
+    }
+
+    info!("Created {} FK edges", all_edges.len());
     db.build_csr_from_edges(all_edges);
 
     Ok(())
 }
 
-fn collect_fk_edges_vectorized(
+/// Collects FK edges for a single column. Returns count of orphaned FK values.
+fn collect_fk_edges(
     fk_col: &Column,
+    col_name: &str,
     target_table: TableIdx,
     row_start: u32,
     ctx: &PreprocessingContext,
     edges: &mut Vec<(u32, u32)>,
-) {
-    let mut add_edge = |opt_val: Option<i64>, row_idx: usize| {
-        if let Some(fk_val) = opt_val {
-            if let Some(target_row) = ctx.lookup_pk(target_table, fk_val) {
-                edges.push((row_start + row_idx as u32, target_row.0));
-            }
-        }
-    };
+) -> usize {
+    let mut orphaned = 0usize;
 
-    match fk_col.dtype() {
-        DataType::Int64 => {
-            if let Ok(ca) = fk_col.i64() {
-                for (row_idx, opt_val) in ca.into_iter().enumerate() {
-                    add_edge(opt_val, row_idx);
-                }
-            }
+    iter_integer_column(fk_col, col_name, |row_idx, fk_val| {
+        if let Some(target_row) = ctx.lookup_pk(target_table, fk_val) {
+            edges.push((row_start + row_idx as u32, target_row.0));
+        } else {
+            orphaned += 1;
         }
-        DataType::Int32 => {
-            if let Ok(ca) = fk_col.i32() {
-                for (row_idx, opt_val) in ca.into_iter().enumerate() {
-                    add_edge(opt_val.map(|v| v as i64), row_idx);
-                }
-            }
-        }
-        DataType::UInt64 => {
-            if let Ok(ca) = fk_col.u64() {
-                for (row_idx, opt_val) in ca.into_iter().enumerate() {
-                    add_edge(opt_val.map(|v| v as i64), row_idx);
-                }
-            }
-        }
-        DataType::UInt32 => {
-            if let Ok(ca) = fk_col.u32() {
-                for (row_idx, opt_val) in ca.into_iter().enumerate() {
-                    add_edge(opt_val.map(|v| v as i64), row_idx);
-                }
-            }
-        }
-        _ => {}
-    }
+    });
+
+    orphaned
 }
 
 // ============================================================================
 // Phase 5: Embed Text Values
 // ============================================================================
 
+/// Embeds all unique text values collected during processing.
 fn embed_text_values(db: &mut Database, ctx: &PreprocessingContext, embedder: &Embedder) {
     let pending_texts = &ctx.pending_texts;
     if pending_texts.is_empty() {
         return;
     }
 
-    // Initialize embeddings storage
     db.init_embeddings(embedder.embedding_dim() as u32, pending_texts.len());
 
     let batch_size = embedder.config.batch_size;
@@ -958,8 +1278,12 @@ fn main() -> Result<()> {
     let mut ctx = PreprocessingContext::new();
 
     // Phase 1: Schema and stats
-    info!("=== Phase 1: Collecting schema and statistics ===");
-    let (table_infos, global_ts_stats) = collect_schema_and_stats(&args.input_dir, &metadata)?;
+    info!(
+        "=== Phase 1: Collecting schema and statistics (chunk_size={}) ===",
+        args.chunk_size
+    );
+    let (table_infos, global_ts_stats) =
+        collect_schema_and_stats(&args.input_dir, &metadata, args.chunk_size)?;
     info!(
         "Found {} tables, {} total rows",
         table_infos.len(),
@@ -968,7 +1292,7 @@ fn main() -> Result<()> {
 
     // Phase 2: Build schema
     info!("=== Phase 2: Building schema ===");
-    let (mut db, table_name_to_idx, column_name_to_idx) =
+    let (mut db, table_name_to_idx, _column_name_to_idx) =
         build_schema(&table_infos, &embedder, &global_ts_stats);
     info!(
         "Schema: {} tables, {} columns",
@@ -979,7 +1303,7 @@ fn main() -> Result<()> {
 
     // Phase 3: Process tables
     info!("=== Phase 3: Processing tables ===");
-    process_tables(&table_infos, &mut db, &column_name_to_idx, &mut ctx)?;
+    process_tables(&table_infos, &mut db, &mut ctx, args.chunk_size)?;
     info!(
         "Rows: {}, PK index: {} entries, Unique texts: {}",
         db.num_rows(),
@@ -989,13 +1313,7 @@ fn main() -> Result<()> {
 
     // Phase 4: Build FK edges
     info!("=== Phase 4: Building FK edges ===");
-    build_fk_edges(
-        &table_infos,
-        &mut db,
-        &column_name_to_idx,
-        &table_name_to_idx,
-        &ctx,
-    )?;
+    build_fk_edges(&table_infos, &mut db, &table_name_to_idx, &ctx, args.chunk_size)?;
 
     // Phase 5: Embed text values
     info!("=== Phase 5: Embedding text values ===");
@@ -1012,7 +1330,6 @@ fn main() -> Result<()> {
         db.num_edges(),
         db.vocab_size()
     );
-    // db.print_field_sizes();
 
     // Save with progress indicator
     std::fs::create_dir_all(&args.output_dir).expect("Failed to create output directory");

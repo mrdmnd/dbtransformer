@@ -51,9 +51,5 @@ crate-type = ["cdylib", "rlib"]
 name = "preprocessor"
 path = "src/preprocessor.rs"
 
-[[bin]]
-name = "bench_sampler"
-path = "src/bench_sampler.rs"
-
 [profile.release]
 debug = true  # Enable debug symbols for profiling

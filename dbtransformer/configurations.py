@@ -36,7 +36,7 @@ class ModelConfig:
     num_blocks: int = 12
     num_heads: int = 8
     d_model: int = 256
-    d_text: int = 384
+    d_text: int = 768  # BGE-base embedding dimension
     d_ff: int = 4 * d_model
     # Timestamp feature dimension: 5 cyclical components (sin/cos each) + 1 linear = 11
     # Cyclical: minute_of_hour, hour_of_day, day_of_week, day_of_year, month
@@ -80,6 +80,21 @@ class TrainingConfig:
 
 
 @dataclass
+class DataConfig:
+    """
+    Configuration for the training data.
+
+    Supports multiple databases: provide a directory containing .rkyv files.
+    The sampler will load all databases and distribute them across workers.
+    """
+
+    # Directory containing preprocessed databases (.rkyv files)
+    db_dir: str = "data/"
+    # Optional directory for eval databases (separate from training)
+    eval_db_dir: str | None = None
+
+
+@dataclass
 class SamplerConfig:
     """
     Configuration for the Rust sampler-backed dataset.
@@ -87,6 +102,10 @@ class SamplerConfig:
 
     max_bfs_width: int = 256
     seed: int = 42
+    # Number of threads for parallel batch generation in Rust.
+    # For multi-GPU training, set to num_cpus / world_size to avoid oversubscription.
+    # If None, defaults to 1 thread per process (safe for multi-process training).
+    num_threads: int | None = None
 
 
 @dataclass
@@ -130,9 +149,21 @@ class OverallConfig:
     This is the top-level configuration object that is passed to the training script.
     """
 
+    data: DataConfig
     model: ModelConfig
     training: TrainingConfig
     sampler: SamplerConfig
     profiling: ProfilingConfig
     wandb: WandbConfig
     random_seed: int = 42069
+
+
+# Default configuration instance
+DEFAULT_OVERALL_CONFIG = OverallConfig(
+    data=DataConfig(),
+    model=ModelConfig(),
+    training=TrainingConfig(),
+    sampler=SamplerConfig(),
+    profiling=ProfilingConfig(),
+    wandb=WandbConfig(),
+)

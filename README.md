@@ -124,3 +124,8 @@ if __name__ == "__main__":
         logger.info(f"Downloading dataset: {dataset_name}")
         get_dataset(dataset_name, download=True)
 ```
+
+
+for preprocessing you probably want to mount the dataset w/ the gcsfuse plugin and use the file cache?
+
+i did this at ~/gcs/dbtransformer

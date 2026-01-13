@@ -14,10 +14,12 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use half::f16;
+use memmap2::Mmap;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::Deserialize as SerdeDeserialize;
 
@@ -183,26 +185,39 @@ pub struct Table {
     pub idx: TableIdx,
 
     /// Range of column indices for this table [start, end).
+    /// This includes ALL columns (PK, FK, features).
     pub column_range: (ColumnIdx, ColumnIdx),
 
-    /// Range of row indices for this table [start, end).
+    /// Range of row indices (nodes) for this table [start, end).
     pub row_range: (RowIdx, RowIdx),
 
-    /// The primary key column for this table (if any).
+    /// Feature columns: the columns actually stored as cell values (excludes PK/FK).
+    /// These are stored in order, and cell values are indexed by position in this vec.
+    /// To get the Column metadata for cell position i, use: columns[feature_columns[i].0]
+    pub feature_columns: Vec<ColumnIdx>,
+
+    /// The primary key column for this table (if any). Not stored as a cell.
     pub primary_key_column: Option<ColumnIdx>,
 
     /// The timestamp column for temporal ordering (if any).
+    /// Note: This column IS stored as a cell if it's not a PK/FK.
     pub time_column: Option<ColumnIdx>,
 }
 
 impl Table {
-    /// Number of columns in this table.
+    /// Number of columns in this table (including PK/FK).
     #[inline]
     pub fn num_columns(&self) -> usize {
         (self.column_range.1.0 - self.column_range.0.0) as usize
     }
 
-    /// Number of rows in this table.
+    /// Number of feature columns stored per row (excludes PK/FK).
+    #[inline]
+    pub fn num_feature_columns(&self) -> usize {
+        self.feature_columns.len()
+    }
+
+    /// Number of rows (nodes) in this table.
     #[inline]
     pub fn num_rows(&self) -> usize {
         (self.row_range.1.0 - self.row_range.0.0) as usize
@@ -219,15 +234,19 @@ impl Table {
     pub fn contains_row(&self, row: RowIdx) -> bool {
         row.0 >= self.row_range.0.0 && row.0 < self.row_range.1.0
     }
+
+    /// Get the global column index for a cell position within a row.
+    #[inline]
+    pub fn cell_column(&self, cell_pos: usize) -> ColumnIdx {
+        self.feature_columns[cell_pos]
+    }
 }
 
 // ============================================================================
-// Packed Cell Values (4 bytes per cell)
+// Packed Cell Values (you get 4 bytes per cell, and you get to figure out what to do with that)
 // ============================================================================
 
 /// A packed cell value - interpretation depends on the column's SemanticType.
-///
-/// This representation saves 50% memory compared to an enum (4 bytes vs 8 bytes):
 /// - Numerical: `f32::from_bits(value)` gives the z-scored scalar
 /// - Categorical: `EmbeddingIdx(value)` gives the embedding index
 /// - Timestamp: `f32::from_bits(value)` gives (fractional) epoch seconds
@@ -240,6 +259,9 @@ pub type PackedCell = u32;
 /// - Won't appear naturally from f32::to_bits() on valid floats
 /// - Is an absurdly large embedding index (~2.1 billion)
 pub const PACKED_NULL: PackedCell = 0x7FC0_0001;
+
+/// Sentinel value for rows without a timestamp (no time_column defined).
+pub const NO_TIMESTAMP: i64 = i64::MIN;
 
 /// Pack a z-scored numerical value.
 #[inline]
@@ -426,25 +448,32 @@ impl PreprocessingContext {
 
 /// A complete preprocessed database ready for sampling.
 ///
-/// Design:
-/// - Schema: tables and columns with metadata (small, kept for introspection)
-/// - Cell data: flat array of packed u32 values with row offsets
-/// - Graph: CSR adjacency for outgoing/incoming FK edges
-/// - Embeddings: flat contiguous buffer indexed by EmbeddingIdx
-/// - Column embeddings: flat contiguous buffer indexed by ColumnIdx
+/// Data Model:
+/// - A relational database is transformed into a graph of nodes
+/// - Each node = one row from a table
+/// - Each node contains cells (one per feature column)
+/// - Edges connect nodes via FK relationships
+///
+/// Storage:
+/// - Schema: tables and columns with metadata
+/// - Cell data: flat array of packed u32 values (PK/FK columns excluded)
+/// - Graph: CSR adjacency for FK edges
+/// - Embeddings: flat contiguous buffers for text and column embeddings
 #[derive(Debug, Archive, Serialize, Deserialize)]
 pub struct Database {
     // --- Schema ---
     pub tables: Vec<Table>,
     pub columns: Vec<Column>,
 
-    // --- Cell Data (flat with row offsets) ---
-    /// All cell values as packed u32s, stored row-by-row.
-    /// For row i: values are at cell_values[row_offsets[i]..row_offsets[i+1]]
-    /// Interpretation depends on column's SemanticType (see `unpack_cell`).
+    // --- Cell Data (nodes with cells) ---
+    /// All cell values as packed u32s, stored node-by-node (row-by-row).
+    /// Only feature columns are stored (PK/FK columns excluded at preprocessing).
+    /// NULLs are stored as PACKED_NULL sentinel.
+    /// For node i: cells are at cell_values[row_offsets[i]..row_offsets[i+1]]
+    /// Cell position j maps to column: table.feature_columns[j]
     pub cell_values: Vec<PackedCell>,
-    /// row_offsets[i] = start index in cell_values for row i.
-    /// Length = num_rows + 1, where row_offsets[num_rows] = cell_values.len()
+    /// row_offsets[i] = start index in cell_values for node i.
+    /// Length = num_nodes + 1, where row_offsets[num_nodes] = cell_values.len()
     pub row_offsets: Vec<u32>,
 
     // --- Graph (CSR adjacency) ---
@@ -468,6 +497,11 @@ pub struct Database {
     // --- Global Timestamp Statistics ---
     pub timestamp_mean: Option<f64>,
     pub timestamp_std: Option<f64>,
+
+    // --- Raw Timestamps (for time-based filtering) ---
+    /// Raw epoch seconds for each row's time_column (i64::MIN if no time_column).
+    /// Same length as num_rows. Enables efficient time-range queries during sampling.
+    pub row_timestamps: Vec<i64>,
 }
 
 impl Database {
@@ -485,6 +519,7 @@ impl Database {
             column_embeddings: Vec::new(),
             timestamp_mean: None,
             timestamp_std: None,
+            row_timestamps: Vec::new(),
         }
     }
 
@@ -512,6 +547,13 @@ impl Database {
         } else {
             self.embeddings.len() / self.embed_dim as usize
         }
+    }
+
+    /// Get the raw timestamp (epoch seconds) for a row.
+    /// Returns None if the row has no timestamp (NO_TIMESTAMP sentinel).
+    pub fn row_timestamp(&self, row: RowIdx) -> Option<i64> {
+        let ts = self.row_timestamps[row.0 as usize];
+        if ts == NO_TIMESTAMP { None } else { Some(ts) }
     }
 
     pub fn table(&self, idx: TableIdx) -> &Table {
@@ -632,13 +674,16 @@ impl Database {
     pub fn reserve_cells(&mut self, total_cells: usize, total_rows: usize) {
         self.cell_values.reserve(total_cells);
         self.row_offsets.reserve(total_rows + 1);
+        self.row_timestamps.reserve(total_rows);
     }
 
-    /// Append a row of packed cells. Must be called in row order (row 0, 1, 2, ...).
+    /// Append a row of packed cells with its raw timestamp.
+    /// timestamp should be epoch seconds (i64::MIN if no time_column).
     #[inline]
-    pub fn push_row(&mut self, cells: &[PackedCell]) {
+    pub fn push_row(&mut self, cells: &[PackedCell], timestamp: i64) {
         self.cell_values.extend_from_slice(cells);
         self.row_offsets.push(self.cell_values.len() as u32);
+        self.row_timestamps.push(timestamp);
     }
 
     // --- Initialization Helpers ---
@@ -658,6 +703,9 @@ impl Database {
     // --- Serialization ---
 
     /// Save the database to a file using rkyv.
+    ///
+    /// To load the database, use `MappedDatabase::load()` which provides
+    /// memory-mapped access for efficient multi-process sharing.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(self).map_err(|e| {
             std::io::Error::new(
@@ -671,26 +719,323 @@ impl Database {
         writer.write_all(&bytes)?;
         writer.flush()
     }
-
-    /// Load a database from an rkyv file.
-    pub fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-
-        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&bytes).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Deserialization error: {e}"),
-            )
-        })
-    }
 }
 
 impl Default for Database {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================================================
+// Memory-Mapped Database (for shared memory across processes)
+// ============================================================================
+
+/// A memory-mapped database for efficient multi-process access.
+///
+/// When multiple processes (e.g., torchrun workers) need to access the same
+/// database, using MappedDatabase ensures they share physical memory pages
+/// via the OS's page cache. This is much more memory-efficient than each
+/// process loading its own copy.
+///
+/// The database file is memory-mapped read-only, and rkyv's zero-copy
+/// deserialization allows direct access to the archived data without copying.
+pub struct MappedDatabase {
+    /// The memory map - kept alive to ensure the archived data remains valid.
+    /// Arc allows the MappedDatabase to be cloned (sharing the same mmap).
+    _mmap: Arc<Mmap>,
+    /// Pointer to the archived database within the mmap.
+    /// SAFETY: This is valid for the lifetime of _mmap.
+    archived: *const ArchivedDatabase,
+}
+
+// SAFETY: The mmap is read-only and the archived data is immutable.
+// Multiple threads can safely read from the same mmap.
+unsafe impl Send for MappedDatabase {}
+unsafe impl Sync for MappedDatabase {}
+
+impl MappedDatabase {
+    /// Load a database from a memory-mapped file.
+    ///
+    /// This is the preferred method for loading databases in multi-process
+    /// training scenarios (e.g., torchrun with multiple workers).
+    ///
+    /// # Safety
+    ///
+    /// Uses unchecked access for zero-copy performance. The file must have
+    /// been written by our preprocessor using rkyv serialization.
+    pub fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        let file = File::open(&path)?;
+        // SAFETY: We're opening the file read-only and won't modify it.
+        let mmap = unsafe { Mmap::map(&file)? };
+
+        // SAFETY: The file was written by our preprocessor using rkyv.
+        // We use unchecked access for zero-copy performance.
+        let archived = unsafe { rkyv::access_unchecked::<ArchivedDatabase>(&mmap) };
+
+        Ok(Self {
+            archived: archived as *const ArchivedDatabase,
+            _mmap: Arc::new(mmap),
+        })
+    }
+
+    /// Get a reference to the archived database.
+    #[inline]
+    pub fn archived(&self) -> &ArchivedDatabase {
+        // SAFETY: The pointer is valid for the lifetime of _mmap, which we own.
+        unsafe { &*self.archived }
+    }
+
+    // --- Schema Accessors (delegating to ArchivedDatabase) ---
+
+    #[inline]
+    pub fn num_tables(&self) -> usize {
+        self.archived().tables.len()
+    }
+
+    #[inline]
+    pub fn num_columns(&self) -> usize {
+        self.archived().columns.len()
+    }
+
+    #[inline]
+    pub fn num_rows(&self) -> usize {
+        self.archived().row_offsets.len().saturating_sub(1)
+    }
+
+    #[inline]
+    pub fn num_edges(&self) -> usize {
+        self.archived().outgoing.col_idx.len()
+    }
+
+    #[inline]
+    pub fn vocab_size(&self) -> usize {
+        let embed_dim: u32 = self.archived().embed_dim.into();
+        if embed_dim == 0 {
+            0
+        } else {
+            self.archived().embeddings.len() / embed_dim as usize
+        }
+    }
+
+    #[inline]
+    pub fn embed_dim(&self) -> usize {
+        let dim: u32 = self.archived().embed_dim.into();
+        dim as usize
+    }
+
+    /// Get the table at the given index.
+    #[inline]
+    pub fn table(&self, idx: TableIdx) -> &ArchivedTable {
+        &self.archived().tables[idx.0 as usize]
+    }
+
+    /// Get the column at the given index.
+    #[inline]
+    pub fn column(&self, idx: ColumnIdx) -> &ArchivedColumn {
+        &self.archived().columns[idx.0 as usize]
+    }
+
+    /// Get which table a row belongs to (binary search).
+    #[inline]
+    pub fn row_table(&self, row_idx: RowIdx) -> TableIdx {
+        let row = row_idx.0;
+        let tables = &self.archived().tables;
+        let idx = tables
+            .binary_search_by(|table| {
+                let range_start: u32 = table.row_range.0.0.into();
+                let range_end: u32 = table.row_range.1.0.into();
+                if row < range_start {
+                    std::cmp::Ordering::Greater
+                } else if row >= range_end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .expect("Row not found in any table");
+        let table_idx: u32 = tables[idx].idx.0.into();
+        TableIdx(table_idx)
+    }
+
+    /// Get the packed cells for a specific row.
+    /// Zero-copy access via transmute (valid on little-endian systems).
+    #[inline]
+    pub fn row_cells(&self, row_idx: RowIdx) -> &[PackedCell] {
+        let db = self.archived();
+        let start: u32 = db.row_offsets[row_idx.0 as usize].into();
+        let end: u32 = db.row_offsets[row_idx.0 as usize + 1].into();
+        // SAFETY: On little-endian systems (x86_64), u32_le has the same layout as u32.
+        unsafe {
+            let archived_slice = &db.cell_values[start as usize..end as usize];
+            std::mem::transmute::<&[rkyv::rend::u32_le], &[u32]>(archived_slice)
+        }
+    }
+
+    /// Get outgoing neighbors (rows this row points to via FK).
+    #[inline]
+    pub fn outgoing_neighbors(&self, row: RowIdx) -> &[u32] {
+        let graph = &self.archived().outgoing;
+        let start: u32 = graph.row_ptr[row.0 as usize].into();
+        let end: u32 = graph.row_ptr[row.0 as usize + 1].into();
+        // SAFETY: On little-endian systems, u32_le has the same layout as u32.
+        unsafe {
+            let archived_slice = &graph.col_idx[start as usize..end as usize];
+            std::mem::transmute::<&[rkyv::rend::u32_le], &[u32]>(archived_slice)
+        }
+    }
+
+    /// Get incoming neighbors (rows that point to this row via FK).
+    #[inline]
+    pub fn incoming_neighbors(&self, row: RowIdx) -> &[u32] {
+        let graph = &self.archived().incoming;
+        let start: u32 = graph.row_ptr[row.0 as usize].into();
+        let end: u32 = graph.row_ptr[row.0 as usize + 1].into();
+        // SAFETY: On little-endian systems, u32_le has the same layout as u32.
+        unsafe {
+            let archived_slice = &graph.col_idx[start as usize..end as usize];
+            std::mem::transmute::<&[rkyv::rend::u32_le], &[u32]>(archived_slice)
+        }
+    }
+
+    /// Get the embedding for a text/categorical value.
+    #[inline]
+    pub fn get_embedding(&self, idx: EmbeddingIdx) -> &[f16] {
+        let db = self.archived();
+        let embed_dim: u32 = db.embed_dim.into();
+        let embed_dim = embed_dim as usize;
+        let start = idx.0 as usize * embed_dim;
+        let end = start + embed_dim;
+        let archived_slice = &db.embeddings[start..end];
+        // SAFETY: Archivedf16 and f16 both have the same 2-byte IEEE 754 half-precision layout.
+        // We transmute via raw pointers to avoid issues with private archived types.
+        unsafe {
+            std::slice::from_raw_parts(archived_slice.as_ptr() as *const f16, archived_slice.len())
+        }
+    }
+
+    /// Get the embedding for a column description.
+    #[inline]
+    pub fn get_column_embedding(&self, idx: ColumnIdx) -> &[f16] {
+        let db = self.archived();
+        let embed_dim: u32 = db.embed_dim.into();
+        let embed_dim = embed_dim as usize;
+        let start = idx.0 as usize * embed_dim;
+        let end = start + embed_dim;
+        let archived_slice = &db.column_embeddings[start..end];
+        // SAFETY: Archivedf16 and f16 both have the same 2-byte IEEE 754 half-precision layout.
+        unsafe {
+            std::slice::from_raw_parts(archived_slice.as_ptr() as *const f16, archived_slice.len())
+        }
+    }
+
+    /// Get timestamp statistics.
+    #[inline]
+    pub fn timestamp_mean(&self) -> Option<f64> {
+        match &self.archived().timestamp_mean {
+            rkyv::option::ArchivedOption::Some(v) => Some((*v).into()),
+            rkyv::option::ArchivedOption::None => None,
+        }
+    }
+
+    #[inline]
+    pub fn timestamp_std(&self) -> Option<f64> {
+        match &self.archived().timestamp_std {
+            rkyv::option::ArchivedOption::Some(v) => Some((*v).into()),
+            rkyv::option::ArchivedOption::None => None,
+        }
+    }
+
+    /// Get the raw timestamp (epoch seconds) for a row.
+    #[inline]
+    pub fn row_timestamp(&self, row: RowIdx) -> Option<i64> {
+        let ts: i64 = self.archived().row_timestamps[row.0 as usize].into();
+        if ts == NO_TIMESTAMP { None } else { Some(ts) }
+    }
+
+    /// Access the underlying columns slice for iteration.
+    #[inline]
+    pub fn columns(&self) -> &[ArchivedColumn] {
+        &self.archived().columns
+    }
+
+    /// Access the underlying tables slice for iteration.
+    #[inline]
+    pub fn tables(&self) -> &[ArchivedTable] {
+        &self.archived().tables
+    }
+}
+
+impl Clone for MappedDatabase {
+    fn clone(&self) -> Self {
+        Self {
+            _mmap: Arc::clone(&self._mmap),
+            archived: self.archived,
+        }
+    }
+}
+
+// ============================================================================
+// Helper Traits for Archived Types
+// ============================================================================
+
+/// Extension methods for ArchivedTable to mirror Table's API.
+pub trait ArchivedTableExt {
+    /// Get the global column index for a cell position within a row.
+    fn cell_column(&self, cell_pos: usize) -> ColumnIdx;
+
+    /// Get the table index as native u32.
+    fn idx_native(&self) -> TableIdx;
+
+    /// Get the time column as native Option<ColumnIdx>.
+    fn time_column_native(&self) -> Option<ColumnIdx>;
+
+    /// Get feature columns as a slice (returns ArchivedVec).
+    fn feature_columns_slice(&self) -> &[ArchivedColumnIdx];
+}
+
+impl ArchivedTableExt for ArchivedTable {
+    #[inline]
+    fn cell_column(&self, cell_pos: usize) -> ColumnIdx {
+        let archived_col_idx = &self.feature_columns[cell_pos];
+        ColumnIdx(archived_col_idx.0.into())
+    }
+
+    #[inline]
+    fn idx_native(&self) -> TableIdx {
+        TableIdx(self.idx.0.into())
+    }
+
+    #[inline]
+    fn time_column_native(&self) -> Option<ColumnIdx> {
+        match &self.time_column {
+            rkyv::option::ArchivedOption::Some(col_idx) => Some(ColumnIdx(col_idx.0.into())),
+            rkyv::option::ArchivedOption::None => None,
+        }
+    }
+
+    #[inline]
+    fn feature_columns_slice(&self) -> &[ArchivedColumnIdx] {
+        &self.feature_columns
+    }
+}
+
+/// Extension methods for ArchivedColumn to access native types.
+pub trait ArchivedColumnExt {
+    /// Get the semantic type as native SemanticType.
+    fn stype_native(&self) -> SemanticType;
+}
+
+impl ArchivedColumnExt for ArchivedColumn {
+    #[inline]
+    fn stype_native(&self) -> SemanticType {
+        // Match on the archived enum variant to convert to native type
+        match self.stype {
+            ArchivedSemanticType::Numerical => SemanticType::Numerical,
+            ArchivedSemanticType::Categorical => SemanticType::Categorical,
+            ArchivedSemanticType::Text => SemanticType::Text,
+            ArchivedSemanticType::Timestamp => SemanticType::Timestamp,
+        }
     }
 }
 
@@ -812,20 +1157,30 @@ mod tests {
             name: "test".to_string(),
             idx: TableIdx(0),
             column_range: (ColumnIdx(5), ColumnIdx(10)),
+            feature_columns: vec![ColumnIdx(6), ColumnIdx(7), ColumnIdx(9)], // Excludes PK/FK
             row_range: (RowIdx(100), RowIdx(200)),
-            primary_key_column: None,
-            time_column: None,
+            primary_key_column: Some(ColumnIdx(5)), // PK at position 0
+            time_column: Some(ColumnIdx(9)),        // Time column is a feature
         };
 
+        // Test column containment (all columns, including PK/FK)
         assert!(table.contains_column(ColumnIdx(5)));
         assert!(table.contains_column(ColumnIdx(9)));
         assert!(!table.contains_column(ColumnIdx(10)));
         assert!(!table.contains_column(ColumnIdx(4)));
 
+        // Test row containment
         assert!(table.contains_row(RowIdx(100)));
         assert!(table.contains_row(RowIdx(199)));
         assert!(!table.contains_row(RowIdx(200)));
         assert!(!table.contains_row(RowIdx(99)));
+
+        // Test feature column access
+        assert_eq!(table.num_columns(), 5); // All columns in schema
+        assert_eq!(table.num_feature_columns(), 3); // Only feature columns stored
+        assert_eq!(table.cell_column(0), ColumnIdx(6));
+        assert_eq!(table.cell_column(1), ColumnIdx(7));
+        assert_eq!(table.cell_column(2), ColumnIdx(9));
     }
 
     #[test]

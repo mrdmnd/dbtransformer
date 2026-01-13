@@ -18,15 +18,16 @@ pub mod utility;
 
 // Re-export common types at crate root
 pub use types::{
-    Column, ColumnIdx, CsrGraph, Database, DatabaseMetadata, EmbeddingIdx, PACKED_NULL, PackedCell,
-    PreprocessingContext, RowIdx, SemanticType, Table, TableIdx, TableMetadata, is_packed_null,
-    load_metadata, pack_embedding_idx, pack_null, pack_numerical, pack_timestamp,
+    ArchivedColumnExt, ArchivedTableExt, Column, ColumnIdx, CsrGraph, Database, DatabaseMetadata,
+    EmbeddingIdx, MappedDatabase, NO_TIMESTAMP, PACKED_NULL, PackedCell, PreprocessingContext,
+    RowIdx, SemanticType, Table, TableIdx, TableMetadata, is_packed_null, load_metadata,
+    pack_embedding_idx, pack_null, pack_numerical, pack_timestamp,
 };
 pub use utility::{TIMESTAMP_DIM, expand_timestamp};
 
 pub use embedder::{EMBEDDING_DIM, Embedder, EmbedderConfig, EmbedderError};
 
-pub use sampler::{BatchVecs, MaskingStrategy, Sampler, SamplerConfig};
+pub use sampler::{BatchVecs, Sampler, SamplerConfig};
 
 #[pymodule]
 fn tributary(m: &Bound<'_, PyModule>) -> PyResult<()> {
