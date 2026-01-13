@@ -7,6 +7,7 @@ Always run with uv run torchrun:
     8 GPUs:           uv run torchrun --nproc_per_node=8 dbtransformer/train.py --num-workers 8
 """
 
+import dataclasses
 import os
 import random
 import time
@@ -105,12 +106,16 @@ class Trainer:
         if self.is_leader:
             logger.info(f"Model: {num_params:,} params (~{num_params / 1e6:.1f}M)")
 
-        # Rust sampler dataset yields full Batch objects (no collation needed).
+        # Training dataset: use split="train" if splitting is enabled
+        train_sampler_config = dataclasses.replace(
+            config.sampler,
+            split="train" if config.sampler.split is not None else None,
+        )
         self.dataset = SamplerBatchDataset(
             data_config=config.data,
             model_config=config.model,
             training_config=config.training,
-            sampler_config=config.sampler,
+            sampler_config=train_sampler_config,
             ddp_parameters=self.ddp_parameters,
         )
 
@@ -129,16 +134,26 @@ class Trainer:
             prefetch_factor=2 if config.training.num_workers > 0 else None,
         )
 
-        # Eval dataset/dataloader (optional, uses separate db dir if configured)
+        # Eval dataset: use split="val" on the same databases
+        # This uses the same train/val/test fractions and split_seed for consistency
         self.eval_dataset: SamplerBatchDataset | None = None
         self.eval_dataloader: DataLoader[Batch] | None = None
-        if config.data.eval_db_dir is not None:
-            eval_data_config = DataConfig(db_dir=config.data.eval_db_dir)
+
+        # Create eval dataset if splitting is enabled OR if a separate eval_db_dir is specified
+        if config.sampler.split is not None or config.data.eval_db_dir is not None:
+            eval_data_config = DataConfig(
+                db_dir=config.data.eval_db_dir or config.data.db_dir,
+                db_names=config.data.eval_db_names or config.data.db_names,
+            )
+            eval_sampler_config = dataclasses.replace(
+                config.sampler,
+                split="val",  # Always use validation split for eval
+            )
             self.eval_dataset = SamplerBatchDataset(
                 data_config=eval_data_config,
                 model_config=config.model,
                 training_config=config.training,
-                sampler_config=config.sampler,
+                sampler_config=eval_sampler_config,
                 ddp_parameters=self.ddp_parameters,
             )
             self.eval_dataloader = DataLoader(
@@ -334,10 +349,13 @@ class Trainer:
         loss_sum = torch.zeros([], device=device, dtype=torch.float32)
         batch_count = torch.zeros([], device=device, dtype=torch.float32)
 
-        bool_preds_list: list[torch.Tensor] = []
-        bool_labels_list: list[torch.Tensor] = []
-        num_preds_list: list[torch.Tensor] = []
-        num_labels_list: list[torch.Tensor] = []
+        # Collect predictions/labels by semantic type
+        numerical_preds_list: list[torch.Tensor] = []
+        numerical_labels_list: list[torch.Tensor] = []
+        categorical_preds_list: list[torch.Tensor] = []  # cosine similarities
+        categorical_labels_list: list[torch.Tensor] = []  # 1s (correct match)
+        timestamp_preds_list: list[torch.Tensor] = []
+        timestamp_labels_list: list[torch.Tensor] = []
 
         max_batches = self.config.training.max_eval_batches
 
@@ -355,19 +373,32 @@ class Trainer:
                 mask_active = batch.masks & (~batch.is_padding)
                 semantic = batch.semantic_types
 
-                bool_mask = mask_active & (semantic == SemanticType.BOOLEAN.value)
-                if bool_mask.any():
-                    preds = torch.sigmoid(output["yhat_boolean"][bool_mask]).flatten()
-                    labels = (batch.boolean_values[bool_mask] > 0).float().flatten()
-                    bool_preds_list.append(preds.detach())
-                    bool_labels_list.append(labels.detach())
+                # Numerical: regression metrics (R², MAE)
+                num_mask = mask_active & (semantic == SemanticType.NUMERICAL.value)
+                if num_mask.any() and output["yhat_numerical"] is not None:
+                    preds = output["yhat_numerical"][num_mask].flatten()
+                    labels = batch.numerical_values[num_mask].flatten()
+                    numerical_preds_list.append(preds.detach())
+                    numerical_labels_list.append(labels.detach())
 
-                num_mask = mask_active & (semantic == SemanticType.NUMBER.value)
-                if num_mask.any():
-                    preds = output["yhat_number"][num_mask].flatten()
-                    labels = batch.number_values[num_mask].flatten()
-                    num_preds_list.append(preds.detach())
-                    num_labels_list.append(labels.detach())
+                # Categorical: cosine similarity (higher = better match)
+                cat_mask = mask_active & (semantic == SemanticType.CATEGORICAL.value)
+                if cat_mask.any() and output["yhat_categorical"] is not None:
+                    pred_emb = output["yhat_categorical"][cat_mask]
+                    target_emb = batch.categorical_values[cat_mask]
+                    # Compute cosine similarity per sample
+                    cos_sim = torch.nn.functional.cosine_similarity(pred_emb, target_emb, dim=-1)
+                    categorical_preds_list.append(cos_sim.detach())
+                    categorical_labels_list.append(torch.ones_like(cos_sim))  # target is 1.0
+
+                # Timestamp: regression on z-scored epoch seconds
+                ts_mask = mask_active & (semantic == SemanticType.TIMESTAMP.value)
+                if ts_mask.any() and output["yhat_timestamp"] is not None:
+                    preds = output["yhat_timestamp"][ts_mask].flatten()
+                    # Target is the last component of timestamp_values (z-scored epoch)
+                    labels = batch.timestamp_values[ts_mask][..., -1].flatten()
+                    timestamp_preds_list.append(preds.detach())
+                    timestamp_labels_list.append(labels.detach())
 
         # Reduce loss totals
         if dist.is_initialized():
@@ -378,37 +409,46 @@ class Trainer:
         if batch_count.item() > 0:
             metrics["eval/loss"] = (loss_sum / batch_count).item()
 
-        # Concatenate local preds/labels then gather across ranks
-        if bool_preds_list:
-            bool_preds = torch.cat(bool_preds_list, dim=0)
-            bool_labels = torch.cat(bool_labels_list, dim=0)
-            bool_preds = self._gather_varlen(bool_preds)
-            bool_labels = self._gather_varlen(bool_labels)
-
-            if self.is_leader:
-                try:
-                    from sklearn.metrics import roc_auc_score
-                except Exception:
-                    logger.warning("sklearn not available; skipping AUC metric")
-                else:
-                    auc = roc_auc_score(bool_labels.cpu().numpy(), bool_preds.cpu().numpy())
-                    metrics["eval/auc_boolean"] = float(auc)
-
-        if num_preds_list:
-            num_preds = torch.cat(num_preds_list, dim=0)
-            num_labels = torch.cat(num_labels_list, dim=0)
+        # Numerical metrics: R² and MAE
+        if numerical_preds_list:
+            num_preds = torch.cat(numerical_preds_list, dim=0)
+            num_labels = torch.cat(numerical_labels_list, dim=0)
             num_preds = self._gather_varlen(num_preds)
             num_labels = self._gather_varlen(num_labels)
 
-            if self.is_leader:
-                # R2: 1 - SS_res / SS_tot
-                y = num_labels.cpu().numpy()
-                yhat = num_preds.cpu().numpy()
+            if self.is_leader and num_labels.numel() > 0:
+                y = num_labels.float().cpu().numpy()
+                yhat = num_preds.float().cpu().numpy()
+                # R²: 1 - SS_res / SS_tot
                 ss_res = float(np.sum((y - yhat) ** 2))
                 ss_tot = float(np.sum((y - y.mean()) ** 2)) if y.size > 0 else 0.0
                 if ss_tot > 0:
-                    r2 = 1.0 - ss_res / ss_tot
-                    metrics["eval/r2_number"] = r2
+                    metrics["eval/r2_numerical"] = 1.0 - ss_res / ss_tot
+                metrics["eval/mae_numerical"] = float(np.mean(np.abs(y - yhat)))
+
+        # Categorical metrics: mean cosine similarity (should approach 1.0)
+        if categorical_preds_list:
+            cat_preds = torch.cat(categorical_preds_list, dim=0)
+            cat_preds = self._gather_varlen(cat_preds)
+
+            if self.is_leader and cat_preds.numel() > 0:
+                metrics["eval/mean_cos_sim_categorical"] = float(cat_preds.mean().item())
+
+        # Timestamp metrics: R² and MAE (same as numerical)
+        if timestamp_preds_list:
+            ts_preds = torch.cat(timestamp_preds_list, dim=0)
+            ts_labels = torch.cat(timestamp_labels_list, dim=0)
+            ts_preds = self._gather_varlen(ts_preds)
+            ts_labels = self._gather_varlen(ts_labels)
+
+            if self.is_leader and ts_labels.numel() > 0:
+                y = ts_labels.float().cpu().numpy()
+                yhat = ts_preds.float().cpu().numpy()
+                ss_res = float(np.sum((y - yhat) ** 2))
+                ss_tot = float(np.sum((y - y.mean()) ** 2)) if y.size > 0 else 0.0
+                if ss_tot > 0:
+                    metrics["eval/r2_timestamp"] = 1.0 - ss_res / ss_tot
+                metrics["eval/mae_timestamp"] = float(np.mean(np.abs(y - yhat)))
 
         if self.is_leader and metrics:
             logger.info("Eval metrics: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items()))

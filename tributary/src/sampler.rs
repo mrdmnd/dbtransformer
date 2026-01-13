@@ -21,8 +21,7 @@ use rand::prelude::*;
 use rayon::prelude::*;
 
 use crate::types::{
-    ArchivedColumnExt, ArchivedTableExt, ColumnIdx, EmbeddingIdx, MappedDatabase, RowIdx,
-    SemanticType,
+    ArchivedColumnExt, ArchivedTableExt, ColumnIdx, Database, EmbeddingIdx, RowIdx, SemanticType,
 };
 use crate::utility::{TIMESTAMP_DIM, expand_timestamp};
 
@@ -320,6 +319,26 @@ impl BatchVecs {
 // Sampler Configuration
 // ============================================================================
 
+/// Data split for train/val/test partitioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Split {
+    #[default]
+    Train,
+    Val,
+    Test,
+}
+
+impl Split {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "train" => Some(Self::Train),
+            "val" | "validation" => Some(Self::Val),
+            "test" => Some(Self::Test),
+            _ => None,
+        }
+    }
+}
+
 /// Configuration for the sampler.
 #[derive(Debug, Clone)]
 pub struct SamplerConfig {
@@ -332,6 +351,18 @@ pub struct SamplerConfig {
     /// For multi-process training (e.g., torchrun), set this to
     /// num_cpus / world_size to avoid oversubscription.
     pub num_threads: Option<usize>,
+
+    // --- Random split configuration ---
+    // Uses deterministic hash of row index to assign rows to splits.
+    // Works for ALL databases regardless of schema.
+    /// Which split to sample seeds from. If None, all rows are eligible.
+    pub split: Option<Split>,
+    /// Fraction of rows for training (default 0.8).
+    pub train_frac: f32,
+    /// Fraction of rows for validation (default 0.1). Test gets the rest.
+    pub val_frac: f32,
+    /// Seed for deterministic split assignment (separate from sampling seed).
+    pub split_seed: u64,
 }
 
 impl Default for SamplerConfig {
@@ -342,6 +373,10 @@ impl Default for SamplerConfig {
             max_bfs_width: 256,
             seed: 42,
             num_threads: None,
+            split: None,
+            train_frac: 0.8,
+            val_frac: 0.1,
+            split_seed: 12345,
         }
     }
 }
@@ -357,7 +392,7 @@ impl Default for SamplerConfig {
 #[pyclass]
 pub struct Sampler {
     /// Memory-mapped database - shared across all processes via OS page cache.
-    database: MappedDatabase,
+    database: Database,
     /// Seed rows for BFS traversal (shuffled each epoch).
     seeds: Vec<RowIdx>,
     config: SamplerConfig,
@@ -371,10 +406,10 @@ pub struct Sampler {
 
 #[pymethods]
 impl Sampler {
-    /// Create a new Sampler from a preprocessed database file.
+    /// Create a new Sampler from a preprocessed database directory.
     ///
-    /// The database is memory-mapped for efficient multi-process sharing.
-    /// When multiple torchrun workers load the same file, the OS shares
+    /// The database files are memory-mapped for efficient multi-process sharing.
+    /// When multiple torchrun workers load the same files, the OS shares
     /// physical memory pages across processes.
     ///
     /// Masking: Exactly one randomly-selected cell from the seed row is masked
@@ -382,7 +417,7 @@ impl Sampler {
     /// than multi-mask approaches in ablation studies.
     ///
     /// Args:
-    ///     db_path: Path to the .rkyv database file
+    ///     db_path: Path to the database directory (containing schema.rkyv, etc.)
     ///     batch_size: Number of sequences per batch
     ///     seq_len: Maximum sequence length (cells per sequence)
     ///     max_bfs_width: Max neighbors sampled per BFS step
@@ -390,8 +425,12 @@ impl Sampler {
     ///     num_threads: Number of threads per process for parallel batch generation.
     ///                  For multi-process training, set to num_cpus / world_size.
     ///                  If None, defaults to 1 thread (safe for multi-process).
+    ///     split: Data split ("train", "val", or "test"). If None, all rows are seeds.
+    ///     train_frac: Fraction of rows for training (default 0.8).
+    ///     val_frac: Fraction of rows for validation (default 0.1). Test gets the rest.
+    ///     split_seed: Seed for deterministic split assignment.
     #[new]
-    #[pyo3(signature = (db_path, batch_size=32, seq_len=1024, max_bfs_width=256, seed=42, num_threads=None))]
+    #[pyo3(signature = (db_path, batch_size=32, seq_len=1024, max_bfs_width=256, seed=42, num_threads=None, split=None, train_frac=0.8, val_frac=0.1, split_seed=12345))]
     fn new(
         db_path: String,
         batch_size: usize,
@@ -399,11 +438,34 @@ impl Sampler {
         max_bfs_width: usize,
         seed: u64,
         num_threads: Option<usize>,
+        split: Option<String>,
+        train_frac: f32,
+        val_frac: f32,
+        split_seed: u64,
     ) -> PyResult<Self> {
         // Use memory-mapped loading for multi-process sharing
-        let database = MappedDatabase::load(Path::new(&db_path)).map_err(|e| {
+        let database = Database::load(Path::new(&db_path)).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("Failed to load database: {}", e))
         })?;
+
+        // Parse split string
+        let split = match split {
+            Some(s) => Some(Split::from_str(&s).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid split '{}'. Expected 'train', 'val', or 'test'.",
+                    s
+                ))
+            })?),
+            None => None,
+        };
+
+        // Validate fractions
+        if train_frac < 0.0 || val_frac < 0.0 || train_frac + val_frac > 1.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid split fractions: train_frac={}, val_frac={}. Must be non-negative and sum to <= 1.0",
+                train_frac, val_frac
+            )));
+        }
 
         let config = SamplerConfig {
             batch_size,
@@ -412,6 +474,10 @@ impl Sampler {
             seed,
             // Default to 1 thread when called from Python (safe for multi-process)
             num_threads: Some(num_threads.unwrap_or(1)),
+            split,
+            train_frac,
+            val_frac,
+            split_seed,
         };
 
         Self::try_init(database, config).map_err(|e| {
@@ -444,6 +510,12 @@ impl Sampler {
     /// Number of tables in the database.
     fn num_tables(&self) -> usize {
         self.database.num_tables()
+    }
+
+    /// Number of seed rows (eligible starting points for BFS).
+    /// This may be less than num_rows if a split is configured.
+    fn num_seeds(&self) -> usize {
+        self.seeds.len()
     }
 
     /// Embedding dimension.
@@ -588,13 +660,24 @@ impl Sampler {
         );
 
         // Select which cell from the seed row to mask (the "label").
-        // Any non-NULL feature column cell is eligible for masking.
+        // Only non-NULL, non-TEXT cells are eligible for masking.
+        // TEXT cells are excluded because:
+        // 1. Text prediction is ill-defined (embedding matching, not value prediction)
+        // 2. Text cells still contribute as context, just never as prediction targets
         let seed_cells = db.row_cells(seed_row);
 
-        // Count eligible non-NULL cells for masking
+        // Count eligible cells: non-NULL AND not TEXT semantic type
         let eligible_count = seed_cells
             .iter()
-            .filter(|&&c| !crate::types::is_packed_null(c))
+            .enumerate()
+            .filter(|&(cell_pos, &packed_cell)| {
+                if crate::types::is_packed_null(packed_cell) {
+                    return false;
+                }
+                let col_idx = seed_table.cell_column(cell_pos);
+                let stype = db.column(col_idx).stype_native();
+                stype != SemanticType::Text
+            })
             .count();
 
         let label_cell_idx = if eligible_count > 0 {
@@ -707,8 +790,8 @@ impl Sampler {
                 seq.column_name_values[start..end].copy_from_slice(col_embedding);
 
                 // Apply masking: only the selected cell from seed row is masked
-                if is_seed_row {
-                    // All non-NULL cells are eligible (we already skip NULLs above)
+                // TEXT cells are never masked (they're context-only)
+                if is_seed_row && stype != SemanticType::Text {
                     seq.masks[seq_i] = seed_eligible_counter == label_cell_idx;
                     seed_eligible_counter += 1;
                 } else {
@@ -1040,13 +1123,15 @@ impl Sampler {
 impl Sampler {
     /// Common initialization logic - can fail if thread pool creation fails.
     fn try_init(
-        database: MappedDatabase,
+        database: Database,
         config: SamplerConfig,
     ) -> Result<Self, rayon::ThreadPoolBuildError> {
         let d_text = database.embed_dim();
 
-        // All rows are potential seeds - any feature column can be masked during training.
-        let seeds: Vec<RowIdx> = (0..database.num_rows()).map(|i| RowIdx(i as u32)).collect();
+        // Filter seeds based on split configuration.
+        // Seeds determine which rows we START BFS from (and mask a cell to predict).
+        // All rows remain available as context during BFS traversal.
+        let seeds: Vec<RowIdx> = Self::compute_seeds(&database, &config);
 
         // Build thread pool with configured number of threads
         let num_threads = config.num_threads.unwrap_or_else(|| {
@@ -1068,11 +1153,63 @@ impl Sampler {
         })
     }
 
-    /// Create a new Sampler from a path, without requiring PyO3.
+    /// Compute which rows are eligible as seeds based on split configuration.
+    ///
+    /// Uses deterministic hash-based assignment:
+    /// - Hash each row index with split_seed
+    /// - Map hash to [0, 1) and compare against train_frac / val_frac thresholds
+    ///
+    /// This ensures:
+    /// - Same split assignment across runs with same split_seed
+    /// - Works for ANY database regardless of schema
+    /// - Approximately respects the configured fractions
+    fn compute_seeds(database: &Database, config: &SamplerConfig) -> Vec<RowIdx> {
+        use std::hash::{Hash, Hasher};
+
+        let num_rows = database.num_rows();
+
+        // If no split specified, all rows are seeds
+        let Some(split) = config.split else {
+            return (0..num_rows).map(|i| RowIdx(i as u32)).collect();
+        };
+
+        // Precompute thresholds (as u64 for integer comparison)
+        let train_threshold = (config.train_frac * u32::MAX as f32) as u64;
+        let val_threshold = ((config.train_frac + config.val_frac) * u32::MAX as f32) as u64;
+
+        let mut seeds = Vec::with_capacity(num_rows / 3); // Rough estimate
+
+        for i in 0..num_rows {
+            // Deterministic hash: combine row index with split seed
+            let mut hasher = std::hash::DefaultHasher::new();
+            config.split_seed.hash(&mut hasher);
+            (i as u64).hash(&mut hasher);
+            let hash = hasher.finish();
+
+            // Map hash to split
+            let hash_val = hash % (u32::MAX as u64);
+            let row_split = if hash_val < train_threshold {
+                Split::Train
+            } else if hash_val < val_threshold {
+                Split::Val
+            } else {
+                Split::Test
+            };
+
+            if row_split == split {
+                seeds.push(RowIdx(i as u32));
+            }
+        }
+
+        seeds.shrink_to_fit();
+        seeds
+    }
+
+    /// Create a new Sampler from a directory path, without requiring PyO3.
     /// This is the Rust-native version for use in tests and internal code.
     /// Uses memory-mapped file access for efficient multi-process sharing.
     pub fn from_path(db_path: &Path, config: SamplerConfig) -> std::io::Result<Self> {
-        let database = MappedDatabase::load(db_path)?;
+        let database = Database::load(db_path)?;
         Self::try_init(database, config).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -1082,7 +1219,7 @@ impl Sampler {
     }
 
     /// Get the database reference for inspection.
-    pub fn database(&self) -> &MappedDatabase {
+    pub fn database(&self) -> &Database {
         &self.database
     }
 

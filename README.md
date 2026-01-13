@@ -80,28 +80,28 @@ rm -rf profiler_log_dump && scp -i ~/.ssh/primeintellect_ed25519 -P 42069 -r roo
 
 
 
-## Rust Stuff
-tributary preprocessing: take some directory which looks like
+## Rust Stuff (Preprocessing & Sampling)
 
+The `tributary` crate handles preprocessing and sampling. See `tributary/README.md` for full details.
+
+### Preprocessing
+
+Convert a raw database (parquet files + metadata.json) into the sampler-friendly format:
+
+```bash
+cd tributary
+cargo run --release --bin preprocessor -- \
+  --input-dir ~/gcs/databases_raw/rel-event \
+  --output-dir ~/gcs/databases_preprocessed/ \
+  --verbose
 ```
-sample_data_f1
-├── db
-│   ├── circuits.parquet
-│   ├── constructor_results.parquet
-│   ├── constructor_standings.parquet
-│   ├── constructors.parquet
-│   ├── drivers.parquet
-│   ├── qualifying.parquet
-│   ├── races.parquet
-│   ├── results.parquet
-│   └── standings.parquet
-```
 
-then run
+This outputs two files:
+- `{name}.rkyv` - Schema, graph, cells (~2.5GB for rel-event)
+- `{name}.embeddings.bin` - Text embeddings, mmap'd (~165MB for rel-event)
 
-mrdmnd@khadgar:~/dbtransformer/tributary$ cargo run --release --bin preprocessor -- --data-dir=sample_data_f1 --verbose
-
-Then, you can sample from it
+The split format allows handling large datasets (e.g., rel-amazon with 47GB of embeddings)
+without loading everything into RAM.
 
 
 

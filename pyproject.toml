@@ -52,6 +52,7 @@ dev = [
     "memray>=1.19.1",
     "mypy>=1.19.0",
     "pandas-stubs>=2.3.3.251201",
+    "polars>=1.37.1",
     "pytest>=9.0.1",
     "pytest-loguru>=0.4.0",
     "ruff>=0.14.8",

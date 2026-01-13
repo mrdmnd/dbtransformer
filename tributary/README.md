@@ -62,28 +62,77 @@ Most commonly, this would be for columns whose Polars dtype is string, but seman
 
 Another circumstance where we might want to do this override is for columns whose Polars dtype is UInt, but semantically are an identifier, and should be treated as such (instead of a numerical variable, or categorical variable).
 
-The preprocessing script will write out a "(database_name).rkyv" file that captures the graph structure of the database,
-along with all of the values (normalized) and a text embedding for each distinct string value seen in the data.
+## Output Format
 
-You should preprocess *all* databases you want to pre-train (or evaluate) on, and place them into the "databases_preprocessed" directory.
-
-Fine-tuning a model involves passing a *single* one of these .rkyv (preprocessed) files, representing the new database
-to fine-tune on.
+The preprocessing script outputs a directory per database:
 
 ```bash
-databases_preprocessed
-├── sample_f1.rkyv
-├── movie_ratings.rkyv
+databases_preprocessed/
+├── rel-event/
+│   ├── manifest.json       # Metadata, stats, file checksums
+│   ├── schema.rkyv         # Tables, columns, column embeddings
+│   ├── graph.rkyv          # CSR adjacency (outgoing + incoming edges)
+│   ├── cells.rkyv          # Cell values, row offsets, row timestamps
+│   └── embeddings.bin      # Text embeddings (f16), mmap'd separately
+├── movie_ratings/
+│   ├── manifest.json
+│   ├── schema.rkyv
+│   ├── graph.rkyv
+│   ├── cells.rkyv
+│   └── embeddings.bin
 ...
 ```
 
-Example usage:
+**Why split files?**
+
+- **schema.rkyv** - Small (KB). Tables, columns, normalization stats. Always loaded.
+- **graph.rkyv** - Medium. CSR adjacency for FK edges. Memory-mapped.
+- **cells.rkyv** - Large. Packed cell values, row timestamps. Memory-mapped.
+- **embeddings.bin** - Huge. Text embeddings for all unique text/categorical values. Memory-mapped so the OS only pages in embeddings that are actually accessed during sampling.
+
+For large datasets like rel-amazon with 31M unique texts (~47GB of embeddings), this split approach is essential for memory efficiency. During sampling, only ~0.2% of embeddings are accessed per batch.
+
+**Streaming Architecture:**
+
+The preprocessor uses a streaming architecture to handle large datasets:
+
+1. **Schema Discovery** - Scan parquet metadata for column types and statistics
+2. **Vocabulary Extraction** - Stream through text columns, deduplicate, write to disk
+3. **Embedding** - Stream vocab file through embedder, write directly to `embeddings.bin`
+4. **Cell Encoding** - Stream tables, encode cells with vocab lookup
+5. **FK Edge Building** - Stream FK columns, resolve to row indices, build CSR graph
+
+Memory usage is O(chunk_size) regardless of dataset size.
+
+**Example usage:**
 
 ```bash
 cargo run --release --bin preprocessor -- \
-  --input-database-dir=databases_raw/rel-event \
-  --output-dir=databases_preprocessed/ \
+  --input-dir databases_raw/rel-event \
+  --output-dir databases_preprocessed/ \
+  --chunk-size 100000 \
   --verbose
+```
+
+**Loading in Rust:**
+
+```rust
+use tributary::Database;
+
+// Loads all split files, mmaps each component
+let db = Database::load("databases_preprocessed/rel-event")?;
+
+// Access schema (in memory)
+let table = db.table(TableIdx(0));
+
+// Access graph (mmap'd)
+let neighbors = db.outgoing_neighbors(row_idx);
+
+// Access cells (mmap'd)
+let cells = db.row_cells(row_idx);
+
+// Access embeddings (mmap - only accessed pages loaded)
+let embedding = db.get_embedding(embedding_idx);
 ```
 
 ## Sampling
@@ -92,3 +141,24 @@ We expose (through PyO3) a rust object that can be used to play the role of a da
 
 1) Performs BFS-based neighborhood sampling around a target row in some database in the training set.
 2) Pre-computes *attention mask* tensors on the CPU side.
+
+**Python usage:**
+
+```python
+import tributary
+
+# Load from a database directory
+sampler = tributary.Sampler(
+    db_path="databases_preprocessed/rel-event",
+    batch_size=32,
+    seq_len=1024,
+    max_bfs_width=256,
+    seed=42,
+    num_threads=4,  # Set to num_cpus / world_size for multi-process training
+)
+
+# Iterate over batches
+for batch_idx in range(sampler.len_py()):
+    batch = sampler.batch_py(batch_idx)
+    # ... training loop
+```

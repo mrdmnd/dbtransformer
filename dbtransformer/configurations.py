@@ -84,20 +84,34 @@ class DataConfig:
     """
     Configuration for the training data.
 
-    Supports multiple databases: provide a directory containing .rkyv files.
-    The sampler will load all databases and distribute them across workers.
+    Supports multiple databases via two modes:
+    1. Specify db_dir only: loads ALL database subdirectories from that directory
+    2. Specify db_dir + db_names: loads only the named databases from db_dir
+
+    Each database is a subdirectory containing .rkyv files (schema.rkyv, graph.rkyv, etc.)
     """
 
-    # Directory containing preprocessed databases (.rkyv files)
+    # Base directory containing preprocessed database subdirectories
     db_dir: str = "data/"
+    # Optional list of database names to load (subdirectory names).
+    # If None, all databases in db_dir are loaded.
+    db_names: list[str] | None = None
     # Optional directory for eval databases (separate from training)
     eval_db_dir: str | None = None
+    # Optional list of eval database names (if None, all in eval_db_dir)
+    eval_db_names: list[str] | None = None
 
 
 @dataclass
 class SamplerConfig:
     """
     Configuration for the Rust sampler-backed dataset.
+
+    Supports deterministic train/val/test splits via hash-based row assignment.
+    Each row is assigned to a split based on hash(row_idx, split_seed), ensuring:
+    - Reproducible splits across runs with the same split_seed
+    - Works for ANY database regardless of schema
+    - Approximately respects the configured fractions
     """
 
     max_bfs_width: int = 256
@@ -106,6 +120,16 @@ class SamplerConfig:
     # For multi-GPU training, set to num_cpus / world_size to avoid oversubscription.
     # If None, defaults to 1 thread per process (safe for multi-process training).
     num_threads: int | None = None
+
+    # Random split configuration
+    # Which split to sample seeds from ("train", "val", "test", or None for all)
+    split: str | None = None
+    # Fraction of rows for training (default 0.8)
+    train_frac: float = 0.8
+    # Fraction of rows for validation (default 0.1). Test gets the remainder.
+    val_frac: float = 0.1
+    # Seed for deterministic split assignment (separate from sampling seed)
+    split_seed: int = 12345
 
 
 @dataclass
@@ -160,10 +184,25 @@ class OverallConfig:
 
 # Default configuration instance
 DEFAULT_OVERALL_CONFIG = OverallConfig(
-    data=DataConfig(),
+    data=DataConfig(
+        db_dir="/home/mrdmnd/gcs/databases_preprocessed",
+        db_names=["rel-event"],
+    ),
     model=ModelConfig(),
-    training=TrainingConfig(),
-    sampler=SamplerConfig(),
+    training=TrainingConfig(
+        batch_size=8,          # Smaller for testing
+        seq_len=256,           # Smaller for testing
+        max_batches=100,       # Short run for testing
+        eval_every_n_batches=20,
+        log_every_n_batches=5,
+        save_every_n_batches=50,
+    ),
+    sampler=SamplerConfig(
+        split="train",         # Enable train/val splitting
+        train_frac=0.8,
+        val_frac=0.1,
+        split_seed=12345,
+    ),
     profiling=ProfilingConfig(),
-    wandb=WandbConfig(),
+    wandb=WandbConfig(enabled=False),  # Disable W&B for testing
 )

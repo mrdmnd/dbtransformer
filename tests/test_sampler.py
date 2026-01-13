@@ -13,8 +13,12 @@ from loguru import logger
 
 import tributary
 
-# Test database path
-DB_PATH = Path("/tmp/databases_preprocessed/rel-event.rkyv")
+# Test database paths
+# For direct sampler tests, use the database directory
+DB_PATH = Path("/tmp/databases_preprocessed/rel-event")
+# For SamplerBatchDataset tests, use the parent directory + db_names
+DB_DIR = Path("/tmp/databases_preprocessed")
+DB_NAMES = ["rel-event"]
 
 
 @pytest.fixture(scope="module")
@@ -28,7 +32,6 @@ def sampler():
         batch_size=4,
         seq_len=128,
         max_bfs_width=32,
-        mask_rate=0.15,
         seed=42,
     )
 
@@ -77,11 +80,10 @@ class TestSamplerCreation:
         """Test that invalid path raises an error."""
         with pytest.raises(Exception):
             tributary.Sampler(
-                db_path="/nonexistent/path.rkyv",
+                db_path="/nonexistent/path",
                 batch_size=4,
                 seq_len=128,
                 max_bfs_width=32,
-                mask_rate=0.15,
                 seed=42,
             )
 
@@ -201,7 +203,6 @@ class TestSequenceVisualization:
             batch_size=1,
             seq_len=seq_len,
             max_bfs_width=32,
-            mask_rate=0.15,
             seed=42,
         )
 
@@ -307,11 +308,7 @@ class TestSequenceVisualization:
             feat_attends = feat_attn[i].sum()
             nbr_attends = nbr_attn[i].sum()
 
-            logger.info(
-                f"Cell {i:>3}: col_attn={col_attends:>3} cells, "
-                f"feat_attn={feat_attends:>3} cells, "
-                f"nbr_attn={nbr_attends:>3} cells"
-            )
+            logger.info(f"Cell {i:>3}: col_attn={col_attends:>3} cells, feat_attn={feat_attends:>3} cells, nbr_attn={nbr_attends:>3} cells")
 
             printed += 1
             if printed >= 10:
@@ -426,23 +423,26 @@ class TestTorchIntegration:
         assert masks.shape == (batch_size, seq_len)
         assert column_attn.shape == (batch_size, seq_len, seq_len)
 
-    def test_mask_rate(self, sampler):
-        """Test that mask rate is approximately correct."""
+    def test_mask_exists(self, sampler):
+        """Test that masking produces exactly one masked cell per sequence."""
         batch_dict = dict(sampler.batch_py(0))
 
         masks = batch_dict["masks"]
         is_padding = batch_dict["is_padding"]
 
-        # Only count non-padding positions
-        non_padding_count = (~is_padding).sum()
-        masked_count = (masks & ~is_padding).sum()
+        # Check each sequence has exactly one masked cell (single-label masking)
+        for seq_idx in range(masks.shape[0]):
+            seq_masks = masks[seq_idx]
+            seq_padding = is_padding[seq_idx]
+            
+            # Only count non-padding positions
+            non_padding_count = (~seq_padding).sum()
+            masked_count = seq_masks.sum()
 
-        if non_padding_count > 0:
-            mask_rate = masked_count / non_padding_count
-            logger.info(f"Actual mask rate: {mask_rate:.3f} (target: 0.15)")
-
-            # Allow some variance due to randomness
-            assert 0.05 < mask_rate < 0.30, f"Mask rate {mask_rate} out of expected range"
+            if non_padding_count > 0:
+                logger.info(f"Sequence {seq_idx}: {masked_count} masked cells")
+                # Single-label masking: exactly one cell masked per sequence
+                assert masked_count == 1, f"Expected 1 masked cell, got {masked_count}"
 
 
 class TestSamplerDataset:
@@ -467,7 +467,7 @@ class TestSamplerDataset:
         )
         from dbtransformer.sampler_dataset import SamplerBatchDataset
 
-        data_config = DataConfig(db_path=str(DB_PATH))
+        data_config = DataConfig(db_dir=str(DB_DIR), db_names=DB_NAMES)
         model_config = ModelConfig()
         training_config = TrainingConfig(batch_size=4, seq_len=128)
         sampler_config = SamplerConfig(max_bfs_width=32, seed=42)
@@ -496,7 +496,7 @@ class TestSamplerDataset:
         from dbtransformer.model import Batch
         from dbtransformer.sampler_dataset import SamplerBatchDataset
 
-        data_config = DataConfig(db_path=str(DB_PATH))
+        data_config = DataConfig(db_dir=str(DB_DIR), db_names=DB_NAMES)
         model_config = ModelConfig()
         training_config = TrainingConfig(batch_size=4, seq_len=128)
         sampler_config = SamplerConfig(max_bfs_width=32, seed=42)
@@ -508,7 +508,8 @@ class TestSamplerDataset:
             sampler_config=sampler_config,
         )
 
-        batch = dataset[0]
+        # SamplerBatchDataset is an IterableDataset, use iteration
+        batch = next(iter(dataset))
         assert isinstance(batch, Batch)
 
         logger.info(f"Batch numerical_values shape: {batch.numerical_values.shape}")

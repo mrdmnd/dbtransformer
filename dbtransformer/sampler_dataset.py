@@ -1,7 +1,7 @@
 """
 Multi-database sampler dataset for distributed training.
 
-Supports multiple .rkyv database files in a directory, distributing them
+Supports multiple preprocessed database directories, distributing them
 across workers with deterministic shuffling per epoch.
 """
 
@@ -11,9 +11,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import tributary
 from torch.utils.data import IterableDataset
 
+import tributary
 from dbtransformer.configurations import (
     DataConfig,
     DDPParameters,
@@ -24,12 +24,55 @@ from dbtransformer.configurations import (
 from dbtransformer.model import Batch
 
 
+def discover_databases(db_dir: Path, db_names: list[str] | None = None) -> list[Path]:
+    """
+    Discover database directories in the given base directory.
+
+    Args:
+        db_dir: Base directory containing database subdirectories
+        db_names: Optional list of specific database names to load.
+                  If None, discovers all valid database subdirectories.
+
+    Returns:
+        Sorted list of paths to database directories.
+    """
+    if not db_dir.exists():
+        raise ValueError(f"Database directory does not exist: {db_dir}")
+
+    if db_names is not None:
+        # Load specific databases by name
+        db_paths = []
+        for name in db_names:
+            db_path = db_dir / name
+            if not db_path.exists():
+                raise ValueError(f"Database '{name}' not found in {db_dir}")
+            if not (db_path / "schema.rkyv").exists():
+                raise ValueError(
+                    f"Database '{name}' is missing schema.rkyv - was it preprocessed?"
+                )
+            db_paths.append(db_path)
+        return sorted(db_paths)
+    else:
+        # Discover all database subdirectories (those containing schema.rkyv)
+        db_paths = []
+        for subdir in db_dir.iterdir():
+            if subdir.is_dir() and (subdir / "schema.rkyv").exists():
+                db_paths.append(subdir)
+
+        if not db_paths:
+            raise ValueError(
+                f"No preprocessed databases found in {db_dir}. "
+                "Each database should be a subdirectory containing schema.rkyv, graph.rkyv, etc."
+            )
+        return sorted(db_paths)
+
+
 class SamplerBatchDataset(IterableDataset[Batch]):
     """
     Multi-database sampler dataset that yields full batches.
 
-    Scans a directory for .rkyv files, creates a Sampler for each, and
-    yields batches in a deterministic order that's shuffled per epoch.
+    Discovers database directories in a base path, creates a Sampler for each,
+    and yields batches in a deterministic order that's shuffled per epoch.
 
     For distributed training, each rank works on a different subset of
     (database, batch) pairs via deterministic sharding.
@@ -59,14 +102,9 @@ class SamplerBatchDataset(IterableDataset[Batch]):
         self._rank = ddp_parameters.global_rank if ddp_parameters else 0
         self._world_size = ddp_parameters.world_size if ddp_parameters else 1
 
-        # Discover all .rkyv files in the directory
+        # Discover database directories
         db_dir = Path(data_config.db_dir)
-        if not db_dir.exists():
-            raise ValueError(f"Database directory does not exist: {db_dir}")
-
-        self._db_paths = sorted(db_dir.glob("*.rkyv"))
-        if not self._db_paths:
-            raise ValueError(f"No .rkyv files found in {db_dir}")
+        self._db_paths = discover_databases(db_dir, data_config.db_names)
 
         # Create samplers for each database
         # Store as list of (path, sampler, num_batches)
@@ -81,6 +119,10 @@ class SamplerBatchDataset(IterableDataset[Batch]):
                 max_bfs_width=sampler_config.max_bfs_width,
                 seed=sampler_config.seed,
                 num_threads=sampler_config.num_threads,
+                split=sampler_config.split,
+                train_frac=sampler_config.train_frac,
+                val_frac=sampler_config.val_frac,
+                split_seed=sampler_config.split_seed,
             )
 
             # Validate embedding dimensions are consistent across DBs
@@ -88,19 +130,20 @@ class SamplerBatchDataset(IterableDataset[Batch]):
             if total_embed_dim is None:
                 total_embed_dim = db_embed_dim
             elif total_embed_dim != db_embed_dim:
-                raise ValueError(
-                    f"Inconsistent embedding dimensions: {db_path} has {db_embed_dim}, "
-                    f"expected {total_embed_dim}"
-                )
+                raise ValueError(f"Inconsistent embedding dimensions: {db_path} has {db_embed_dim}, expected {total_embed_dim}")
 
             num_batches = sampler.len_py()
+            num_seeds = sampler.num_seeds()
+            num_rows = sampler.num_rows()
+            if self._rank == 0 and sampler_config.split:
+                print(f"  {db_path.name}: {num_seeds:,} seeds / {num_rows:,} rows ({sampler_config.split} split)")
+
             self._samplers.append((db_path, sampler, num_batches))
 
         # Validate model's d_text matches database embedding dimension
         if total_embed_dim is not None and self.d_text != total_embed_dim:
             raise ValueError(
-                f"Model d_text ({self.d_text}) doesn't match database embedding dim "
-                f"({total_embed_dim}). Update ModelConfig.d_text to match."
+                f"Model d_text ({self.d_text}) doesn't match database embedding dim ({total_embed_dim}). Update ModelConfig.d_text to match."
             )
 
         # Build global batch index: list of (db_idx, batch_idx) covering all batches
@@ -115,10 +158,7 @@ class SamplerBatchDataset(IterableDataset[Batch]):
         # Log database info
         if self._rank == 0:
             total_rows = sum(s.num_rows() for _, s, _ in self._samplers)
-            print(
-                f"Loaded {len(self._samplers)} databases with {total_rows:,} total rows, "
-                f"{self._total_batches:,} total batches"
-            )
+            print(f"Loaded {len(self._samplers)} databases with {total_rows:,} total rows, {self._total_batches:,} total batches")
 
     def __len__(self) -> int:
         """Number of batches this worker will process per epoch."""

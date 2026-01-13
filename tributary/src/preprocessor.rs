@@ -1,17 +1,46 @@
 //! Preprocessor binary: transforms raw parquet databases into graph representation.
 //!
-//! Optimized for speed and memory efficiency:
-//! - Columnar processing using Polars vectorized operations
-//! - Pre-allocation of all vectors
-//! - Streaming table processing (one table in memory at a time)
+//! ## Output Format
 //!
-//! Usage:
-//!   cargo run --release --bin preprocessor -- \
-//!     --input-dir databases_raw/rel-event \
-//!     --output-dir databases_preprocessed/ \
-//!     --verbose
+//! The preprocessor outputs a directory per database:
+//!
+//! ```text
+//! database_name/
+//!   manifest.json       # Metadata, stats, file paths
+//!   schema.rkyv         # Tables, columns, column embeddings
+//!   graph.rkyv          # CSR adjacency (outgoing + incoming)
+//!   cells.rkyv          # Cell values, row offsets, row timestamps
+//!   embeddings.bin      # Text embeddings (raw f16, mmap'd)
+//! ```
+//!
+//! ## Streaming Architecture
+//!
+//! Memory usage is O(chunk_size) regardless of dataset size:
+//!
+//! 1. **Schema Discovery** - Collect column types and normalization statistics
+//! 2. **Vocabulary Extraction** - Stream text columns, deduplicate with HashSet, write to disk
+//! 3. **Embedding** - Stream vocab file through embedder, write directly to `embeddings.bin`
+//! 4. **Cell Encoding** - Stream tables, encode cells with vocab lookup, build PK index
+//! 5. **FK Edge Building** - Stream FK columns, resolve to row indices, build CSR graph
+//! 6. **Finalize** - Save schema, graph, cells to separate .rkyv files
+//!
+//! ## Usage
+//!
+//! ```bash
+//! cargo run --release --bin preprocessor -- \
+//!   --input-dir databases_raw/rel-event \
+//!   --output-dir databases_preprocessed/ \
+//!   --chunk-size 100000 \
+//!   --verbose
+//! ```
+//!
+//! ## Loading
+//!
+//! Use `Database::load()` to load the preprocessed database from a directory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -22,10 +51,10 @@ use tracing::{Level, debug, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use tributary::{
-    Column as SchemaColumn, ColumnIdx, Database, DatabaseMetadata, Embedder, EmbedderConfig,
-    EmbeddingIdx, NO_TIMESTAMP, PackedCell, PreprocessingContext, RowIdx, SemanticType, Table,
-    TableIdx, TableMetadata, load_metadata, pack_embedding_idx, pack_null, pack_numerical,
-    pack_timestamp,
+    Cells, Column as SchemaColumn, ColumnIdx, DatabaseMetadata, Embedder, EmbedderConfig,
+    EmbeddingIdx, Graph, Manifest, ManifestStats, NO_TIMESTAMP, PackedCell, RowIdx, Schema,
+    SemanticType, Table, TableIdx, TableMetadata, load_metadata, pack_embedding_idx, pack_null,
+    pack_numerical, pack_timestamp,
 };
 
 // ============================================================================
@@ -46,17 +75,365 @@ struct Args {
     verbose: bool,
 
     /// Number of rows to process at a time (controls memory usage).
-    /// Smaller values use less memory but are slower.
-    /// Default: 100000 rows per chunk.
     #[arg(long, default_value = "100000")]
     chunk_size: usize,
+}
+
+// ============================================================================
+// Streaming Vocabulary
+// ============================================================================
+
+struct StreamingVocab {
+    temp_dir: PathBuf,
+    vocab_path: PathBuf,
+    pub embeddings_path: PathBuf,
+    lookup: HashMap<u64, EmbeddingIdx>,
+    pub vocab_size: usize,
+    pub embed_dim: usize,
+}
+
+impl StreamingVocab {
+    fn new(output_dir: &PathBuf, db_name: &str) -> Result<Self> {
+        let temp_dir = output_dir.join(format!(".{}_temp", db_name));
+        std::fs::create_dir_all(&temp_dir)?;
+
+        Ok(Self {
+            vocab_path: temp_dir.join("vocab.txt"),
+            embeddings_path: output_dir.join(db_name).join("embeddings.bin"),
+            temp_dir,
+            lookup: HashMap::new(),
+            vocab_size: 0,
+            embed_dim: 0,
+        })
+    }
+
+    fn hash_text(text: &str) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn extract_vocabulary(
+        &mut self,
+        table_infos: &[TableInfo],
+        schema: &Schema,
+        chunk_size: usize,
+    ) -> Result<usize> {
+        info!("Extracting vocabulary from text columns...");
+
+        let mut unique_texts: HashSet<String> = HashSet::new();
+
+        let total_rows: usize = table_infos.iter().map(|t| t.num_rows).sum();
+        let pb = ProgressBar::new(total_rows as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} rows",
+            )
+            .unwrap()
+            .progress_chars("█▓▒░  "),
+        );
+
+        let mut rows_processed = 0u64;
+
+        for (table_idx, info) in table_infos.iter().enumerate() {
+            let table_idx = TableIdx(table_idx as u32);
+            let path_str = path_to_str(&info.path)?;
+
+            let ignored_cols: Vec<&str> = info
+                .metadata
+                .as_ref()
+                .map(|m| m.ignored_columns.iter().map(|s| s.as_str()).collect())
+                .unwrap_or_default();
+
+            let text_columns: Vec<(String, SemanticType)> = info
+                .column_stats
+                .iter()
+                .filter(|cs| {
+                    !should_ignore_column(&cs.name, &ignored_cols)
+                        && (cs.stype == SemanticType::Text || cs.stype == SemanticType::Categorical)
+                })
+                .map(|cs| (cs.name.clone(), cs.stype))
+                .collect();
+
+            if text_columns.is_empty() {
+                rows_processed += info.num_rows as u64;
+                pb.set_position(rows_processed);
+                continue;
+            }
+
+            let fk_columns: HashSet<String> = info
+                .metadata
+                .as_ref()
+                .map(|m| {
+                    m.foreign_key_column_to_primary_key_table
+                        .keys()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut offset: i64 = 0;
+            let chunk_size_u32 = chunk_size as u32;
+
+            while (offset as usize) < info.num_rows {
+                let df =
+                    LazyFrame::scan_parquet(PlPath::new(path_str), ScanArgsParquet::default())?
+                        .slice(offset, chunk_size_u32)
+                        .collect()
+                        .with_context(|| format!("Failed to read chunk from: {:?}", info.path))?;
+
+                let batch_rows = df.height();
+                if batch_rows == 0 {
+                    break;
+                }
+
+                for (col_name, stype) in &text_columns {
+                    if fk_columns.contains(col_name) {
+                        continue;
+                    }
+                    let is_pk = schema.tables[table_idx.0 as usize]
+                        .primary_key_column
+                        .map(|idx| &schema.columns[idx.0 as usize].name == col_name)
+                        .unwrap_or(false);
+                    if is_pk {
+                        continue;
+                    }
+
+                    if let Ok(col) = df.column(col_name) {
+                        extract_texts_from_column(col, col_name, *stype, &mut unique_texts);
+                    }
+                }
+
+                rows_processed += batch_rows as u64;
+                offset += batch_rows as i64;
+                pb.set_position(rows_processed);
+            }
+        }
+
+        pb.finish_with_message("Vocabulary extracted");
+
+        info!("Sorting {} unique texts...", unique_texts.len());
+        let mut texts: Vec<String> = unique_texts.into_iter().collect();
+        texts.sort();
+
+        info!("Writing vocabulary to file...");
+        let write_pb = ProgressBar::new(texts.len() as u64);
+        write_pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} texts",
+            )
+            .unwrap()
+            .progress_chars("█▓▒░  "),
+        );
+
+        let vocab_file = File::create(&self.vocab_path)?;
+        let mut writer = BufWriter::new(vocab_file);
+        for (idx, text) in texts.iter().enumerate() {
+            writeln!(writer, "{}", text)?;
+            if idx % 100_000 == 0 {
+                write_pb.set_position(idx as u64);
+            }
+        }
+        writer.flush()?;
+        write_pb.finish_with_message("Vocabulary written");
+
+        self.vocab_size = texts.len();
+
+        info!("Building lookup table...");
+        let lookup_pb = ProgressBar::new(texts.len() as u64);
+        lookup_pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} hashes",
+            )
+            .unwrap()
+            .progress_chars("█▓▒░  "),
+        );
+
+        self.lookup.reserve(texts.len());
+        for (idx, text) in texts.iter().enumerate() {
+            let hash = Self::hash_text(text);
+            self.lookup.insert(hash, EmbeddingIdx(idx as u32));
+            if idx % 100_000 == 0 {
+                lookup_pb.set_position(idx as u64);
+            }
+        }
+        lookup_pb.finish_with_message("Lookup table built");
+
+        info!("Vocabulary complete: {} unique texts", self.vocab_size);
+        Ok(self.vocab_size)
+    }
+
+    fn embed_vocabulary(&mut self, embedder: &Embedder) -> Result<()> {
+        if self.vocab_size == 0 {
+            // Create empty embeddings file with header
+            std::fs::create_dir_all(self.embeddings_path.parent().unwrap())?;
+            let embed_file = File::create(&self.embeddings_path)?;
+            let mut writer = BufWriter::new(embed_file);
+            writer.write_all(&0u32.to_le_bytes())?;
+            writer.write_all(&(embedder.embedding_dim() as u32).to_le_bytes())?;
+            writer.flush()?;
+            self.embed_dim = embedder.embedding_dim();
+            return Ok(());
+        }
+
+        info!(
+            "Embedding {} texts (batch_size={})...",
+            self.vocab_size, embedder.config.batch_size
+        );
+
+        self.embed_dim = embedder.embedding_dim();
+        let batch_size = embedder.config.batch_size;
+
+        std::fs::create_dir_all(self.embeddings_path.parent().unwrap())?;
+        let embed_file = File::create(&self.embeddings_path)?;
+        let mut writer = BufWriter::new(embed_file);
+
+        writer.write_all(&(self.vocab_size as u32).to_le_bytes())?;
+        writer.write_all(&(self.embed_dim as u32).to_le_bytes())?;
+
+        let vocab_file = File::open(&self.vocab_path)?;
+        let reader = BufReader::new(vocab_file);
+        let mut batch: Vec<String> = Vec::with_capacity(batch_size);
+        let mut texts_embedded = 0usize;
+
+        let pb = ProgressBar::new(self.vocab_size as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} Embedding: [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}, ETA: {eta})",
+            )
+            .unwrap()
+            .progress_chars("█▓▒░  "),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        let total_batches = (self.vocab_size + batch_size - 1) / batch_size;
+        let log_interval = std::cmp::max(1, total_batches / 20);
+        let mut batches_processed = 0usize;
+
+        for line in reader.lines() {
+            let text = line?;
+            batch.push(text);
+
+            if batch.len() >= batch_size {
+                self.embed_and_write_batch(&batch, embedder, &mut writer)?;
+                texts_embedded += batch.len();
+                batches_processed += 1;
+                pb.set_position(texts_embedded as u64);
+
+                if batches_processed % log_interval == 0 {
+                    let pct = (texts_embedded as f64 / self.vocab_size as f64) * 100.0;
+                    info!(
+                        "Embedding progress: {}/{} texts ({:.1}%)",
+                        texts_embedded, self.vocab_size, pct
+                    );
+                }
+                batch.clear();
+            }
+        }
+
+        if !batch.is_empty() {
+            self.embed_and_write_batch(&batch, embedder, &mut writer)?;
+            texts_embedded += batch.len();
+            pb.set_position(texts_embedded as u64);
+        }
+
+        writer.flush()?;
+        pb.finish_with_message("Embeddings complete");
+
+        info!(
+            "Embedded {} texts to {:?}",
+            texts_embedded, self.embeddings_path
+        );
+        Ok(())
+    }
+
+    fn embed_and_write_batch(
+        &self,
+        batch: &[String],
+        embedder: &Embedder,
+        writer: &mut BufWriter<File>,
+    ) -> Result<()> {
+        let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
+
+        match embedder.embed_batch_f16(&refs) {
+            Ok(embeddings) => {
+                for embedding in embeddings {
+                    for val in embedding {
+                        writer.write_all(&val.to_le_bytes())?;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to embed batch: {}", e);
+                let zeros = vec![0u8; self.embed_dim * 2];
+                for _ in batch {
+                    writer.write_all(&zeros)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lookup_text(&self, text: &str) -> Option<EmbeddingIdx> {
+        let hash = Self::hash_text(text);
+        self.lookup.get(&hash).copied()
+    }
+
+    fn cleanup(&self) -> Result<()> {
+        if self.temp_dir.exists() {
+            std::fs::remove_dir_all(&self.temp_dir)?;
+        }
+        Ok(())
+    }
+}
+
+fn extract_texts_from_column(
+    col: &Column,
+    col_name: &str,
+    stype: SemanticType,
+    texts: &mut HashSet<String>,
+) {
+    match stype {
+        SemanticType::Categorical => {
+            for row_idx in 0..col.len() {
+                if let Ok(AnyValue::Null) = col.get(row_idx) {
+                    continue;
+                }
+                if let Some(val_str) = get_string_value(col, row_idx) {
+                    let text = format!("{} is {}", col_name, val_str);
+                    texts.insert(text);
+                }
+            }
+        }
+        SemanticType::Text => {
+            if let Ok(str_col) = col.str() {
+                for opt_val in str_col.into_iter() {
+                    if let Some(s) = opt_val {
+                        if !s.is_empty() {
+                            texts.insert(s.to_string());
+                        }
+                    }
+                }
+            } else {
+                for row_idx in 0..col.len() {
+                    if let Some(s) = get_string_value(col, row_idx) {
+                        if !s.is_empty() {
+                            texts.insert(s);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 // ============================================================================
 // Polars Dtype -> SemanticType
 // ============================================================================
 
-/// Maps Polars data types to our semantic types.
 fn dtype_to_stype(dtype: &DataType) -> Option<SemanticType> {
     match dtype {
         DataType::Boolean => Some(SemanticType::Categorical),
@@ -80,9 +457,7 @@ fn dtype_to_stype(dtype: &DataType) -> Option<SemanticType> {
     }
 }
 
-/// Determines the semantic type for a column, respecting metadata overrides.
 fn determine_stype(col: &Column, col_name: &str, metadata: Option<&TableMetadata>) -> SemanticType {
-    // Check for metadata override first
     if let Some(meta) = metadata {
         if let Some(override_str) = meta.stype_overrides.get(col_name) {
             if let Some(stype) = SemanticType::from_str(override_str) {
@@ -90,7 +465,6 @@ fn determine_stype(col: &Column, col_name: &str, metadata: Option<&TableMetadata
             }
         }
     }
-    // Fall back to dtype inference
     match dtype_to_stype(col.dtype()) {
         Some(stype) => stype,
         None => {
@@ -105,10 +479,9 @@ fn determine_stype(col: &Column, col_name: &str, metadata: Option<&TableMetadata
 }
 
 // ============================================================================
-// Running Statistics (Welford's online algorithm)
+// Running Statistics
 // ============================================================================
 
-/// Computes mean and std incrementally without storing all values.
 #[derive(Default, Clone, Copy)]
 struct RunningStats {
     count: u64,
@@ -142,7 +515,6 @@ impl RunningStats {
 // Column Statistics
 // ============================================================================
 
-/// Statistics collected for a single column during schema discovery.
 struct ColumnStats {
     name: String,
     dtype: DataType,
@@ -152,7 +524,7 @@ struct ColumnStats {
 }
 
 // ============================================================================
-// Table Info (lightweight metadata for each table)
+// Table Info
 // ============================================================================
 
 struct TableInfo {
@@ -164,28 +536,18 @@ struct TableInfo {
 }
 
 // ============================================================================
-// Path Utilities
+// Utilities
 // ============================================================================
 
-/// Converts a PathBuf to a string, returning an error if the path is invalid UTF-8.
 fn path_to_str(path: &PathBuf) -> Result<&str> {
     path.to_str()
         .with_context(|| format!("Path contains invalid UTF-8: {:?}", path))
 }
 
-// ============================================================================
-// Column Filtering
-// ============================================================================
-
-/// Returns true if the column should be ignored.
-/// Ignores:
-/// - Columns explicitly listed in metadata's ignored_columns
-/// - Pandas index columns (pattern: "Unnamed: N" where N is a number)
 fn should_ignore_column(col_name: &str, ignored_cols: &[&str]) -> bool {
     if ignored_cols.contains(&col_name) {
         return true;
     }
-    // Skip pandas-style unnamed index columns: "Unnamed: 0", "Unnamed: 1", etc.
     if col_name.starts_with("Unnamed: ") {
         if col_name[9..].parse::<u32>().is_ok() {
             return true;
@@ -194,11 +556,6 @@ fn should_ignore_column(col_name: &str, ignored_cols: &[&str]) -> bool {
     false
 }
 
-// ============================================================================
-// Timestamp Conversion
-// ============================================================================
-
-/// Iterates over a datetime column, calling the callback with epoch seconds for each value.
 fn iter_datetime_as_epoch_secs<F: FnMut(Option<i64>)>(col: &Column, mut f: F) {
     match col.dtype() {
         DataType::Datetime(unit, _tz) => {
@@ -224,11 +581,6 @@ fn iter_datetime_as_epoch_secs<F: FnMut(Option<i64>)>(col: &Column, mut f: F) {
     }
 }
 
-// ============================================================================
-// Column Data Extraction (per semantic type)
-// ============================================================================
-
-/// Extracts numerical column values, normalizing by mean/std.
 fn extract_numerical(col: &Column, mean: f64, std: f64) -> Vec<PackedCell> {
     let n = col.len();
     let mut values = Vec::with_capacity(n);
@@ -248,16 +600,14 @@ fn extract_numerical(col: &Column, mean: f64, std: f64) -> Vec<PackedCell> {
         }
     }
 
-    // Fallback: all nulls
     values.resize(n, pack_null());
     values
 }
 
-/// Extracts categorical column values as "column_name is value" text embeddings.
-fn extract_categorical(
+fn extract_categorical_streaming(
     col: &Column,
     col_name: &str,
-    ctx: &mut PreprocessingContext,
+    vocab: &StreamingVocab,
 ) -> Vec<PackedCell> {
     let n = col.len();
     let mut values = Vec::with_capacity(n);
@@ -269,14 +619,16 @@ fn extract_categorical(
         }
         let val_str = get_string_value(col, row_idx).unwrap_or_else(|| "unknown".into());
         let text = format!("{} is {}", col_name, val_str);
-        let idx = ctx.intern_text(&text);
-        values.push(pack_embedding_idx(idx));
+        if let Some(idx) = vocab.lookup_text(&text) {
+            values.push(pack_embedding_idx(idx));
+        } else {
+            values.push(pack_null());
+        }
     }
 
     values
 }
 
-/// Extracts timestamp column values as epoch seconds (stored as f32).
 fn extract_timestamp(col: &Column) -> Vec<PackedCell> {
     let n = col.len();
     let mut values = Vec::with_capacity(n);
@@ -286,7 +638,6 @@ fn extract_timestamp(col: &Column) -> Vec<PackedCell> {
         None => values.push(pack_null()),
     });
 
-    // If iter didn't produce values (unsupported dtype), fill with nulls
     if values.is_empty() {
         values.resize(n, pack_null());
     }
@@ -294,8 +645,7 @@ fn extract_timestamp(col: &Column) -> Vec<PackedCell> {
     values
 }
 
-/// Extracts text column values as embedding indices.
-fn extract_text(col: &Column, ctx: &mut PreprocessingContext) -> Vec<PackedCell> {
+fn extract_text_streaming(col: &Column, vocab: &StreamingVocab) -> Vec<PackedCell> {
     let n = col.len();
     let mut values = Vec::with_capacity(n);
 
@@ -303,23 +653,26 @@ fn extract_text(col: &Column, ctx: &mut PreprocessingContext) -> Vec<PackedCell>
         for opt_val in str_col.into_iter() {
             match opt_val {
                 Some(s) if !s.is_empty() => {
-                    let idx = ctx.intern_text(s);
-                    values.push(pack_embedding_idx(idx));
+                    if let Some(idx) = vocab.lookup_text(s) {
+                        values.push(pack_embedding_idx(idx));
+                    } else {
+                        values.push(pack_null());
+                    }
                 }
                 _ => values.push(pack_null()),
             }
         }
     } else {
-        // Fallback: convert each value to string
         for row_idx in 0..n {
             if let Ok(AnyValue::Null) = col.get(row_idx) {
                 values.push(pack_null());
             } else if let Some(s) = get_string_value(col, row_idx) {
                 if s.is_empty() {
                     values.push(pack_null());
-                } else {
-                    let idx = ctx.intern_text(&s);
+                } else if let Some(idx) = vocab.lookup_text(&s) {
                     values.push(pack_embedding_idx(idx));
+                } else {
+                    values.push(pack_null());
                 }
             } else {
                 values.push(pack_null());
@@ -330,11 +683,10 @@ fn extract_text(col: &Column, ctx: &mut PreprocessingContext) -> Vec<PackedCell>
     values
 }
 
-/// Extracts all cell values for a column, dispatching to the appropriate type handler.
-fn extract_column(
+fn extract_column_streaming(
     col: &Column,
     schema_col: &SchemaColumn,
-    ctx: &mut PreprocessingContext,
+    vocab: &StreamingVocab,
 ) -> Vec<PackedCell> {
     match schema_col.stype {
         SemanticType::Numerical => {
@@ -342,13 +694,12 @@ fn extract_column(
             let std = schema_col.norm_std.unwrap_or(1.0) as f64;
             extract_numerical(col, mean, std)
         }
-        SemanticType::Categorical => extract_categorical(col, &schema_col.name, ctx),
+        SemanticType::Categorical => extract_categorical_streaming(col, &schema_col.name, vocab),
         SemanticType::Timestamp => extract_timestamp(col),
-        SemanticType::Text => extract_text(col, ctx),
+        SemanticType::Text => extract_text_streaming(col, vocab),
     }
 }
 
-/// Converts a cell value to string representation.
 fn get_string_value(col: &Column, row_idx: usize) -> Option<String> {
     match col.get(row_idx) {
         Ok(AnyValue::Null) => None,
@@ -359,13 +710,6 @@ fn get_string_value(col: &Column, row_idx: usize) -> Option<String> {
     }
 }
 
-// ============================================================================
-// Integer Column Iteration (for PK/FK handling)
-// ============================================================================
-
-/// Iterates over an integer column, calling the callback with (row_idx, value) for non-null values.
-/// Handles Int32, Int64, UInt32, UInt64, and String columns.
-/// Returns the number of null/unhandled values for diagnostics.
 fn iter_integer_column<F: FnMut(usize, i64)>(
     col: &Column,
     col_name: &str,
@@ -428,7 +772,6 @@ fn iter_integer_column<F: FnMut(usize, i64)>(
             }
         }
         DataType::String => {
-            // Try to parse string values as integers
             if let Ok(ca) = col.str() {
                 for (row_idx, opt_val) in ca.into_iter().enumerate() {
                     match opt_val {
@@ -458,10 +801,9 @@ fn iter_integer_column<F: FnMut(usize, i64)>(
 }
 
 // ============================================================================
-// Phase 1: Schema and Statistics (Chunked)
+// Phase 1: Schema and Statistics
 // ============================================================================
 
-/// Gets the total row count from a parquet file without loading data.
 fn get_parquet_row_count(path: &PathBuf) -> Result<usize> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
     let file = std::fs::File::open(path)
@@ -475,8 +817,6 @@ fn get_parquet_row_count(path: &PathBuf) -> Result<usize> {
     Ok(num_rows as usize)
 }
 
-/// Scans all parquet files to collect schema information and statistics.
-/// Uses chunked processing to avoid loading entire files into memory.
 fn collect_schema_and_stats(
     input_dir: &PathBuf,
     metadata: &DatabaseMetadata,
@@ -522,20 +862,16 @@ fn collect_schema_and_stats(
             .map(|m| m.ignored_columns.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();
 
-        // Get row count from parquet metadata (no data loading)
         let num_rows = get_parquet_row_count(&path)?;
 
-        // Get schema from first few rows
         let schema_df = LazyFrame::scan_parquet(PlPath::new(path_str), ScanArgsParquet::default())?
             .slice(0, 1)
             .collect()
             .with_context(|| format!("Failed to read schema from: {:?}", path))?;
 
-        // Initialize running stats per column
         let mut column_running_stats: HashMap<String, (DataType, SemanticType, RunningStats)> =
             HashMap::new();
 
-        // Initialize from schema
         for col in schema_df.get_columns() {
             let col_name = col.name().to_string();
             if should_ignore_column(&col_name, &ignored_cols) {
@@ -546,7 +882,6 @@ fn collect_schema_and_stats(
             column_running_stats.insert(col_name, (dtype, stype, RunningStats::default()));
         }
 
-        // Process file in chunks to collect stats
         let mut offset: i64 = 0;
         let chunk_size_i64 = chunk_size as i64;
 
@@ -554,7 +889,9 @@ fn collect_schema_and_stats(
             let df = LazyFrame::scan_parquet(PlPath::new(path_str), ScanArgsParquet::default())?
                 .slice(offset, chunk_size_i64 as u32)
                 .collect()
-                .with_context(|| format!("Failed to read chunk at offset {} from: {:?}", offset, path))?;
+                .with_context(|| {
+                    format!("Failed to read chunk at offset {} from: {:?}", offset, path)
+                })?;
 
             if df.height() == 0 {
                 break;
@@ -566,7 +903,6 @@ fn collect_schema_and_stats(
                     continue;
                 };
 
-                // Update running stats for numerical columns
                 if entry.1 == SemanticType::Numerical {
                     if let Ok(f64_col) = col.cast(&DataType::Float64) {
                         if let Ok(ca) = f64_col.f64() {
@@ -581,7 +917,6 @@ fn collect_schema_and_stats(
                     }
                 }
 
-                // Collect timestamp stats for global normalization
                 if entry.1 == SemanticType::Timestamp {
                     iter_datetime_as_epoch_secs(col, |opt_epoch| {
                         if let Some(epoch_secs) = opt_epoch {
@@ -594,7 +929,6 @@ fn collect_schema_and_stats(
             offset += df.height() as i64;
         }
 
-        // Convert running stats to ColumnStats (preserve column order from schema)
         let mut column_stats = Vec::new();
         for col in schema_df.get_columns() {
             let col_name = col.name().to_string();
@@ -639,23 +973,18 @@ fn collect_schema_and_stats(
 // Phase 2: Build Schema
 // ============================================================================
 
-/// Builds the database schema from collected table info.
 fn build_schema(
     table_infos: &[TableInfo],
     embedder: &Embedder,
     global_ts_stats: &RunningStats,
-) -> (
-    Database,
-    HashMap<String, TableIdx>,
-    HashMap<(TableIdx, String), ColumnIdx>,
-) {
-    let mut db = Database::new();
+) -> (Schema, HashMap<String, TableIdx>, HashMap<(TableIdx, String), ColumnIdx>) {
+    let mut schema = Schema::new();
     let mut table_name_to_idx: HashMap<String, TableIdx> = HashMap::new();
     let mut column_name_to_idx: HashMap<(TableIdx, String), ColumnIdx> = HashMap::new();
 
     if global_ts_stats.count > 0 {
-        db.timestamp_mean = Some(global_ts_stats.mean());
-        db.timestamp_std = Some(global_ts_stats.std());
+        schema.timestamp_mean = Some(global_ts_stats.mean());
+        schema.timestamp_std = Some(global_ts_stats.std());
     }
 
     let mut global_col_idx: u32 = 0;
@@ -669,7 +998,6 @@ fn build_schema(
         let col_start = ColumnIdx(global_col_idx);
         let row_start = RowIdx(global_row_idx);
 
-        // Find PK and time columns from metadata
         let pk_col_name = info
             .metadata
             .as_ref()
@@ -678,7 +1006,6 @@ fn build_schema(
         let mut pk_column_idx: Option<ColumnIdx> = None;
         let mut time_column_idx: Option<ColumnIdx> = None;
 
-        // Validate metadata references
         if let Some(pk_name) = pk_col_name {
             if !info.column_stats.iter().any(|c| &c.name == pk_name) {
                 warn!(
@@ -711,7 +1038,7 @@ fn build_schema(
             let description = format!("{}.{}", info.name, col_stats.name);
             column_descriptions.push((col_idx, description));
 
-            db.columns.push(SchemaColumn {
+            schema.columns.push(SchemaColumn {
                 name: col_stats.name.clone(),
                 idx: col_idx,
                 table_idx,
@@ -728,11 +1055,11 @@ fn build_schema(
         let col_end = ColumnIdx(global_col_idx);
         let row_end = RowIdx(global_row_idx + info.num_rows as u32);
 
-        db.tables.push(Table {
+        schema.tables.push(Table {
             name: info.name.clone(),
             idx: table_idx,
             column_range: (col_start, col_end),
-            feature_columns: Vec::new(), // Populated after FK resolution
+            feature_columns: Vec::new(),
             row_range: (row_start, row_end),
             primary_key_column: pk_column_idx,
             time_column: time_column_idx,
@@ -741,10 +1068,8 @@ fn build_schema(
         global_row_idx += info.num_rows as u32;
     }
 
-    // Initialize column embeddings storage
-    db.init_column_embeddings(embedder.embedding_dim() as u32);
+    schema.init_column_embeddings(embedder.embedding_dim() as u32);
 
-    // Batch embed column descriptions
     if !column_descriptions.is_empty() {
         info!(
             "Embedding {} column descriptions...",
@@ -757,7 +1082,7 @@ fn build_schema(
         match embedder.embed_batch_chunked_f16(&descriptions, embedder.config.batch_size) {
             Ok(embeddings) => {
                 for ((col_idx, _), embedding) in column_descriptions.iter().zip(embeddings) {
-                    db.set_column_embedding(*col_idx, &embedding);
+                    schema.set_column_embedding(*col_idx, &embedding);
                 }
             }
             Err(e) => {
@@ -766,25 +1091,21 @@ fn build_schema(
         }
     }
 
-    // Resolve FK references
     resolve_foreign_keys(
         table_infos,
-        &mut db,
+        &mut schema,
         &table_name_to_idx,
         &column_name_to_idx,
     );
 
-    // Compute feature_columns for each table (excludes PK and FK columns)
-    // Also computes target_columns from metadata
-    compute_feature_columns(&mut db, table_infos);
+    compute_feature_columns(&mut schema);
 
-    (db, table_name_to_idx, column_name_to_idx)
+    (schema, table_name_to_idx, column_name_to_idx)
 }
 
-/// Resolves foreign key references from metadata.
 fn resolve_foreign_keys(
     table_infos: &[TableInfo],
-    db: &mut Database,
+    schema: &mut Schema,
     table_name_to_idx: &HashMap<String, TableIdx>,
     column_name_to_idx: &HashMap<(TableIdx, String), ColumnIdx>,
 ) {
@@ -795,7 +1116,6 @@ fn resolve_foreign_keys(
         let table_idx = table_name_to_idx[&info.name];
 
         for (fk_col_name, target_table_name) in &meta.foreign_key_column_to_primary_key_table {
-            // Validate FK column exists
             let Some(&fk_col_idx) = column_name_to_idx.get(&(table_idx, fk_col_name.clone()))
             else {
                 warn!(
@@ -805,7 +1125,6 @@ fn resolve_foreign_keys(
                 continue;
             };
 
-            // Validate target table exists
             let Some(&target_table_idx) = table_name_to_idx.get(target_table_name) else {
                 warn!(
                     "Table '{}': FK target table '{}' not found",
@@ -814,8 +1133,8 @@ fn resolve_foreign_keys(
                 continue;
             };
 
-            // Validate target table has a PK
-            let Some(pk_col_idx) = db.tables[target_table_idx.0 as usize].primary_key_column else {
+            let Some(pk_col_idx) = schema.tables[target_table_idx.0 as usize].primary_key_column
+            else {
                 warn!(
                     "Table '{}': FK target table '{}' has no primary key",
                     info.name, target_table_name
@@ -823,18 +1142,17 @@ fn resolve_foreign_keys(
                 continue;
             };
 
-            db.columns[fk_col_idx.0 as usize].fk_target_column = Some(pk_col_idx);
+            schema.columns[fk_col_idx.0 as usize].fk_target_column = Some(pk_col_idx);
             debug!("FK: {}.{} -> {}", info.name, fk_col_name, target_table_name);
         }
     }
 }
 
-/// Computes which columns are features (not PK or FK) for each table.
-fn compute_feature_columns(db: &mut Database, _table_infos: &[TableInfo]) {
-    for table in db.tables.iter_mut() {
+fn compute_feature_columns(schema: &mut Schema) {
+    for table in schema.tables.iter_mut() {
         let mut feature_cols = Vec::new();
-        for col_idx in table.column_range.0.0..table.column_range.1.0 {
-            let col = &db.columns[col_idx as usize];
+        for col_idx in table.column_range.0 .0..table.column_range.1 .0 {
+            let col = &schema.columns[col_idx as usize];
             if !col.is_primary_key && col.fk_target_column.is_none() {
                 feature_cols.push(ColumnIdx(col_idx));
             }
@@ -850,10 +1168,6 @@ fn compute_feature_columns(db: &mut Database, _table_infos: &[TableInfo]) {
         table.feature_columns = feature_cols;
     }
 }
-
-// ============================================================================
-// Print Schema Summary
-// ============================================================================
 
 fn print_schema_summary(table_infos: &[TableInfo]) {
     info!("Schema Summary:");
@@ -871,15 +1185,43 @@ fn print_schema_summary(table_infos: &[TableInfo]) {
 }
 
 // ============================================================================
-// Phase 3: Process Tables (Chunked)
+// PK Index
 // ============================================================================
 
-/// Processes all tables, extracting cell data and building PK indices.
-/// Uses chunked processing to avoid loading entire files into memory.
-fn process_tables(
+struct PkIndex {
+    index: HashMap<(TableIdx, i64), RowIdx>,
+}
+
+impl PkIndex {
+    fn new() -> Self {
+        Self {
+            index: HashMap::new(),
+        }
+    }
+
+    fn register(&mut self, table_idx: TableIdx, pk_value: i64, row_idx: RowIdx) {
+        self.index.insert((table_idx, pk_value), row_idx);
+    }
+
+    fn lookup(&self, table_idx: TableIdx, pk_value: i64) -> Option<RowIdx> {
+        self.index.get(&(table_idx, pk_value)).copied()
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+}
+
+// ============================================================================
+// Phase 4: Process Tables
+// ============================================================================
+
+fn process_tables_streaming(
     table_infos: &[TableInfo],
-    db: &mut Database,
-    ctx: &mut PreprocessingContext,
+    schema: &Schema,
+    cells: &mut Cells,
+    vocab: &StreamingVocab,
+    pk_index: &mut PkIndex,
     chunk_size: usize,
 ) -> Result<()> {
     let total_rows: usize = table_infos.iter().map(|t| t.num_rows).sum();
@@ -894,8 +1236,7 @@ fn process_tables(
         total_cells
     );
 
-    // Pre-allocate cell storage
-    db.reserve_cells(total_cells, total_rows);
+    cells.reserve(total_cells, total_rows);
 
     let pb = ProgressBar::new(total_rows as u64);
     pb.set_style(
@@ -911,7 +1252,7 @@ fn process_tables(
         pb.set_message(format!("{}", info.name));
 
         let path_str = path_to_str(&info.path)?;
-        let row_start = db.tables[table_idx.0 as usize].row_range.0.0;
+        let row_start = schema.tables[table_idx.0 as usize].row_range.0 .0;
 
         let ignored_cols: Vec<&str> = info
             .metadata
@@ -919,21 +1260,17 @@ fn process_tables(
             .map(|m| m.ignored_columns.iter().map(|s| s.as_str()).collect())
             .unwrap_or_default();
 
-        // Get the feature columns for this table
-        let feature_columns = db.tables[table_idx.0 as usize].feature_columns.clone();
+        let feature_columns = schema.tables[table_idx.0 as usize].feature_columns.clone();
         let num_feature_cols = feature_columns.len();
 
-        // Get PK column name if present
-        let pk_col_name = db.tables[table_idx.0 as usize]
+        let pk_col_name = schema.tables[table_idx.0 as usize]
             .primary_key_column
-            .map(|idx| db.columns[idx.0 as usize].name.clone());
+            .map(|idx| schema.columns[idx.0 as usize].name.clone());
 
-        // Get time column name if present
-        let time_col_name = db.tables[table_idx.0 as usize]
+        let time_col_name = schema.tables[table_idx.0 as usize]
             .time_column
-            .map(|idx| db.columns[idx.0 as usize].name.clone());
+            .map(|idx| schema.columns[idx.0 as usize].name.clone());
 
-        // Process file in chunks
         let mut offset: i64 = 0;
         let chunk_size_u32 = chunk_size as u32;
         let mut rows_processed_in_table: u32 = 0;
@@ -942,14 +1279,18 @@ fn process_tables(
             let df = LazyFrame::scan_parquet(PlPath::new(path_str), ScanArgsParquet::default())?
                 .slice(offset, chunk_size_u32)
                 .collect()
-                .with_context(|| format!("Failed to read chunk at offset {} from: {:?}", offset, info.path))?;
+                .with_context(|| {
+                    format!(
+                        "Failed to read chunk at offset {} from: {:?}",
+                        offset, info.path
+                    )
+                })?;
 
             let batch_rows = df.height();
             if batch_rows == 0 {
                 break;
             }
 
-            // Build column name -> polars column mapping (filtered)
             let polars_columns: HashMap<&str, &Column> = df
                 .get_columns()
                 .iter()
@@ -957,12 +1298,11 @@ fn process_tables(
                 .map(|c| (c.name().as_str(), c))
                 .collect();
 
-            // Extract feature column data as packed cells for this batch
             let mut column_data: Vec<Vec<PackedCell>> = Vec::with_capacity(num_feature_cols);
             for &col_idx in &feature_columns {
-                let schema_col = &db.columns[col_idx.0 as usize];
+                let schema_col = &schema.columns[col_idx.0 as usize];
                 if let Some(polars_col) = polars_columns.get(schema_col.name.as_str()) {
-                    let values = extract_column(polars_col, schema_col, ctx);
+                    let values = extract_column_streaming(polars_col, schema_col, vocab);
                     column_data.push(values);
                 } else {
                     warn!("Feature column '{}' not found in parquet", schema_col.name);
@@ -970,28 +1310,22 @@ fn process_tables(
                 }
             }
 
-            // Extract raw timestamps for this batch
-            let row_timestamps = extract_row_timestamps_batch(
-                &df,
-                time_col_name.as_deref(),
-                batch_rows,
-            );
+            let row_timestamps =
+                extract_row_timestamps_batch(&df, time_col_name.as_deref(), batch_rows);
 
-            // Build cells row by row from columnar data
             let mut row_buffer = Vec::with_capacity(num_feature_cols);
             for row_idx in 0..batch_rows {
                 row_buffer.clear();
                 for col_data in &column_data {
                     row_buffer.push(col_data[row_idx]);
                 }
-                db.push_row(&row_buffer, row_timestamps[row_idx]);
+                cells.push_row(&row_buffer, row_timestamps[row_idx]);
             }
 
-            // Build PK index for this batch
             if let Some(ref pk_name) = pk_col_name {
                 if let Some(col) = polars_columns.get(pk_name.as_str()) {
                     let batch_row_start = row_start + rows_processed_in_table;
-                    build_pk_index(col, pk_name, table_idx, batch_row_start, ctx);
+                    build_pk_index(col, pk_name, table_idx, batch_row_start, pk_index);
                 }
             }
 
@@ -1005,8 +1339,6 @@ fn process_tables(
     Ok(())
 }
 
-/// Extracts raw i64 timestamps for each row in a batch from the time_column.
-/// Returns NO_TIMESTAMP for rows without a time_column or with null values.
 fn extract_row_timestamps_batch(
     df: &DataFrame,
     time_col_name: Option<&str>,
@@ -1026,7 +1358,6 @@ fn extract_row_timestamps_batch(
         timestamps.push(opt_epoch.unwrap_or(NO_TIMESTAMP));
     });
 
-    // If iteration didn't produce values (unsupported dtype), fill with NO_TIMESTAMP
     if timestamps.is_empty() {
         warn!(
             "Time column '{}' has unsupported dtype {:?}",
@@ -1039,16 +1370,15 @@ fn extract_row_timestamps_batch(
     timestamps
 }
 
-/// Builds the primary key index for a table.
 fn build_pk_index(
     col: &Column,
     col_name: &str,
     table_idx: TableIdx,
     row_start: u32,
-    ctx: &mut PreprocessingContext,
+    pk_index: &mut PkIndex,
 ) {
     let (handled, skipped) = iter_integer_column(col, col_name, |row_idx, pk| {
-        ctx.register_pk(table_idx, pk, RowIdx(row_start + row_idx as u32));
+        pk_index.register(table_idx, pk, RowIdx(row_start + row_idx as u32));
     });
 
     if skipped > 0 {
@@ -1060,19 +1390,17 @@ fn build_pk_index(
 }
 
 // ============================================================================
-// Phase 4: Build FK Edges (Chunked)
+// Phase 5: Build FK Edges
 // ============================================================================
 
-/// Builds foreign key edges between tables.
-/// Uses chunked processing to avoid loading entire files into memory.
 fn build_fk_edges(
     table_infos: &[TableInfo],
-    db: &mut Database,
+    schema: &Schema,
+    graph: &mut Graph,
     table_name_to_idx: &HashMap<String, TableIdx>,
-    ctx: &PreprocessingContext,
+    pk_index: &PkIndex,
     chunk_size: usize,
 ) -> Result<()> {
-    // Count FK columns for progress
     let total_fk_cols: usize = table_infos
         .iter()
         .filter_map(|info| info.metadata.as_ref())
@@ -1081,7 +1409,8 @@ fn build_fk_edges(
 
     if total_fk_cols == 0 {
         info!("No foreign key edges to build");
-        db.build_csr_from_edges(Vec::new());
+        let num_rows: usize = table_infos.iter().map(|t| t.num_rows).sum();
+        graph.build_from_edges(num_rows, Vec::new());
         return Ok(());
     }
 
@@ -1110,22 +1439,25 @@ fn build_fk_edges(
             .collect();
 
         let path_str = path_to_str(&info.path)?;
-        let row_start = db.tables[table_idx.0 as usize].row_range.0.0;
+        let row_start = schema.tables[table_idx.0 as usize].row_range.0 .0;
 
-        // Process file in chunks, selecting only FK columns
         let mut offset: i64 = 0;
         let chunk_size_u32 = chunk_size as u32;
         let mut rows_processed: u32 = 0;
 
         while (offset as usize) < info.num_rows {
-            // Select only the FK columns to minimize memory usage
             let select_cols: Vec<Expr> = fk_col_names.iter().map(|s| col(s.as_str())).collect();
 
             let df = LazyFrame::scan_parquet(PlPath::new(path_str), ScanArgsParquet::default())?
                 .select(select_cols)
                 .slice(offset, chunk_size_u32)
                 .collect()
-                .with_context(|| format!("Failed to read FK chunk at offset {} from: {:?}", offset, info.path))?;
+                .with_context(|| {
+                    format!(
+                        "Failed to read FK chunk at offset {} from: {:?}",
+                        offset, info.path
+                    )
+                })?;
 
             let batch_rows = df.height();
             if batch_rows == 0 {
@@ -1145,7 +1477,7 @@ fn build_fk_edges(
                         fk_col_name,
                         target_table_idx,
                         batch_row_start,
-                        ctx,
+                        pk_index,
                         &mut all_edges,
                     );
                     total_orphaned += orphaned;
@@ -1156,7 +1488,6 @@ fn build_fk_edges(
             offset += batch_rows as i64;
         }
 
-        // Increment progress by number of FK columns in this table
         pb.inc(meta.foreign_key_column_to_primary_key_table.len() as u64);
     }
 
@@ -1170,24 +1501,24 @@ fn build_fk_edges(
     }
 
     info!("Created {} FK edges", all_edges.len());
-    db.build_csr_from_edges(all_edges);
+    let num_rows: usize = table_infos.iter().map(|t| t.num_rows).sum();
+    graph.build_from_edges(num_rows, all_edges);
 
     Ok(())
 }
 
-/// Collects FK edges for a single column. Returns count of orphaned FK values.
 fn collect_fk_edges(
     fk_col: &Column,
     col_name: &str,
     target_table: TableIdx,
     row_start: u32,
-    ctx: &PreprocessingContext,
+    pk_index: &PkIndex,
     edges: &mut Vec<(u32, u32)>,
 ) -> usize {
     let mut orphaned = 0usize;
 
     iter_integer_column(fk_col, col_name, |row_idx, fk_val| {
-        if let Some(target_row) = ctx.lookup_pk(target_table, fk_val) {
+        if let Some(target_row) = pk_index.lookup(target_table, fk_val) {
             edges.push((row_start + row_idx as u32, target_row.0));
         } else {
             orphaned += 1;
@@ -1195,55 +1526,6 @@ fn collect_fk_edges(
     });
 
     orphaned
-}
-
-// ============================================================================
-// Phase 5: Embed Text Values
-// ============================================================================
-
-/// Embeds all unique text values collected during processing.
-fn embed_text_values(db: &mut Database, ctx: &PreprocessingContext, embedder: &Embedder) {
-    let pending_texts = &ctx.pending_texts;
-    if pending_texts.is_empty() {
-        return;
-    }
-
-    db.init_embeddings(embedder.embedding_dim() as u32, pending_texts.len());
-
-    let batch_size = embedder.config.batch_size;
-    let total = pending_texts.len();
-
-    let pb = ProgressBar::new(total as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} texts ({per_sec}, ETA: {eta})",
-        )
-        .unwrap()
-        .progress_chars("█▓▒░  "),
-    );
-
-    for chunk_start in (0..total).step_by(batch_size) {
-        let chunk_end = (chunk_start + batch_size).min(total);
-        let chunk: Vec<&str> = pending_texts[chunk_start..chunk_end]
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-
-        match embedder.embed_batch_f16(&chunk) {
-            Ok(embeddings) => {
-                for (i, embedding) in embeddings.into_iter().enumerate() {
-                    db.set_embedding(EmbeddingIdx((chunk_start + i) as u32), &embedding);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to embed batch at {}: {}", chunk_start, e);
-            }
-        }
-
-        pb.set_position(chunk_end as u64);
-    }
-
-    pb.finish_with_message("Done");
 }
 
 // ============================================================================
@@ -1269,13 +1551,21 @@ fn main() -> Result<()> {
         HashMap::new()
     };
 
+    // Get database name
+    let db_name = args
+        .input_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("database");
+
+    // Create output directory for this database
+    let output_dir = args.output_dir.join(db_name);
+    std::fs::create_dir_all(&output_dir).expect("Failed to create output directory");
+
     // Initialize embedder
     info!("Initializing embedder...");
     let embedder = Embedder::new(EmbedderConfig::default()).expect("Failed to initialize embedder");
     info!("Embedder ready");
-
-    // Initialize preprocessing context
-    let mut ctx = PreprocessingContext::new();
 
     // Phase 1: Schema and stats
     info!(
@@ -1292,63 +1582,110 @@ fn main() -> Result<()> {
 
     // Phase 2: Build schema
     info!("=== Phase 2: Building schema ===");
-    let (mut db, table_name_to_idx, _column_name_to_idx) =
+    let (schema, table_name_to_idx, _column_name_to_idx) =
         build_schema(&table_infos, &embedder, &global_ts_stats);
     info!(
         "Schema: {} tables, {} columns",
-        db.tables.len(),
-        db.columns.len()
+        schema.num_tables(),
+        schema.num_columns()
     );
     print_schema_summary(&table_infos);
 
-    // Phase 3: Process tables
-    info!("=== Phase 3: Processing tables ===");
-    process_tables(&table_infos, &mut db, &mut ctx, args.chunk_size)?;
+    // Phase 3: Extract vocabulary (streaming)
+    info!("=== Phase 3: Extracting vocabulary (streaming) ===");
+    let mut vocab = StreamingVocab::new(&args.output_dir, db_name)?;
+    let vocab_size = vocab.extract_vocabulary(&table_infos, &schema, args.chunk_size)?;
+    info!("Vocabulary: {} unique texts", vocab_size);
+
+    // Phase 4: Embed vocabulary (streaming to disk)
+    info!("=== Phase 4: Embedding vocabulary (streaming to disk) ===");
+    vocab.embed_vocabulary(&embedder)?;
+
+    // Phase 5: Process tables (cell encoding)
+    info!("=== Phase 5: Processing tables ===");
+    let mut cells = Cells::new();
+    let mut pk_index = PkIndex::new();
+    process_tables_streaming(
+        &table_infos,
+        &schema,
+        &mut cells,
+        &vocab,
+        &mut pk_index,
+        args.chunk_size,
+    )?;
     info!(
-        "Rows: {}, PK index: {} entries, Unique texts: {}",
-        db.num_rows(),
-        ctx.pk_index.len(),
-        ctx.vocab_size()
+        "Rows: {}, PK index: {} entries",
+        cells.num_rows(),
+        pk_index.len()
     );
 
-    // Phase 4: Build FK edges
-    info!("=== Phase 4: Building FK edges ===");
-    build_fk_edges(&table_infos, &mut db, &table_name_to_idx, &ctx, args.chunk_size)?;
+    // Phase 6: Build FK edges
+    info!("=== Phase 6: Building FK edges ===");
+    let mut graph = Graph::new();
+    build_fk_edges(
+        &table_infos,
+        &schema,
+        &mut graph,
+        &table_name_to_idx,
+        &pk_index,
+        args.chunk_size,
+    )?;
 
-    // Phase 5: Embed text values
-    info!("=== Phase 5: Embedding text values ===");
-    embed_text_values(&mut db, &ctx, &embedder);
+    // Cleanup temp files
+    vocab.cleanup()?;
 
-    // Drop preprocessing context (no longer needed)
-    drop(ctx);
+    // Phase 7: Save all files
+    info!("=== Phase 7: Saving files ===");
 
-    info!(
-        "Database complete: {} tables, {} columns, {} rows, {} edges, {} value embeddings",
-        db.num_tables(),
-        db.num_columns(),
-        db.num_rows(),
-        db.num_edges(),
-        db.vocab_size()
-    );
-
-    // Save with progress indicator
-    std::fs::create_dir_all(&args.output_dir).expect("Failed to create output directory");
-    let db_name = args
-        .input_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("database");
-    let output_path = args.output_dir.join(format!("{db_name}.rkyv"));
-
-    info!("Saving to: {:?}", output_path);
     let save_pb = ProgressBar::new_spinner();
-    save_pb.set_style(ProgressStyle::with_template("{spinner:.green} Saving database...").unwrap());
+    save_pb.set_style(ProgressStyle::with_template("{spinner:.green} {msg}").unwrap());
     save_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    db.save(&output_path).expect("Failed to save database");
+    save_pb.set_message("Saving schema.rkyv...");
+    schema.save(output_dir.join("schema.rkyv"))?;
+
+    save_pb.set_message("Saving graph.rkyv...");
+    graph.save(output_dir.join("graph.rkyv"))?;
+
+    save_pb.set_message("Saving cells.rkyv...");
+    cells.save(output_dir.join("cells.rkyv"))?;
+
+    save_pb.set_message("Saving manifest.json...");
+    let manifest = Manifest {
+        version: "1.0".to_string(),
+        created: chrono::Utc::now().to_rfc3339(),
+        source_dir: args.input_dir.to_string_lossy().to_string(),
+        stats: ManifestStats {
+            num_tables: schema.num_tables(),
+            num_columns: schema.num_columns(),
+            num_rows: cells.num_rows(),
+            num_edges: graph.num_edges(),
+            vocab_size: vocab.vocab_size,
+            embed_dim: vocab.embed_dim,
+        },
+    };
+    manifest.save(output_dir.join("manifest.json"))?;
 
     save_pb.finish_with_message("Saved!");
-    info!("Done!");
+
+    info!("=== Complete ===");
+    info!("Output directory: {:?}", output_dir);
+    info!(
+        "  - schema.rkyv:     {} tables, {} columns",
+        schema.num_tables(),
+        schema.num_columns()
+    );
+    info!(
+        "  - graph.rkyv:      {} nodes, {} edges",
+        graph.num_nodes(),
+        graph.num_edges()
+    );
+    info!("  - cells.rkyv:      {} rows", cells.num_rows());
+    info!(
+        "  - embeddings.bin:  {} texts, dim={}",
+        vocab.vocab_size, vocab.embed_dim
+    );
+    info!("  - manifest.json:   metadata");
 
     Ok(())
 }

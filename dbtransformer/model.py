@@ -403,8 +403,9 @@ class RelationalTransformer(nn.Module):
         self.out_norm = nn.RMSNorm(config.d_model)
 
         # Set up decoder layers
+        # Note: No text_decoder because TEXT cells are context-only (never masked/predicted).
+        # This enables zero-shot transfer to unseen text values.
         self.numerical_decoder = nn.Linear(config.d_model, 1, bias=True)
-        self.text_decoder = nn.Linear(config.d_model, config.d_text, bias=True)
 
         # Categorical decoder: predicts a d_text embedding. At inference, use
         # nearest neighbor search against precomputed category embeddings.
@@ -430,9 +431,8 @@ class RelationalTransformer(nn.Module):
         is_text: Bool[Tensor, "b s"] = semantic_type == SemanticType.TEXT.value
         is_timestamp: Bool[Tensor, "b s"] = semantic_type == SemanticType.TIMESTAMP.value
 
-        # Note: Text masking is now supported via contrastive loss (InfoNCE).
-        # The text loss computation uses boolean indexing which may cause a
-        # torch.compile graph break, but this is acceptable for the text path.
+        # Note: TEXT cells are never masked or predicted. They provide context
+        # for predicting numerical, categorical, and timestamp cells.
 
         # =======================================================
         #  INPUT EMBEDDING STEP
@@ -499,12 +499,16 @@ class RelationalTransformer(nn.Module):
         # This is an intentional tradeoff (extra compute to avoid graph breaks).
         with torch.autograd.profiler.record_function("output_decoding"):
             yhat_numerical: Float[Tensor, "b s 1"] = self.numerical_decoder(x) * is_numerical[..., None]
-            yhat_text: Float[Tensor, "b s d_text"] = self.text_decoder(x) * is_text[..., None]
             yhat_timestamp: Float[Tensor, "b s 1"] = self.timestamp_decoder(x) * is_timestamp[..., None]
 
             # Categorical decoder predicts a d_text embedding.
             # At inference, use nearest neighbor search against category embeddings.
             yhat_categorical: Float[Tensor, "b s d_text"] = self.categorical_decoder(x)
+
+            # Text prediction is not done during training - TEXT cells are context-only.
+            # They're embedded and encoded for context, but never masked or predicted.
+            # This enables zero-shot transfer to databases with unseen text values.
+            yhat_text: Float[Tensor, "b s d_text"] = torch.zeros_like(text_values)
 
         with torch.autograd.profiler.record_function("loss_computation"):
             # Compute per-position losses (before masking)
@@ -536,49 +540,12 @@ class RelationalTransformer(nn.Module):
                 loss_numerical * is_numerical + loss_categorical * is_categorical + loss_timestamp * is_timestamp
             )
 
-            # Compute masked loss for numerical, categorical, and timestamp
-            num_cat_time_mask = masks & (is_numerical | is_categorical | is_timestamp)
-            num_cat_time_count = num_cat_time_mask.sum().clamp(min=1)
-            loss_num_cat_time: Float[Tensor, ""] = (combined_loss * num_cat_time_mask).sum() / num_cat_time_count
-
-            # Text contrastive loss (InfoNCE)
-            # Note: This uses boolean indexing which may cause a torch.compile graph break.
-            # We accept this tradeoff since text masking is expected to be less frequent
-            # than numerical/categorical masking, and contrastive loss requires gathering.
-            text_mask: Bool[Tensor, "b s"] = is_text & masks
-            num_text_targets: int = int(text_mask.sum().item())
-
-            if num_text_targets > 1:
-                # Gather masked text predictions and targets
-                pred_text_flat: Float[Tensor, "n d_text"] = yhat_text[text_mask]
-                target_text_flat: Float[Tensor, "n d_text"] = text_values[text_mask]
-
-                # Normalize for cosine similarity
-                pred_norm = F.normalize(pred_text_flat, dim=-1)
-                target_norm = F.normalize(target_text_flat, dim=-1)
-
-                # Compute similarity matrix: (N, d) @ (d, N) -> (N, N)
-                # Each row i contains similarities between prediction i and all targets
-                logits: Float[Tensor, "n n"] = pred_norm @ target_norm.T / self.text_contrastive_temperature
-
-                # Labels: diagonal (prediction i should match target i)
-                labels = torch.arange(num_text_targets, device=logits.device)
-                loss_text: Float[Tensor, ""] = F.cross_entropy(logits, labels)
-
-            elif num_text_targets == 1:
-                # Single text target: fall back to cosine loss (can't do contrastive)
-                pred_text_flat = yhat_text[text_mask]
-                target_text_flat = text_values[text_mask]
-                cos_sim_text = F.cosine_similarity(pred_text_flat, target_text_flat, dim=-1)
-                loss_text = (1.0 - cos_sim_text).mean()
-
-            else:
-                # No text targets: dummy term to touch text_decoder params for DDP gradient sync
-                loss_text = yhat_text.sum() * 0.0
-
-            # Combine losses
-            # Weight text loss equally with num/cat/timestamp loss (both contribute to total)
-            loss_out: Float[Tensor, ""] = loss_num_cat_time + loss_text
+            # Compute masked loss for numerical, categorical, and timestamp.
+            # TEXT cells are never masked (they're context-only), so not included here.
+            # This ensures proper masking: only non-NULL, non-TEXT cells from seed rows.
+            masked_positions = masks & (is_numerical | is_categorical | is_timestamp)
+            masked_count = masked_positions.sum().clamp(min=1)
+            loss_out: Float[Tensor, ""] = (combined_loss * masked_positions).sum() / masked_count
 
         return ModelOutput(
             loss=loss_out,

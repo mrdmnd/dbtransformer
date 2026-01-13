@@ -6,20 +6,16 @@
 //! - Integration with the Database types for column/table embeddings
 
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
-use crossbeam_channel::{Receiver, Sender, bounded};
 use half::f16;
 use hf_hub::{Repo, RepoType, api::sync::Api};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use thiserror::Error;
 use tokenizers::Tokenizer;
-use tracing::{debug, error, info, warn};
-
-use crate::{ColumnIdx, Database, EmbeddingIdx};
+use tracing::{error, info};
 
 // ============================================================================
 // Configuration
@@ -127,20 +123,6 @@ impl EmbedderConfig {
     }
 }
 
-// ============================================================================
-// Work Queue Item
-// ============================================================================
-
-/// Item in the embedding work queue
-#[derive(Debug)]
-pub enum WorkItem {
-    /// Embed a text value and store at the given EmbeddingIdx
-    TextValue { text: String, idx: EmbeddingIdx },
-    /// Embed a column description and store on the column
-    ColumnDescription { text: String, col_idx: ColumnIdx },
-    /// Shutdown signal
-    Shutdown,
-}
 
 // ============================================================================
 // Embedding Model
@@ -336,10 +318,6 @@ pub struct Embedder {
     inner: Arc<RwLock<Option<EmbeddingModel>>>,
     /// Configuration (public for external access to batch_size, etc.)
     pub config: EmbedderConfig,
-    /// Work queue sender
-    work_tx: Option<Sender<WorkItem>>,
-    /// Worker thread handle
-    worker_handle: Option<JoinHandle<()>>,
 }
 
 impl Embedder {
@@ -352,8 +330,6 @@ impl Embedder {
         Ok(Self {
             inner: Arc::new(RwLock::new(Some(model))),
             config,
-            work_tx: None,
-            worker_handle: None,
         })
     }
 
@@ -448,273 +424,12 @@ impl Embedder {
         })
     }
 
-    // ========================================================================
-    // Work Queue Management
-    // ========================================================================
-
-    /// Start the background worker for processing embedding requests
-    pub fn start_worker(&mut self, database: Arc<Mutex<Database>>) {
-        if self.worker_handle.is_some() {
-            warn!("Worker already running");
-            return;
-        }
-
-        let (tx, rx) = bounded::<WorkItem>(self.config.queue_capacity);
-        self.work_tx = Some(tx);
-
-        let inner = Arc::clone(&self.inner);
-        let batch_size = self.config.batch_size;
-        let embed_dim = self.embedding_dim();
-
-        let handle = thread::spawn(move || {
-            Self::worker_loop(inner, rx, database, batch_size, embed_dim);
-        });
-
-        self.worker_handle = Some(handle);
-        info!("Embedding worker started");
-    }
-
-    /// Worker loop that processes items from the queue
-    fn worker_loop(
-        inner: Arc<RwLock<Option<EmbeddingModel>>>,
-        rx: Receiver<WorkItem>,
-        database: Arc<Mutex<Database>>,
-        batch_size: usize,
-        embed_dim: usize,
-    ) {
-        let mut text_batch: Vec<(String, EmbeddingIdx)> = Vec::with_capacity(batch_size);
-        let mut col_batch: Vec<(String, ColumnIdx)> = Vec::with_capacity(batch_size);
-
-        loop {
-            match rx.recv() {
-                Ok(WorkItem::Shutdown) => {
-                    debug!("Worker received shutdown signal");
-                    if !text_batch.is_empty() {
-                        Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
-                    }
-                    if !col_batch.is_empty() {
-                        Self::process_column_batch(&inner, &database, &mut col_batch, embed_dim);
-                    }
-                    break;
-                }
-                Ok(WorkItem::TextValue { text, idx }) => {
-                    text_batch.push((text, idx));
-                    if text_batch.len() >= batch_size {
-                        Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
-                    }
-                }
-                Ok(WorkItem::ColumnDescription { text, col_idx }) => {
-                    col_batch.push((text, col_idx));
-                    if col_batch.len() >= batch_size {
-                        Self::process_column_batch(&inner, &database, &mut col_batch, embed_dim);
-                    }
-                }
-                Err(_) => {
-                    debug!("Worker channel closed");
-                    break;
-                }
-            }
-
-            // Drain additional items
-            while let Ok(item) = rx.try_recv() {
-                match item {
-                    WorkItem::Shutdown => {
-                        if !text_batch.is_empty() {
-                            Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
-                        }
-                        if !col_batch.is_empty() {
-                            Self::process_column_batch(
-                                &inner,
-                                &database,
-                                &mut col_batch,
-                                embed_dim,
-                            );
-                        }
-                        return;
-                    }
-                    WorkItem::TextValue { text, idx } => {
-                        text_batch.push((text, idx));
-                    }
-                    WorkItem::ColumnDescription { text, col_idx } => {
-                        col_batch.push((text, col_idx));
-                    }
-                }
-
-                if text_batch.len() >= batch_size {
-                    Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
-                }
-                if col_batch.len() >= batch_size {
-                    Self::process_column_batch(&inner, &database, &mut col_batch, embed_dim);
-                }
-            }
-
-            // Process partial batches
-            if !text_batch.is_empty() {
-                Self::process_text_batch(&inner, &database, &mut text_batch, embed_dim);
-            }
-            if !col_batch.is_empty() {
-                Self::process_column_batch(&inner, &database, &mut col_batch, embed_dim);
-            }
-        }
-
-        info!("Embedding worker shut down");
-    }
-
-    /// Process a batch of text values
-    fn process_text_batch(
-        inner: &Arc<RwLock<Option<EmbeddingModel>>>,
-        database: &Arc<Mutex<Database>>,
-        batch: &mut Vec<(String, EmbeddingIdx)>,
-        _embed_dim: usize,
-    ) {
-        if batch.is_empty() {
-            return;
-        }
-
-        let texts: Vec<&str> = batch.iter().map(|(s, _)| s.as_str()).collect();
-        let batch_len = batch.len();
-
-        let mut guard = inner.write();
-        if let Some(model) = guard.as_mut() {
-            match model.embed_batch(&texts) {
-                Ok(embeddings) => {
-                    let mut db = database.lock();
-                    for ((_, idx), embedding) in batch.drain(..).zip(embeddings) {
-                        let f16_embedding: Vec<f16> =
-                            embedding.into_iter().map(f16::from_f32).collect();
-                        if (idx.0 as usize) < db.vocab_size() {
-                            db.set_embedding(idx, &f16_embedding);
-                        }
-                    }
-                    debug!("Processed {} text embeddings", batch_len);
-                }
-                Err(e) => {
-                    error!("Failed to embed text batch: {}", e);
-                    batch.clear();
-                }
-            }
-        } else {
-            batch.clear();
-        }
-    }
-
-    /// Process a batch of column descriptions
-    fn process_column_batch(
-        inner: &Arc<RwLock<Option<EmbeddingModel>>>,
-        database: &Arc<Mutex<Database>>,
-        batch: &mut Vec<(String, ColumnIdx)>,
-        _embed_dim: usize,
-    ) {
-        if batch.is_empty() {
-            return;
-        }
-
-        let texts: Vec<&str> = batch.iter().map(|(s, _)| s.as_str()).collect();
-        let batch_len = batch.len();
-
-        let mut guard = inner.write();
-        if let Some(model) = guard.as_mut() {
-            match model.embed_batch(&texts) {
-                Ok(embeddings) => {
-                    let mut db = database.lock();
-                    for ((_, col_idx), embedding) in batch.drain(..).zip(embeddings) {
-                        let f16_embedding: Vec<f16> =
-                            embedding.into_iter().map(f16::from_f32).collect();
-                        if (col_idx.0 as usize) < db.columns.len() {
-                            db.set_column_embedding(col_idx, &f16_embedding);
-                        }
-                    }
-                    debug!("Processed {} column embeddings", batch_len);
-                }
-                Err(e) => {
-                    error!("Failed to embed column batch: {}", e);
-                    batch.clear();
-                }
-            }
-        } else {
-            batch.clear();
-        }
-    }
-
-    /// Submit a text value for background embedding
-    pub fn submit_text(&self, text: String, idx: EmbeddingIdx) -> Result<()> {
-        if let Some(ref tx) = self.work_tx {
-            tx.send(WorkItem::TextValue { text, idx })
-                .map_err(|e| EmbedderError::QueueError(e.to_string()))
-        } else {
-            Err(EmbedderError::QueueError("Worker not started".to_string()))
-        }
-    }
-
-    /// Submit a column description for background embedding
-    pub fn submit_column(&self, text: String, col_idx: ColumnIdx) -> Result<()> {
-        if let Some(ref tx) = self.work_tx {
-            tx.send(WorkItem::ColumnDescription { text, col_idx })
-                .map_err(|e| EmbedderError::QueueError(e.to_string()))
-        } else {
-            Err(EmbedderError::QueueError("Worker not started".to_string()))
-        }
-    }
-
-    /// Shutdown the worker thread
-    pub fn shutdown(&mut self) {
-        if let Some(ref tx) = self.work_tx {
-            let _ = tx.send(WorkItem::Shutdown);
-        }
-        if let Some(handle) = self.worker_handle.take() {
-            let _ = handle.join();
-        }
-        self.work_tx = None;
-        info!("Embedder shutdown complete");
-    }
-
     /// Unload the model to free memory
     pub fn unload(&self) {
         let mut guard = self.inner.write();
         *guard = None;
         info!("Model unloaded");
     }
-}
-
-impl Drop for Embedder {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-// ============================================================================
-// Convenience Functions for Database Integration
-// ============================================================================
-
-/// Embed all column descriptions in a database synchronously
-pub fn embed_all_column_descriptions(embedder: &Embedder, db: &mut Database) -> Result<()> {
-    info!("Embedding {} column descriptions...", db.columns.len());
-
-    // Initialize column embeddings storage
-    db.init_column_embeddings(embedder.embedding_dim() as u32);
-
-    // Collect all "<column_name> of <table_name>" strings
-    let descriptions: Vec<String> = db
-        .columns
-        .iter()
-        .map(|col| {
-            let table_name = &db.tables[col.table_idx.0 as usize].name;
-            format!("{} of {}", col.name, table_name)
-        })
-        .collect();
-
-    let refs: Vec<&str> = descriptions.iter().map(|s| s.as_str()).collect();
-
-    // Embed in chunks
-    let embeddings = embedder.embed_batch_chunked_f16(&refs, embedder.config.batch_size)?;
-
-    // Store embeddings
-    for (col_idx, embedding) in embeddings.into_iter().enumerate() {
-        db.set_column_embedding(ColumnIdx(col_idx as u32), &embedding);
-    }
-
-    info!("Embedded {} column descriptions", db.columns.len());
-    Ok(())
 }
 
 /// Create a placeholder embedding (zeros) for lazy initialization
