@@ -180,7 +180,8 @@ class OverallConfig:
 DEFAULT_OVERALL_CONFIG = OverallConfig(
     data=DataConfig(
         db_dir="/home/mrdmnd/data/databases_preprocessed",
-        db_names=["synthetic-xor", "synthetic-moons", "synthetic-numerical", "synthetic-teams"],
+        db_names=["synthetic-xor", "synthetic-moons", "synthetic-numerical"],  # Train on these
+        eval_db_names=["synthetic-teams"],  # Zero-shot eval on unseen database!
     ),
     model=ModelConfig(),
     training=TrainingConfig(
