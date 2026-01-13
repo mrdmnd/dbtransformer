@@ -660,13 +660,12 @@ impl Sampler {
         );
 
         // Select which cell from the seed row to mask (the "label").
-        // Only non-NULL, non-TEXT cells are eligible for masking.
-        // TEXT cells are excluded because:
-        // 1. Text prediction is ill-defined (embedding matching, not value prediction)
-        // 2. Text cells still contribute as context, just never as prediction targets
+        // Only cells from columns explicitly marked as prediction_targets are eligible.
+        // This prevents data leakage from redundant/denormalized columns and
+        // allows explicit control over what the model learns to predict.
         let seed_cells = db.row_cells(seed_row);
 
-        // Count eligible cells: non-NULL AND not TEXT semantic type
+        // Count eligible cells: non-NULL AND is_prediction_target
         let eligible_count = seed_cells
             .iter()
             .enumerate()
@@ -675,8 +674,9 @@ impl Sampler {
                     return false;
                 }
                 let col_idx = seed_table.cell_column(cell_pos);
-                let stype = db.column(col_idx).stype_native();
-                stype != SemanticType::Text
+                let column = db.column(col_idx);
+                // Only mask columns explicitly marked as prediction targets
+                column.is_prediction_target()
             })
             .count();
 
@@ -790,8 +790,8 @@ impl Sampler {
                 seq.column_name_values[start..end].copy_from_slice(col_embedding);
 
                 // Apply masking: only the selected cell from seed row is masked
-                // TEXT cells are never masked (they're context-only)
-                if is_seed_row && stype != SemanticType::Text {
+                // Only columns marked as prediction_targets can be masked
+                if is_seed_row && column.is_prediction_target() {
                     seq.masks[seq_i] = seed_eligible_counter == label_cell_idx;
                     seed_eligible_counter += 1;
                 } else {
@@ -1153,33 +1153,64 @@ impl Sampler {
         })
     }
 
-    /// Compute which rows are eligible as seeds based on split configuration.
+    /// Compute which rows are eligible as seeds based on split configuration
+    /// AND whether the row's table has prediction targets.
     ///
-    /// Uses deterministic hash-based assignment:
-    /// - Hash each row index with split_seed
-    /// - Map hash to [0, 1) and compare against train_frac / val_frac thresholds
+    /// A row is a valid seed only if:
+    /// 1. It belongs to the configured split (train/val/test)
+    /// 2. Its table has at least one column marked as is_prediction_target
     ///
-    /// This ensures:
-    /// - Same split assignment across runs with same split_seed
-    /// - Works for ANY database regardless of schema
-    /// - Approximately respects the configured fractions
+    /// This prevents creating sequences with nothing to predict.
     fn compute_seeds(database: &Database, config: &SamplerConfig) -> Vec<RowIdx> {
         use std::hash::{Hash, Hasher};
 
         let num_rows = database.num_rows();
 
-        // If no split specified, all rows are seeds
+        // Precompute which tables have prediction targets
+        let tables_with_targets: Vec<bool> = (0..database.num_tables())
+            .map(|t| {
+                let table = database.table(crate::types::TableIdx(t as u32));
+                // Check if any feature column in this table is a prediction target
+                table
+                    .feature_columns_slice()
+                    .iter()
+                    .any(|archived_col_idx| {
+                        let col_idx = ColumnIdx(archived_col_idx.0.into());
+                        database.column(col_idx).is_prediction_target()
+                    })
+            })
+            .collect();
+
+        // If no split specified, include all rows from tables with prediction targets
         let Some(split) = config.split else {
-            return (0..num_rows).map(|i| RowIdx(i as u32)).collect();
+            return (0..num_rows)
+                .filter_map(|i| {
+                    let row = RowIdx(i as u32);
+                    let table_idx = database.row_table(row);
+                    if tables_with_targets[table_idx.0 as usize] {
+                        Some(row)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
         };
 
         // Precompute thresholds (as u64 for integer comparison)
         let train_threshold = (config.train_frac * u32::MAX as f32) as u64;
         let val_threshold = ((config.train_frac + config.val_frac) * u32::MAX as f32) as u64;
 
-        let mut seeds = Vec::with_capacity(num_rows / 3); // Rough estimate
+        let mut seeds = Vec::with_capacity(num_rows / 10); // Conservative estimate
 
         for i in 0..num_rows {
+            let row = RowIdx(i as u32);
+
+            // Skip rows from tables without prediction targets
+            let table_idx = database.row_table(row);
+            if !tables_with_targets[table_idx.0 as usize] {
+                continue;
+            }
+
             // Deterministic hash: combine row index with split seed
             let mut hasher = std::hash::DefaultHasher::new();
             config.split_seed.hash(&mut hasher);
@@ -1197,7 +1228,7 @@ impl Sampler {
             };
 
             if row_split == split {
-                seeds.push(RowIdx(i as u32));
+                seeds.push(row);
             }
         }
 

@@ -155,6 +155,7 @@ class Trainer:
                 training_config=config.training,
                 sampler_config=eval_sampler_config,
                 ddp_parameters=self.ddp_parameters,
+                precreate_samplers=True,  # Avoid recreating samplers on each eval
             )
             self.eval_dataloader = DataLoader(
                 self.eval_dataset,
@@ -332,7 +333,7 @@ class Trainer:
             trimmed.append(t[: int(l.item())])
         return torch.cat(trimmed, dim=0)
 
-    def _evaluate(self) -> dict[str, float]:
+    def _evaluate(self, current_batch: int) -> dict[str, float]:
         """Run a bounded evaluation loop over the eval dataloader."""
         if self.eval_dataloader is None:
             return {}
@@ -453,13 +454,10 @@ class Trainer:
         if self.is_leader and metrics:
             logger.info("Eval metrics: " + ", ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
             if self.wandb_run is not None:
-                self.wandb_run.log(metrics, step=self.batches_run)
+                self.wandb_run.log(metrics, step=current_batch)
 
         self.model.train()
         return metrics
-
-    def _init_wandb(self) -> None:
-        """Initialize Weights & Biases on rank 0 only."""
 
     def _warmup_compile(self) -> None:
         """
@@ -555,14 +553,17 @@ class Trainer:
                 and self.config.training.eval_every_n_batches > 0
                 and current_batch % self.config.training.eval_every_n_batches == 0
             ):
-                self._evaluate()
+                self._evaluate(current_batch)
 
             # Log metrics every log_every_n_batches
             if current_batch % self.config.training.log_every_n_batches == 0:
-                total_loss_scalar = accumulated_loss.item()
+                # All-reduce loss across ranks for accurate global average
+                if dist.is_initialized():
+                    dist.all_reduce(accumulated_loss, op=dist.ReduceOp.SUM)
+                    accumulated_loss = accumulated_loss / self.ddp_parameters.world_size
 
                 if self.is_leader:
-                    avg_loss = total_loss_scalar / batches_since_log
+                    avg_loss = accumulated_loss.item() / batches_since_log
                     lr_now = self.optimizer.param_groups[0]["lr"]
                     _log_metrics(self.wandb_run, current_batch, self.config.training.max_batches, avg_loss, lr_now)
                     pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr_now:.2e}")

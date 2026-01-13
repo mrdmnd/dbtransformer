@@ -44,11 +44,6 @@ class ModelConfig:
     d_time: int = 11
     compile_model: bool = True
 
-    # Temperature for text contrastive loss (InfoNCE).
-    # Lower = sharper distinctions, higher = softer.
-    # 0.07 is common in CLIP-style models.
-    text_contrastive_temperature: float = 0.07
-
 
 @dataclass
 class TrainingConfig:
@@ -88,7 +83,6 @@ class DataConfig:
     1. Specify db_dir only: loads ALL database subdirectories from that directory
     2. Specify db_dir + db_names: loads only the named databases from db_dir
 
-    Each database is a subdirectory containing .rkyv files (schema.rkyv, graph.rkyv, etc.)
     """
 
     # Base directory containing preprocessed database subdirectories
@@ -185,24 +179,26 @@ class OverallConfig:
 # Default configuration instance
 DEFAULT_OVERALL_CONFIG = OverallConfig(
     data=DataConfig(
-        db_dir="/home/mrdmnd/gcs/databases_preprocessed",
+        db_dir="/home/mrdmnd/data/databases_preprocessed",
         db_names=["rel-event"],
     ),
     model=ModelConfig(),
     training=TrainingConfig(
-        batch_size=8,          # Smaller for testing
-        seq_len=256,           # Smaller for testing
-        max_batches=100,       # Short run for testing
-        eval_every_n_batches=20,
-        log_every_n_batches=5,
-        save_every_n_batches=50,
+        batch_size=32,
+        seq_len=1024,
+        max_batches=1000,
+        eval_every_n_batches=100,
+        log_every_n_batches=10,
+        save_every_n_batches=500,
+        num_workers=4,  # DataLoader workers for prefetching
     ),
     sampler=SamplerConfig(
-        split="train",         # Enable train/val splitting
+        num_threads=32,  # Per-worker threads (4 workers × 6 = 24 total)
+        split="train",  # Enable train/val splitting
         train_frac=0.8,
         val_frac=0.1,
         split_seed=12345,
     ),
-    profiling=ProfilingConfig(),
-    wandb=WandbConfig(enabled=False),  # Disable W&B for testing
+    profiling=ProfilingConfig(profile_mode="disabled"),
+    wandb=WandbConfig(enabled=True),
 )

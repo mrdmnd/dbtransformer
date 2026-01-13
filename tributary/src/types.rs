@@ -79,6 +79,12 @@ pub struct TableMetadata {
     /// Columns to exclude from processing entirely.
     #[serde(default)]
     pub ignored_columns: Vec<String>,
+
+    /// Columns that are valid prediction targets (can be masked during training).
+    /// If empty or not specified, NO columns from this table are prediction targets.
+    /// This prevents data leakage from redundant/denormalized columns.
+    #[serde(default)]
+    pub prediction_targets: Vec<String>,
 }
 
 /// Complete database metadata: table name -> table metadata.
@@ -141,6 +147,9 @@ pub struct Column {
     pub fk_target_column: Option<ColumnIdx>,
     pub norm_mean: Option<f32>,
     pub norm_std: Option<f32>,
+    /// Whether this column can be masked as a prediction target.
+    /// Only columns explicitly listed in metadata.prediction_targets are true.
+    pub is_prediction_target: bool,
 }
 
 /// Table metadata with column and row ranges.
@@ -161,7 +170,7 @@ pub struct Table {
 impl Table {
     #[inline]
     pub fn num_columns(&self) -> usize {
-        (self.column_range.1 .0 - self.column_range.0 .0) as usize
+        (self.column_range.1.0 - self.column_range.0.0) as usize
     }
 
     #[inline]
@@ -171,17 +180,17 @@ impl Table {
 
     #[inline]
     pub fn num_rows(&self) -> usize {
-        (self.row_range.1 .0 - self.row_range.0 .0) as usize
+        (self.row_range.1.0 - self.row_range.0.0) as usize
     }
 
     #[inline]
     pub fn contains_column(&self, col: ColumnIdx) -> bool {
-        col.0 >= self.column_range.0 .0 && col.0 < self.column_range.1 .0
+        col.0 >= self.column_range.0.0 && col.0 < self.column_range.1.0
     }
 
     #[inline]
     pub fn contains_row(&self, row: RowIdx) -> bool {
-        row.0 >= self.row_range.0 .0 && row.0 < self.row_range.1 .0
+        row.0 >= self.row_range.0.0 && row.0 < self.row_range.1.0
     }
 
     #[inline]
@@ -418,7 +427,10 @@ impl Schema {
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Serialization error: {e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Serialization error: {e}"),
+            )
         })?;
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -477,7 +489,10 @@ impl Graph {
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Serialization error: {e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Serialization error: {e}"),
+            )
         })?;
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -540,16 +555,15 @@ impl Cells {
     #[inline]
     pub fn row_timestamp(&self, row: RowIdx) -> Option<i64> {
         let ts = self.row_timestamps[row.0 as usize];
-        if ts == NO_TIMESTAMP {
-            None
-        } else {
-            Some(ts)
-        }
+        if ts == NO_TIMESTAMP { None } else { Some(ts) }
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Serialization error: {e}"))
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Serialization error: {e}"),
+            )
         })?;
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -611,7 +625,7 @@ impl Manifest {
 // ============================================================================
 
 /// A memory-mapped database assembled from split files.
-/// 
+///
 /// Each component is independently mmap'd for efficient multi-process access.
 pub struct Database {
     /// Schema (loaded into memory, small)
@@ -762,8 +776,8 @@ impl Database {
         let tables = &self.archived_schema().tables;
         let idx = tables
             .binary_search_by(|table| {
-                let range_start: u32 = table.row_range.0 .0.into();
-                let range_end: u32 = table.row_range.1 .0.into();
+                let range_start: u32 = table.row_range.0.0.into();
+                let range_end: u32 = table.row_range.1.0.into();
                 if row < range_start {
                     std::cmp::Ordering::Greater
                 } else if row >= range_end {
@@ -793,11 +807,7 @@ impl Database {
     #[inline]
     pub fn row_timestamp(&self, row: RowIdx) -> Option<i64> {
         let ts: i64 = self.archived_cells().row_timestamps[row.0 as usize].into();
-        if ts == NO_TIMESTAMP {
-            None
-        } else {
-            Some(ts)
-        }
+        if ts == NO_TIMESTAMP { None } else { Some(ts) }
     }
 
     // --- Graph accessors ---
@@ -925,6 +935,7 @@ impl ArchivedTableExt for ArchivedTable {
 /// Extension methods for ArchivedColumn.
 pub trait ArchivedColumnExt {
     fn stype_native(&self) -> SemanticType;
+    fn is_prediction_target(&self) -> bool;
 }
 
 impl ArchivedColumnExt for ArchivedColumn {
@@ -936,6 +947,11 @@ impl ArchivedColumnExt for ArchivedColumn {
             ArchivedSemanticType::Text => SemanticType::Text,
             ArchivedSemanticType::Timestamp => SemanticType::Timestamp,
         }
+    }
+
+    #[inline]
+    fn is_prediction_target(&self) -> bool {
+        self.is_prediction_target
     }
 }
 

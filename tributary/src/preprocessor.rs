@@ -977,7 +977,11 @@ fn build_schema(
     table_infos: &[TableInfo],
     embedder: &Embedder,
     global_ts_stats: &RunningStats,
-) -> (Schema, HashMap<String, TableIdx>, HashMap<(TableIdx, String), ColumnIdx>) {
+) -> (
+    Schema,
+    HashMap<String, TableIdx>,
+    HashMap<(TableIdx, String), ColumnIdx>,
+) {
     let mut schema = Schema::new();
     let mut table_name_to_idx: HashMap<String, TableIdx> = HashMap::new();
     let mut column_name_to_idx: HashMap<(TableIdx, String), ColumnIdx> = HashMap::new();
@@ -1003,6 +1007,11 @@ fn build_schema(
             .as_ref()
             .and_then(|m| m.primary_key_column.as_ref());
         let time_col_name = info.metadata.as_ref().and_then(|m| m.time_column.as_ref());
+        let prediction_targets: HashSet<&str> = info
+            .metadata
+            .as_ref()
+            .map(|m| m.prediction_targets.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
         let mut pk_column_idx: Option<ColumnIdx> = None;
         let mut time_column_idx: Option<ColumnIdx> = None;
 
@@ -1022,6 +1031,15 @@ fn build_schema(
                 );
             }
         }
+        // Warn about prediction targets not found in schema
+        for target in &prediction_targets {
+            if !info.column_stats.iter().any(|c| c.name == *target) {
+                warn!(
+                    "Table '{}': prediction_target '{}' not found in schema",
+                    info.name, target
+                );
+            }
+        }
 
         for col_stats in &info.column_stats {
             let col_idx = ColumnIdx(global_col_idx);
@@ -1034,6 +1052,7 @@ fn build_schema(
             if time_col_name.map(|s| s == &col_stats.name).unwrap_or(false) {
                 time_column_idx = Some(col_idx);
             }
+            let is_prediction_target = prediction_targets.contains(col_stats.name.as_str());
 
             let description = format!("{}.{}", info.name, col_stats.name);
             column_descriptions.push((col_idx, description));
@@ -1047,6 +1066,7 @@ fn build_schema(
                 fk_target_column: None,
                 norm_mean: col_stats.mean,
                 norm_std: col_stats.std,
+                is_prediction_target,
             });
 
             global_col_idx += 1;
@@ -1151,7 +1171,7 @@ fn resolve_foreign_keys(
 fn compute_feature_columns(schema: &mut Schema) {
     for table in schema.tables.iter_mut() {
         let mut feature_cols = Vec::new();
-        for col_idx in table.column_range.0 .0..table.column_range.1 .0 {
+        for col_idx in table.column_range.0.0..table.column_range.1.0 {
             let col = &schema.columns[col_idx as usize];
             if !col.is_primary_key && col.fk_target_column.is_none() {
                 feature_cols.push(ColumnIdx(col_idx));
@@ -1252,7 +1272,7 @@ fn process_tables_streaming(
         pb.set_message(format!("{}", info.name));
 
         let path_str = path_to_str(&info.path)?;
-        let row_start = schema.tables[table_idx.0 as usize].row_range.0 .0;
+        let row_start = schema.tables[table_idx.0 as usize].row_range.0.0;
 
         let ignored_cols: Vec<&str> = info
             .metadata
@@ -1439,7 +1459,7 @@ fn build_fk_edges(
             .collect();
 
         let path_str = path_to_str(&info.path)?;
-        let row_start = schema.tables[table_idx.0 as usize].row_range.0 .0;
+        let row_start = schema.tables[table_idx.0 as usize].row_range.0.0;
 
         let mut offset: i64 = 0;
         let chunk_size_u32 = chunk_size as u32;
