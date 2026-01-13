@@ -8,6 +8,7 @@ dependencies = [
     "einops>=0.8.1",
     "jaxtyping>=0.3.3",
     "loguru>=0.7.3",
+    "matplotlib>=3.10.8",
     "maturin>=1.11.5",
     "maturin-import-hook>=0.3.0",
     "numpy>=2.3.5",

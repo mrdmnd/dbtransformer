@@ -383,10 +383,11 @@ class Trainer:
                     numerical_labels_list.append(labels.detach())
 
                 # Categorical: cosine similarity (higher = better match)
+                # Use projected_categorical as target (same as training loss)
                 cat_mask = mask_active & (semantic == SemanticType.CATEGORICAL.value)
-                if cat_mask.any() and output["yhat_categorical"] is not None:
+                if cat_mask.any() and output["yhat_categorical"] is not None and output["projected_categorical"] is not None:
                     pred_emb = output["yhat_categorical"][cat_mask]
-                    target_emb = batch.categorical_values[cat_mask]
+                    target_emb = output["projected_categorical"][cat_mask]  # Use projected target
                     # Compute cosine similarity per sample
                     cos_sim = torch.nn.functional.cosine_similarity(pred_emb, target_emb, dim=-1)
                     categorical_preds_list.append(cos_sim.detach())

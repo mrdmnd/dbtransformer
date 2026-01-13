@@ -345,6 +345,7 @@ class ModelOutput(TypedDict):
     yhat_categorical: Float[Tensor, "b s d_text"] | None  # Predicted embedding, use NN for class
     yhat_text: Float[Tensor, "b s d_text"] | None
     yhat_timestamp: Float[Tensor, "b s 1"] | None  # Predicted z-scored epoch seconds
+    projected_categorical: Float[Tensor, "b s d_text"] | None  # Target for categorical loss
 
 
 @jaxtyped(typechecker=None)
@@ -505,29 +506,16 @@ class RelationalTransformer(nn.Module):
             # Compute per-position losses (before masking)
             loss_numerical: Float[Tensor, "b s"] = F.huber_loss(yhat_numerical, numerical_values, reduction="none").mean(-1)
 
-            # Categorical loss: InfoNCE with in-batch negatives (per-sample).
-            # For each position i, the model should predict an embedding closer to
-            # target i than to any other target j in the same sample.
-            # This provides much stronger gradients than simple cosine loss.
+            # Categorical loss: cosine embedding loss in the PROJECTED space.
+            # We compare predicted embedding to the PROJECTED target (not raw).
+            # This allows the projection to learn to separate categories that are
+            # too close in the original text embedding space.
             # Note: projected_categorical was computed earlier in input embedding.
-            yhat_cat_norm = F.normalize(yhat_categorical, p=2, dim=-1)  # (B, S, d_text)
-            target_cat_norm = F.normalize(projected_categorical, p=2, dim=-1)  # (B, S, d_text)
-
-            # Per-sample similarity: logits[b, i, j] = sim(pred[b,i], tgt[b,j])
-            temperature = 0.07  # Standard for contrastive learning (CLIP uses 0.07)
-            cat_logits: Float[Tensor, "b s s"] = torch.bmm(yhat_cat_norm, target_cat_norm.transpose(-2, -1)) / temperature
-
-            # Cross-entropy: position i should match target i (diagonal)
-            batch_size_actual, seq_len_actual = cat_logits.shape[:2]
-            cat_labels = torch.arange(seq_len_actual, device=cat_logits.device)
-            cat_labels = cat_labels.unsqueeze(0).expand(batch_size_actual, -1)  # (B, S)
-
-            # Compute per-position cross-entropy loss (graph-break-free)
-            loss_categorical: Float[Tensor, "b s"] = F.cross_entropy(
-                cat_logits.reshape(-1, seq_len_actual),  # (B*S, S)
-                cat_labels.reshape(-1),  # (B*S,)
-                reduction="none",
-            ).reshape(batch_size_actual, seq_len_actual)
+            yhat_cat_norm = F.normalize(yhat_categorical, p=2, dim=-1)
+            target_cat_norm = F.normalize(projected_categorical, p=2, dim=-1)
+            # Cosine similarity: higher is better, so loss = 1 - cos_sim
+            cos_sim: Float[Tensor, "b s"] = (yhat_cat_norm * target_cat_norm).sum(dim=-1)
+            loss_categorical: Float[Tensor, "b s"] = 1.0 - cos_sim
 
             # Timestamp loss: Huber on z-scored epoch seconds (last component of input).
             # Input uses full 12-d for cyclical awareness; output predicts epoch only.
@@ -551,4 +539,5 @@ class RelationalTransformer(nn.Module):
             yhat_categorical=yhat_categorical,
             yhat_text=yhat_text,
             yhat_timestamp=yhat_timestamp,
+            projected_categorical=projected_categorical,
         )

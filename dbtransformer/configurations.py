@@ -180,14 +180,14 @@ class OverallConfig:
 DEFAULT_OVERALL_CONFIG = OverallConfig(
     data=DataConfig(
         db_dir="/home/mrdmnd/data/databases_preprocessed",
-        db_names=["rel-event"],
+        db_names=["synthetic-xor", "synthetic-moons", "synthetic-numerical", "synthetic-teams"],
     ),
     model=ModelConfig(),
     training=TrainingConfig(
         batch_size=32,
         seq_len=1024,
-        max_batches=1000,
-        eval_every_n_batches=100,
+        max_batches=500,
+        eval_every_n_batches=50,
         log_every_n_batches=10,
         save_every_n_batches=500,
         num_workers=4,  # DataLoader workers for prefetching
